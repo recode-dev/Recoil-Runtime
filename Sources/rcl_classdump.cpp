@@ -1043,6 +1043,12 @@ const char *name_of_table(uint32_t start) {
     return (n && strcmp(n, "-") != 0) ? n : nullptr;
 }
 
+const char *family_of_table(uint32_t start) {
+    std::map<uint32_t, std::string>::const_iterator it = g_table_family.find(start);
+    if (it != g_table_family.end() && !it->second.empty()) return it->second.c_str();
+    return nullptr;
+}
+
 bool class_from_text(const char *s, char *out, size_t cap) {
     for (const char *p = s; *p; p++) {
         if (*p < 'A' || *p > 'Z') continue;
@@ -1999,8 +2005,14 @@ void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
     for (size_t i = 0; i < tables.size(); i++) {
         const ClassTable &t = tables[i];
         const char *nm = name_of_table(t.start);
-        const std::string label = nm ? std::string(nm) : hex_label(t.start);
-        const char *cat = (nm && *nm) ? category_of_name(nm) : "Unknown";
+        const char *fam = (!nm || !*nm) ? family_of_table(t.start) : nullptr;
+        if (!nm && !fam) {
+            per_cat["Unknown"]++;
+            continue;
+        }
+        std::string label = (nm && *nm) ? std::string(nm) : std::string(fam);
+        if (!nm || !*nm) label += "." + hex_label(t.start).substr(3);
+        const char *cat = category_of_name(label.c_str());
         char safe[192];
         safe_name(safe, sizeof safe, label.c_str());
         if (!*safe) snprintf(safe, sizeof safe, "%s", "vt");
@@ -2361,11 +2373,11 @@ void write_class_docs(const Image &img) {
         FILE *f = fopen(path, "w");
         if (!f) continue;
         std::map<uint32_t, std::string>::const_iterator gu = g_table_class.find(t.start);
-        fprintf(f, "# vt_%06x%s%s\n\n**Class Table:** `%#x`  **Slots:** %u  **Segment:** `%s`\n\n"
-                   "No documented class claims this table.\n\n| slot | rva | address | method |\n"
-                   "|------|-----|---------|--------|\n", t.start,
-                (gu == g_table_class.end()) ? "" : " - ", (gu == g_table_class.end()) ? "" : gu->second.c_str(),
-                t.start, t.slots, t.seg.c_str());
+        const char *gu_fam = (gu == g_table_class.end()) ? family_of_table(t.start) : nullptr;
+        fprintf(f, "# vt_%06x%s%s%s%s\n\n**Class Table:** `%#x`  **Slots:** %u  **Segment:** `%s`\n\n",
+                t.start, (gu == g_table_class.end() && !gu_fam) ? "" : " - ",
+                (gu == g_table_class.end()) ? "" : gu->second.c_str(), gu_fam ? " - " : "",
+                gu_fam ? gu_fam : "", t.start, t.slots, t.seg.c_str());
         for (uint32_t s = 0; s < t.slots; s++) {
             uint64_t raw = 0;
             if (!img.read || !img.read(img.ctx, img.base + t.start + s * 8, &raw, sizeof(raw))) break;
