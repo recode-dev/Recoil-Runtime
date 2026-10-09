@@ -100,6 +100,7 @@ bool g_insight_done = false;
 const MachInsight *g_mi = nullptr;
 const FnStarts *g_fs = nullptr;
 const std::vector<SecRange> *g_dic = nullptr;
+std::vector<uint32_t> g_slot_starts;
 
 void ensure_insight(const Image &img) {
     if (g_insight_done && g_insight_base == img.base) return;
@@ -198,6 +199,8 @@ bool slot_at(const Image &img, uint64_t raw, uint64_t tlo, uint64_t thi, uint32_
         return false;
     }
     if (st) st->entry_ok++;
+    if (g_fs && !g_fs->is_start(r) && g_slot_starts.size() < (1u << 19))
+        g_slot_starts.push_back(r);
     if (rva) *rva = r;
     return true;
 }
@@ -1853,6 +1856,14 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     std::vector<uint32_t> starts;
     if (g_fs && g_fs->v.size() >= 16) starts = g_fs->v;
     else starts = build_starts(img, L);
+    if (!g_slot_starts.empty()) {
+        starts.insert(starts.end(), g_slot_starts.begin(), g_slot_starts.end());
+        std::sort(starts.begin(), starts.end());
+        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+        RCL_LOGLN("[deep] accepted slot entries added to the start set: %zu -> %zu",
+                  g_slot_starts.size(), starts.size());
+        g_slot_starts.clear();
+    }
     std::vector<uint32_t> lcs;
     const bool lcs_ok = lc_function_starts(img, L, lcs);
     std::vector<uint32_t> brs;
