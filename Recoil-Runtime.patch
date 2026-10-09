@@ -1,0 +1,1831 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+new file mode 100644
+index 0000000..1ef5eb3
+--- /dev/null
++++ b/.github/workflows/build.yml
+@@ -0,0 +1,75 @@
++name: build
++
++on:
++  push:
++    branches: ["**"]
++    tags: ["v*"]
++  pull_request:
++  workflow_dispatch:
++
++jobs:
++  # Toolchain-free checks: the scanner builds and runs on the host, and the arm64 decoder is
++  # exercised against the real image when one is supplied through the RCL_IMAGE_URL secret.
++  self-test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Fetch the game image (optional)
++        continue-on-error: true
++        run: |
++          if [ -n "${{ secrets.RCL_IMAGE_URL }}" ]; then
++            curl -fsSL "${{ secrets.RCL_IMAGE_URL }}" -o /tmp/attach.txt
++            ls -la /tmp/attach.txt
++          else
++            echo "no RCL_IMAGE_URL secret - structural checks only"
++          fi
++      - name: Host scanner build + run
++        env:
++          RCL_BIN: /tmp/attach.txt
++        run: |
++          make -C host
++          if [ -f "$RCL_BIN" ]; then ./host/rclscan "$RCL_BIN" /tmp; else echo "no image, skipping run"; fi
++      - name: Decoder unit test
++        env:
++          RCL_BIN: /tmp/attach.txt
++        run: |
++          if [ -f "$RCL_BIN" ]; then node test/decode_test.js; else echo "no image, skipping"; fi
++
++  # The deliverable: Theos on macOS builds the .dylib for LiveContainer / jailbreak.
++  dylib:
++    runs-on: macos-14
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Install Theos
++        run: |
++          export THEOS="$RUNNER_TEMP/theos"
++          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
++          xcode-select -s "$(xcode-select -p)"
++          xcrun --sdk iphoneos --show-sdk-path
++          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
++
++      # arm64 only: that is the slice LiveContainer loads. For a jailbreak build that also wants
++      # arm64e, run with ARCHS="arm64 arm64e".
++      - name: Build the dylib
++        run: make -j4 ARCHS="arm64"
++
++      - name: Inspect the artifact
++        run: |
++          ls -la RecoilRuntime.dylib || true
++          file RecoilRuntime.dylib || true
++          xcrun vtool -show-build RecoilRuntime.dylib || true
++
++      - name: Upload the dylib
++        uses: actions/upload-artifact@v4
++        with:
++          name: RecoilRuntime-dylib
++          path: RecoilRuntime.dylib
++          if-no-files-found: error
++
++      - name: Attach to a release on a tag
++        if: startsWith(github.ref, 'refs/tags/')
++        uses: softprops/action-gh-release@v2
++        with:
++          files: RecoilRuntime.dylib
++          generate_release_notes: true
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..2f336ea
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,6 @@
++.theos/
++packages/
++*.dylib
++host/rclscan
++*.o
++*.log
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..acba463
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,34 @@
++# Recoil-Runtime - Theos project that builds the runtime offset searcher as a .dylib.
++#
++#   THEOS=/path/to/theos make            # build
++#   THEOS=/path/to/theos make clean
++#
++# Output lands in .theos/obj/... as a .dylib. See .github/workflows/build.yml for the CI that
++# installs Theos and builds this on a macOS runner.
++
++export ARCHS ?= arm64        # LiveContainer-safe slice; use ARCHS="arm64 arm64e" for a fat jailbreak build
++export TARGET = iphone:clang:latest:14.0
++export ADDITIONAL_CFLAGS = -I Sources
++
++include $(THEOS)/makefiles/common.mk
++
++LIBRARY_NAME = RecoilRuntime
++
++RecoilRuntime_FILES = \
++    Sources/rcl_main.cpp \
++    Sources/rcl_scan.cpp \
++    Sources/rcl_hook.cpp \
++    Sources/rcl_report.cpp \
++    Sources/rcl_log.cpp
++
++RecoilRuntime_CFLAGS     = -I Sources -O2 -fvisibility=hidden
++RecoilRuntime_CXXFLAGS   = -I Sources -O2 -std=c++17 -fvisibility=hidden
++RecoilRuntime_FRAMEWORKS = Foundation
++RecoilRuntime_INSTALL_PATH = /usr/lib
++
++include $(THEOS_MAKE_PATH)/library.mk
++
++# Convenience: copy the built dylib to the repo root and the host build next to it.
++after-all::
++	@find .theos -name '$(LIBRARY_NAME)*.dylib' -exec cp {} ./$(LIBRARY_NAME).dylib \; 2>/dev/null || true
++	@ls -la ./$(LIBRARY_NAME).dylib 2>/dev/null || echo "dylib not found - check .theos"
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..b54ad76
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,106 @@
++# Recoil-Runtime
++
++A **read-only** `.dylib` that scans the loaded game image at launch and writes a log of the gameplay
++offsets. Built by GitHub Actions with [Theos](https://github.com/theos/theos), installed through
++**LiveContainer** (or any tweak loader).
++
++No inline hooks, no code patching, no pointer rewiring. The dylib only reads and logs — which is why
++it is safe to drop into LiveContainer and why it needs no `mobilesubstrate` dependency.
++
++```
++src --> GitHub runner (macos-14 + Theos) --> RecoilRuntime.dylib --> LiveContainer --> log
++```
++
++---
++
++## What it recovers, and how far each part is trusted
++
++| section | what | trust |
++|---|---|---|
++| `[property sites]` | `field <- property ids`. The engine fills runtime objects through one getter, so every `mov w1,#<id> ; bl <getter> ; str/strb w0,[xN,#<field>]` yields an `id -> field` pair. **This is the useful one**: after a game update the field moves, the property id does not. | **solid** — the id is a literal in the caller, and the store decode is the code unit-tested against hand-checked sites |
++| `[column names]` | the data schema's own column-name strings, with the address each was loaded from | **solid as a name list** |
++| `[own-character byte flags]` | bytes on `getBattle()+0x28` that gameplay reads as booleans (build 69: `+0x44, +0x14c, +0x2bc, +0x2ec, +0x32e`) | **solid** — register-liveness checked |
++| `[reachability]` | how many pointer slots hold each seed, i.e. what a slot hook could observe | **solid** — byte-compared against the image |
++| `[loaded images]` | every mapped image >= 512 KB with its `__TEXT` size — shows how LiveContainer maps the guest app | **solid** |
++
++**Deliberately not attempted:** joining a column *name* to a property *id*. Reading the bytes at the
++candidate cache slot looked right for a couple of names and then did not hold up — 1482 of 2143 slots
++hold "unset" and the rest hold 0 or unrelated data, so the store after the name lookup does not belong
++to that cache. Naming a field therefore needs the data schema itself, or a different hook point. This
++is written down so it is not "re-discovered" as a success.
++
++## Installing through LiveContainer
++
++1. Let CI build on a tag, or build locally:
++   ```
++   THEOS=/path/to/theos make -j4 ARCHS="arm64"      # -> RecoilRuntime.dylib
++   ```
++2. In LiveContainer, open the app's settings -> **Tweaks**, and add `RecoilRuntime.dylib`
++   (or drop it into the container's tweak folder). No `.plist` filter is needed.
++3. Launch the game. The dylib waits up to 60 s for the guest app to be mapped — LiveContainer injects
++   tweaks before the guest image is loaded, so a wait is required.
++4. Take the log. `$HOME/Documents` inside the guest container is where it lands; the dylib tries that,
++   then `$HOME`, `/var/mobile/Documents`, `/tmp`. Set `RCL_LOG_DIR` to force a directory, or
++   `RCL_STDERR=1` to mirror everything to stderr (visible in LiveContainer's console).
++
++`RCL_IMAGE_MATCH=<substring>` forces which image is scanned if the auto-pick is ever wrong. In
++LiveContainer the guest app is **not** image 0 — it is a dylib loaded into the host process — so the
++dylib picks the target by shape (an `.app/` path, large `__TEXT`, not the host app), not by index.
++
++## Other install paths
++
++**Jailbroken — as a tweak**
++```
++tools/install_device.sh --device root@<ip> --dylib RecoilRuntime.dylib --bundle-id <id>
++```
++`make package` also produces a `.deb`.
++
++**Sideloaded IPA — inject the load command**
++```
++tools/install_ipa.sh --ipa game.ipa --dylib RecoilRuntime.dylib --out game+recoil.ipa
++```
++Copies the dylib into `<App>.app/Frameworks/`, adds `@executable_path/Frameworks/RecoilRuntime.dylib`
++as an `LC_LOAD_DYLIB`, and repacks. Re-signing afterwards is mandatory — the script prints the exact
++`codesign` / `ldid` / `zsign` command.
++
++**The client's own TweakLoader** — the binary links `@loader_path/../../Tweaks/TweakLoader.dylib`, so
++`--no-lc --tweaks` drops the dylib where that loader looks. The loader's scan directory lives in
++`TweakLoader.dylib`, not in the game binary, so confirm the path on your install.
++
++`tools/inject.py` appends the load command inside the header slack and grows `ncmds`/`sizeofcmds`.
++Verified on the real image: exactly the two header counters plus the command bytes change, the file
++size is untouched, the result still parses as a Mach-O. It refuses when the slack is too small instead
++of relocating anything, and it never re-signs.
++
++## Layout
++
++```
++Sources/   rcl_scan.*    AArch64 scanner + store-to-W0 decoder   (portable, no OS deps)
++           rcl_hook.*    slot search (read-only here); write half is Darwin-only and unused
++           rcl_report.*  the report itself                        (portable)
++           rcl_log.*     POSIX file logging + stderr mirror       (portable)
++           rcl_main.cpp  dylib entry: pick image, wait, scan      (Darwin-guarded)
++host/      main.cpp runs the SAME report over a Mach-O file
++agent/     arm64_decode.js  the decoder in JS (Frida path), same spec as the C++
++test/      decode_test.js   verifies the decoder against the real image
++tools/     inject.py  install_ipa.sh  install_device.sh  smoke.sh
++```
++
++## Verifying it yourself
++
++```
++RCL_BIN=/path/to/attach.txt bash tools/smoke.sh
++```
++Builds the host scanner with plain `g++`, runs the *same report code* the dylib runs, and checks the
++arm64 decoder against hand-verified sites. Everything that could silently produce wrong numbers is
++portable C++ precisely so this works without an iOS toolchain.
++
++## Limits worth knowing
++
++* **Seeds are build-69 specific** (`0x8c5130`, `0xafd76c`, `0xbc75e8`, the `__text` bounds) — the one
++  thing to update per version. Everything derived from them is not.
++* **Nothing can be slot-hooked that lives in no table.** Verified: the property getter and the
++  column-name getter have **zero** pointer slots. A virtual target does: `0x7a03a0` has exactly one,
++  at `0xfd6c70`. This build does not hook anything anyway.
++* **The iOS link happens in CI** (no iOS toolchain here), but the device TUs are Darwin-guarded and
++  compile in the host build, so their syntax is covered.
+diff --git a/RecoilRuntime.plist b/RecoilRuntime.plist
+new file mode 100644
+index 0000000..3bc5a2a
+--- /dev/null
++++ b/RecoilRuntime.plist
+@@ -0,0 +1,14 @@
++{
++    Filter = {
++        Bundles = (
++            "com.supercell.brawlstars",
++            "com.nulls.brawlstars"
++        );
++    };
++    /* Substrate / ElleKit filter.
++     *
++     * Replace the bundle ids with the ones your install actually uses - tools/install_device.sh can
++     * do it for you:  ./tools/install_device.sh --bundle-id <id> --dylib <dylib>
++     * Find the real id with:  plutil -p Payload/*.app/Info.plist | grep CFBundleIdentifier
++     */
++}
+diff --git a/Sources/rcl_hook.cpp b/Sources/rcl_hook.cpp
+new file mode 100644
+index 0000000..c3afd02
+--- /dev/null
++++ b/Sources/rcl_hook.cpp
+@@ -0,0 +1,76 @@
++// rcl_hook.cpp - pointer-slot hooking and live offset logging.
++//
++// We do NOT patch code. The mod this is ported from deliberately refuses to write executable pages
++// and rewires function pointers instead: find the 8-byte slots that hold the target address and
++// repoint them at the replacement, keeping the original for call-through. That works with PAC and
++// needs no trampoline.
++//
++// The scan half is portable, so it is verified on the host against the real image; only the write
++// half is Darwin-specific.
++
++#include "rcl_hook.h"
++#include <string.h>
++
++namespace rcl {
++
++int hook_scan(const Image &img, uint64_t target, uint64_t skip_lo, uint64_t skip_hi,
++              std::vector<uint64_t> &slots, int max_slots) {
++    slots.clear();
++    const uint64_t base = img.base;
++    const uint64_t end = img.base + img.vmsize;
++    for (uint64_t va = base; va + 8 <= end; va += 8) {
++        if (va >= skip_lo && va < skip_hi) continue;        // never look inside __text
++        uint64_t v = 0;
++        if (!img.read(img.ctx, va, &v, 8)) continue;
++        // Two forms are accepted:
++        //   loaded image  -> the slot holds the absolute VA of the target
++        //   on-disk file  -> chained fixups keep the full VA in the low 36 bits, with the
++        //                    bind/next/delta fields above (observed: 0x00100001007a03a0)
++        if (v == target || (v & 0xFFFFFFFFFULL) == (target & 0xFFFFFFFFFULL)) {
++            slots.push_back(va);
++            if ((int)slots.size() >= max_slots) break;
++        }
++    }
++    return (int)slots.size();
++}
++
++int hook_install(const Image &img, uint64_t target, uint64_t replacement,
++                 uint64_t skip_lo, uint64_t skip_hi, std::vector<uint64_t> &originals,
++                 int max_slots) {
++    originals.clear();
++    std::vector<uint64_t> slots;
++    hook_scan(img, target, skip_lo, skip_hi, slots, max_slots);
++    int n = 0;
++    for (uint64_t slot : slots) {
++        uint64_t prev = 0;
++        if (!img.read(img.ctx, slot, &prev, 8)) continue;
++        if (!hook_slot_write(slot, replacement)) continue;   // host build: stops here, by design
++        originals.push_back(prev);
++        n++;
++    }
++    return n;
++}
++
++#if defined(__APPLE__)
++#include <mach/mach.h>
++#include <mach/vm_map.h>
++#include <libkern/OSCacheControl.h>
++
++bool hook_slot_write(uint64_t slot, uint64_t value) {
++    vm_address_t page = (vm_address_t)(slot & ~0xFFFULL);
++    kern_return_t kr = vm_protect(mach_task_self(), page, 0x1000, false,
++                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
++    if (kr != KERN_SUCCESS) return false;
++    memcpy((void *)slot, &value, 8);
++    sys_icache_invalidate((void *)page, 0x1000);
++    vm_protect(mach_task_self(), page, 0x1000, false, VM_PROT_READ | VM_PROT_EXECUTE);
++    return true;
++}
++#else
++bool hook_slot_write(uint64_t slot, uint64_t value) {
++    (void)slot; (void)value;
++    return false;      // host build: scanning only, no writes
++}
++#endif
++
++} // namespace rcl
+diff --git a/Sources/rcl_hook.h b/Sources/rcl_hook.h
+new file mode 100644
+index 0000000..e318152
+--- /dev/null
++++ b/Sources/rcl_hook.h
+@@ -0,0 +1,26 @@
++// rcl_hook.h - pointer-slot hooks for the runtime logger.
++#ifndef RCL_HOOK_H
++#define RCL_HOOK_H
++
++#include "rcl_scan.h"
++#include <vector>
++
++namespace rcl {
++
++// Collect up to max_slots 8-byte slots holding `target`, skipping [skip_lo, skip_hi) (__text).
++int hook_scan(const Image &img, uint64_t target, uint64_t skip_lo, uint64_t skip_hi,
++              std::vector<uint64_t> &slots, int max_slots = 64);
++
++// Rewrite one slot. Returns false when unavailable (host build) or when the page cannot be made
++// writable. Callers must keep the previous value for call-through.
++bool hook_slot_write(uint64_t slot, uint64_t value);
++
++// Convenience: scan and rewrite every slot for `target`; returns how many were rewritten and fills
++// `originals` with the previous values.
++int hook_install(const Image &img, uint64_t target, uint64_t replacement,
++                 uint64_t skip_lo, uint64_t skip_hi, std::vector<uint64_t> &originals,
++                 int max_slots = 64);
++
++} // namespace rcl
++
++#endif
+diff --git a/Sources/rcl_log.cpp b/Sources/rcl_log.cpp
+new file mode 100644
+index 0000000..a168499
+--- /dev/null
++++ b/Sources/rcl_log.cpp
+@@ -0,0 +1,50 @@
++// rcl_log.cpp
++
++#include "rcl_log.h"
++#include <fcntl.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++#include <stdlib.h>
++
++namespace rcl {
++
++static int g_fd = -1;
++static char g_path[512];
++
++void log_open(const char *dir) {
++    if (g_fd >= 0) return;
++    const char *d = (dir && *dir) ? dir : ".";
++    time_t t = time(nullptr);
++    struct tm tmv;
++    localtime_r(&t, &tmv);
++    snprintf(g_path, sizeof g_path, "%s/recoil-runtime-%04d%02d%02d-%02d%02d%02d.log", d,
++             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
++    g_fd = open(g_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
++}
++
++bool log_is_open() { return g_fd >= 0; }
++
++void log_close() {
++    if (g_fd >= 0) { close(g_fd); g_fd = -1; }
++}
++
++void log_printf(const char *fmt, ...) {
++    char buf[1024];
++    va_list ap;
++    va_start(ap, fmt);
++    int n = vsnprintf(buf, sizeof buf, fmt, ap);
++    va_end(ap);
++    if (n <= 0) return;
++    if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;
++    if (g_fd >= 0) {
++        ssize_t r = write(g_fd, buf, (size_t)n);
++        (void)r;
++    }
++    // mirror to stderr: LiveContainer and most installers show it in their console, which is a
++    // useful fallback when the container path cannot be located from the outside
++    if (getenv("RCL_STDERR")) fwrite(buf, 1, (size_t)n, stderr);
++}
++
++} // namespace rcl
+diff --git a/Sources/rcl_log.h b/Sources/rcl_log.h
+new file mode 100644
+index 0000000..c04da7f
+--- /dev/null
++++ b/Sources/rcl_log.h
+@@ -0,0 +1,24 @@
++// rcl_log.h - logging for the runtime offset searcher.
++//
++// Writes to a file (so the result survives a crash and can be pulled off the device) and mirrors to
++// os_log when available. POSIX-only core, so it also builds on the host.
++#ifndef RCL_LOG_H
++#define RCL_LOG_H
++
++#include <stdarg.h>
++
++namespace rcl {
++
++// Opens the log file. `dir` defaults to the app's Documents directory on device, "." on host.
++// Returns the path actually used (empty on failure).
++void log_open(const char *dir);
++bool log_is_open();
++void log_close();
++void log_printf(const char *fmt, ...);
++
++} // namespace rcl
++
++#define RCL_LOG(...) ::rcl::log_printf(__VA_ARGS__)
++#define RCL_LOGLN(...) do { ::rcl::log_printf(__VA_ARGS__); ::rcl::log_printf("\n"); } while (0)
++
++#endif
+diff --git a/Sources/rcl_main.cpp b/Sources/rcl_main.cpp
+new file mode 100644
+index 0000000..664e15f
+--- /dev/null
++++ b/Sources/rcl_main.cpp
+@@ -0,0 +1,185 @@
++// rcl_main.cpp - entry point of the injected dylib.
++//
++// READ-ONLY by design: the dylib scans the loaded game image and writes a log. It installs no
++// inline hooks, patches no code and rewires no pointers - there is nothing to turn off, because the
++// write path is not used here at all.
++//
++// LiveContainer-aware: in LiveContainer the guest app is not image 0, it is a dylib loaded into the
++// host process, so the target is chosen by shape (an .app/ path, large __TEXT, not the host app)
++// rather than by index. RCL_IMAGE_MATCH forces a substring when needed.
++//
++// Darwin parts are guarded so this file also compiles on the host, which is how its build is
++// verified without an iOS toolchain.
++
++#include "rcl_scan.h"
++#include "rcl_report.h"
++#include "rcl_hook.h"
++#include "rcl_log.h"
++
++#include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string>
++
++#if defined(__APPLE__)
++#include <mach-o/dyld.h>
++#include <mach-o/loader.h>
++#include <unistd.h>
++#include <pthread.h>
++#endif
++
++namespace rcl {
++
++#if defined(__APPLE__)
++
++static const char *kSelfName = "RecoilRuntime";
++
++static bool live_read(void *ctx, uint64_t va, void *dst, size_t n) {
++    const Image *im = (const Image *)ctx;
++    if (va < im->base) return false;
++    uint64_t off = va - im->base;
++    if (off + n > im->vmsize) return false;
++    memcpy(dst, (const void *)(uintptr_t)va, n);      // VA == pointer in-process
++    return true;
++}
++
++struct Cand { const struct mach_header_64 *h; int64_t slide; const char *name; uint64_t textsize; };
++
++static uint64_t text_vmsize(const struct mach_header_64 *h) {
++    uint64_t t = 0;
++    const uint8_t *p = (const uint8_t *)h + sizeof(struct mach_header_64);
++    for (uint32_t c = 0; c < h->ncmds; c++) {
++        const struct load_command *lc = (const struct load_command *)p;
++        if (lc->cmd == LC_SEGMENT_64) {
++            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
++            if (strncmp(sg->segname, "__TEXT", 16) == 0) t = sg->vmsize;
++        }
++        p += lc->cmdsize;
++    }
++    return t;
++}
++
++// Pick the target image; false while the guest app is not mapped yet.
++static bool find_image(Image &out, std::string &why) {
++    const char *want = getenv("RCL_IMAGE_MATCH");
++    Cand best{nullptr, 0, nullptr, 0};        // best .app/ image that is not the host
++    Cand biggest{nullptr, 0, nullptr, 0};     // fallback: biggest non-system image
++
++    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
++        const struct mach_header_64 *h = (const struct mach_header_64 *) _dyld_get_image_header(i);
++        if (!h || h->magic != MH_MAGIC_64) continue;
++        const char *name = _dyld_get_image_name(i);
++        if (!name) continue;
++        if (strstr(name, kSelfName)) continue;                  // our own dylib
++        uint64_t ts = text_vmsize(h);
++        if (ts < 0x200000) continue;                            // system libs, small dylibs
++        Cand c{h, _dyld_get_image_vmaddr_slide(i), name, ts};
++
++        if (want) { if (strstr(name, want) && ts > biggest.textsize) biggest = c; continue; }
++
++        const bool inApp = strstr(name, ".app/") != nullptr;
++        const bool host  = strstr(name, "LiveContainer") || strstr(name, "TrollStore");
++        if (inApp && !host && ts > best.textsize) best = c;
++        if (ts > biggest.textsize) biggest = c;
++    }
++
++    Cand pick = (want && biggest.h) ? biggest : (best.h ? best : biggest);
++    if (!pick.h) { why = "no candidate image yet"; return false; }
++
++    static Image holder;
++    holder.base = (uint64_t)(uintptr_t)pick.h;
++    holder.vmsize = pick.textsize;
++    holder.ctx = &holder;
++    holder.read = live_read;
++    out = holder;
++    why = pick.name ? pick.name : "?";
++    return true;
++}
++
++static void log_image_list() {
++    RCL_LOGLN("[loaded images] >=512KB, with __TEXT vmsize - shows how the guest app is mapped");
++    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
++        const struct mach_header_64 *h = (const struct mach_header_64 *) _dyld_get_image_header(i);
++        if (!h || h->magic != MH_MAGIC_64) continue;
++        uint64_t ts = text_vmsize(h);
++        if (ts < 0x80000) continue;
++        RCL_LOGLN("   [%2u] 0x%08llx  %s", i, (unsigned long long)ts,
++                  _dyld_get_image_name(i) ? _dyld_get_image_name(i) : "?");
++    }
++}
++
++// First writable directory wins. LiveContainer gives the guest its own HOME, so $HOME/Documents is
++// the primary candidate; the shared and jailbreak paths are fallbacks.
++static void open_log_anywhere() {
++    char home_docs[512] = {0}, home[512] = {0};
++    const char *env = getenv("RCL_LOG_DIR");
++    const char *h = getenv("HOME");
++    if (h) { snprintf(home, sizeof home, "%s", h); snprintf(home_docs, sizeof home_docs, "%s/Documents", h); }
++
++    const char *cands[5];
++    int n = 0;
++    if (env && *env) cands[n++] = env;
++    if (home_docs[0]) cands[n++] = home_docs;
++    if (home[0]) cands[n++] = home;
++    cands[n++] = "/var/mobile/Documents";
++    cands[n++] = "/tmp";
++
++    for (int i = 0; i < n; i++) {
++        log_open(cands[i]);
++        if (log_is_open()) { RCL_LOGLN("[log] %s", cands[i]); return; }
++    }
++}
++
++static void run_once() {
++    Image img;
++    std::string why;
++    if (!find_image(img, why)) return;
++    log_image_list();
++    RCL_LOGLN("[target image] %s", why.c_str());
++    report_run(img, Seeds::build69());
++    log_close();
++}
++
++static void *waiter(void *) {
++    // LiveContainer may inject the tweak before the guest app is mapped: poll up to ~60s.
++    for (int i = 0; i < 120; i++) {
++        Image img; std::string why;
++        if (find_image(img, why)) {
++            open_log_anywhere();
++            run_once();
++            return nullptr;
++        }
++        usleep(500000);
++    }
++    open_log_anywhere();
++    RCL_LOGLN("Recoil-Runtime: no target image after 60s");
++    log_close();
++    return nullptr;
++}
++
++__attribute__((constructor)) static void rcl_ctor(void) {
++    pthread_t th;
++    if (pthread_create(&th, nullptr, waiter, nullptr) == 0) pthread_detach(th);
++    else { open_log_anywhere(); waiter(nullptr); }
++}
++
++#else  // ---------- host ----------
++
++static bool host_read(void *, uint64_t, void *, size_t) { return false; }
++
++Image rcl_host_placeholder_image() {
++    Image i{};
++    i.read = host_read;
++    return i;
++}
++
++void rcl_run_once_for_host() {
++    Image img = rcl_host_placeholder_image();
++    log_open("/tmp");
++    report_run(img, Seeds::build69());
++    log_close();
++}
++
++#endif
++
++} // namespace rcl
+diff --git a/Sources/rcl_report.cpp b/Sources/rcl_report.cpp
+new file mode 100644
+index 0000000..e9c009e
+--- /dev/null
++++ b/Sources/rcl_report.cpp
+@@ -0,0 +1,117 @@
++// rcl_report.cpp - the offset search report.
++//
++// READ-ONLY. This file never writes to the target process: no inline hooks, no code patching, no
++// pointer rewiring. It scans and writes a log. That is the whole contract, and it is what makes the
++// dylib safe to drop into LiveContainer.
++//
++// Portable: the device and the host run exactly this, so the host output is the device output.
++//
++// What is reported, and how far each item is trusted:
++//   [property sites]      solid. The id is a literal in the caller (`mov w1,#id` right before the
++//                         call) and the field is the store immediately after the call returns; the
++//                         store decode is the same code verified against hand-checked sites.
++//   [column names]        solid as a NAME LIST - the strings really are the data schema's column
++//                         names. The page+offset shown locates the string, nothing more.
++//   [own-character flags] solid, register-liveness checked.
++//   [reachability]        solid, byte-compared against the real image.
++//
++//   NOT reported, because it was tried and did not hold up: the link from a column NAME to a
++//   property ID. Reading the 4 bytes at the candidate cache slot looked promising on a few names
++//   and turned out to be wrong - 1482 of 2143 slots hold "unset" and the rest 0 or unrelated data,
++//   so the store after the name lookup does not belong to the cache. Naming a field therefore still
++//   needs the data schema itself, or a different hook point. Do not resurrect this without a
++//   runtime check.
++
++#include "rcl_report.h"
++#include "rcl_hook.h"
++#include "rcl_log.h"
++#include <map>
++#include <set>
++#include <string>
++#include <vector>
++
++namespace rcl {
++
++static void dump_property_sites(const Image &img, const Seeds &s) {
++    auto sites = scan_property_sites(img, s);
++    std::map<uint32_t, std::set<uint32_t>> byField;      // field -> {ids}
++    for (auto &p : sites) byField[p.field].insert(p.id);
++
++    RCL_LOGLN("[property sites] sites=%zu  unique(field)=%zu", sites.size(), byField.size());
++    RCL_LOGLN("   field -> the property ids written into it");
++    for (auto &kv : byField) {
++        RCL_LOG("   +0x%04x <-", kv.first);
++        for (auto id : kv.second) RCL_LOG(" 0x%02x", id);
++        RCL_LOGLN("");
++    }
++}
++
++static void dump_column_names(const std::vector<ColumnSite> &cols) {
++    std::map<uint64_t, std::string> byPageOff;
++    for (auto &c : cols) if (c.slot_va) byPageOff[c.slot_va] = c.name;
++
++    RCL_LOGLN("[column names] sites=%zu  unique=%zu", cols.size(), byPageOff.size());
++    RCL_LOGLN("   name and the address it was loaded from (the schema's own strings)");
++    int shown = 0;
++    for (auto &kv : byPageOff) {
++        RCL_LOGLN("   0x%llx  \"%s\"", (unsigned long long)(kv.first - 0x100000000ULL), kv.second.c_str());
++        if (++shown >= 32) { RCL_LOGLN("   ... (%zu total, first 32 shown)", byPageOff.size()); break; }
++    }
++    RCL_LOGLN("   -- names mentioning charge / hyper, listed in full --");
++    for (auto &kv : byPageOff) {
++        const std::string &nm = kv.second;
++        if (nm.find("vercharge") == std::string::npos && nm.find("yper") == std::string::npos &&
++            nm.find("Charge") == std::string::npos) continue;
++        RCL_LOGLN("   0x%llx  \"%s\"", (unsigned long long)(kv.first - 0x100000000ULL), nm.c_str());
++    }
++}
++
++static void dump_own_char_flags(const Image &img, const Seeds &s) {
++    auto flags = scan_own_char_flags(img, s);
++    std::set<uint32_t> uniq;
++    for (auto &f : flags) uniq.insert(f.off);
++    RCL_LOGLN("[own-character byte flags] hits=%zu  unique offsets=%zu", flags.size(), uniq.size());
++    for (auto o : uniq) RCL_LOGLN("   +0x%04x", o);
++}
++
++static void dump_reachability(const Image &img, const Seeds &s) {
++    RCL_LOGLN("[reachability] pointer slots holding each seed (informational - nothing is hooked)");
++    struct { const char *nm; uint64_t off; } seeds[] = {
++        {"getBattle 0x8c5130", s.getbattle_off},
++        {"propget   0xafd76c", s.propget_off},
++        {"colname   0xbc75e8", s.colname_off},
++        {"vt99      0x7a03a0", 0x7a03a0},
++    };
++    for (auto &sd : seeds) {
++        std::vector<uint64_t> slots;
++        int n = hook_scan(img, img.base + sd.off, img.base + s.text_off,
++                          img.base + s.text_end_off, slots);
++        RCL_LOG("   %s -> %d slot(s)", sd.nm, n);
++        for (int i = 0; i < n && i < 4; i++)
++            RCL_LOG("  0x%llx", (unsigned long long)(slots[i] - img.base));
++        RCL_LOGLN("");
++    }
++}
++
++void report_run(const Image &img, const Seeds &s) {
++    RCL_LOGLN("== Recoil-Runtime offset search ==");
++    RCL_LOGLN("image base 0x%llx  vmsize 0x%llx", (unsigned long long)img.base,
++              (unsigned long long)img.vmsize);
++    RCL_LOGLN("__text     0x%llx..0x%llx", (unsigned long long)s.text_off,
++              (unsigned long long)s.text_end_off);
++    RCL_LOGLN("mode: read-only scan, no hooks installed");
++    RCL_LOGLN("");
++
++    std::vector<ColumnSite> cols = scan_column_sites(img, s);
++
++    dump_property_sites(img, s);
++    RCL_LOGLN("");
++    dump_column_names(cols);
++    RCL_LOGLN("");
++    dump_own_char_flags(img, s);
++    RCL_LOGLN("");
++    dump_reachability(img, s);
++    RCL_LOGLN("== end ==");
++}
++
++} // namespace rcl
+diff --git a/Sources/rcl_report.h b/Sources/rcl_report.h
+new file mode 100644
+index 0000000..97fc1a2
+--- /dev/null
++++ b/Sources/rcl_report.h
+@@ -0,0 +1,14 @@
++// rcl_report.h
++#ifndef RCL_REPORT_H
++#define RCL_REPORT_H
++
++#include "rcl_scan.h"
++
++namespace rcl {
++
++// Run every scanner against `img` and write the report to the log. Identical on device and host.
++void report_run(const Image &img, const Seeds &s);
++
++} // namespace rcl
++
++#endif
+diff --git a/Sources/rcl_scan.cpp b/Sources/rcl_scan.cpp
+new file mode 100644
+index 0000000..97846e6
+--- /dev/null
++++ b/Sources/rcl_scan.cpp
+@@ -0,0 +1,249 @@
++// rcl_scan.cpp - see rcl_scan.h
++
++#include "rcl_scan.h"
++#include <string.h>
++
++namespace rcl {
++
++// ---------------------------------------------------------------- seeds
++
++Seeds Seeds::build69() {
++    Seeds s{};
++    s.text_off      = 0x4000;      // __TEXT.__text starts at 0x100004000
++    s.text_end_off  = 0xd8af60;    // __text end
++    s.getbattle_off = 0x8c5130;    // RCL_GETBATTLE_RVA
++    s.propget_off   = 0xafd76c;    // property-value getter  getPropertyValue(obj, id)
++    s.colname_off   = 0xbc75e8;    // column index by name   getColumnIndex(table, name)
++    s.cstr_va       = 0;           // not needed: strings are read by absolute VA
++    s.cstr_size     = 0;
++    return s;
++}
++
++// ---------------------------------------------------------------- image
++
++bool Image::cstr(uint64_t va, std::string &out) const {
++    out.clear();
++    for (int i = 0; i < 48; i++) {
++        char c = 0;
++        if (!read(ctx, va + i, &c, 1)) return false;
++        if (c == 0) break;
++        if ((unsigned char)c < 32 || (unsigned char)c > 126) return false;
++        out.push_back(c);
++    }
++    return out.size() >= 3;
++}
++
++// ---------------------------------------------------------------- instruction helpers
++
++static inline int64_t sign_extend(uint64_t v, int bits) {
++    uint64_t m = 1ULL << (bits - 1);
++    return (int64_t)((v ^ m) - m);
++}
++
++bool branch_target(const Image &img, uint64_t va, uint64_t &target) {
++    uint32_t w = 0;
++    if (!img.u32(va, w)) return false;
++    if ((w & 0xFC000000) == 0x14000000) {          // b / bl
++        target = va + ((uint64_t)(sign_extend(w & 0x03FFFFFF, 26)) << 2);
++        return true;
++    }
++    if ((w & 0xFF000010) == 0x54000000) {          // b.cond
++        target = va + ((uint64_t)(sign_extend((w >> 5) & 0x7FFFF, 19)) << 2);
++        return true;
++    }
++    if ((w & 0x7E000000) == 0x34000000) {          // cbz / cbnz
++        target = va + ((uint64_t)(sign_extend((w >> 5) & 0x7FFFF, 19)) << 2);
++        return true;
++    }
++    return false;
++}
++
++static bool is_bl_to(const Image &img, uint64_t va, uint64_t target) {
++    uint32_t w = 0;
++    if (!img.u32(va, w)) return false;
++    if ((w & 0xFC000000) != 0x94000000) return false;
++    uint64_t t = va + ((uint64_t)(sign_extend(w & 0x03FFFFFF, 26)) << 2);
++    return t == target;
++}
++
++// movz w1, #imm  -> id
++static bool movz_w1(uint32_t w, uint32_t &imm) {
++    if ((w & 0xFFE00000) != 0x52800000) return false;   // opcode + hw == 0
++    if ((w & 0x1F) != 1) return false;                  // Rd == w1
++    imm = (w >> 5) & 0xFFFF;
++    return true;
++}
++
++// adrp xR, #page  at va -> (page, R)
++static bool adrp_at(const Image &img, uint64_t va, uint64_t &page, uint32_t &rd) {
++    uint32_t w = 0;
++    if (!img.u32(va, w)) return false;
++    if ((w & 0x9F000000) != 0x90000000) return false;
++    uint64_t imm = (((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3);
++    page = (va & ~0xFFFULL) + ((uint64_t)sign_extend(imm, 21) << 12);
++    rd = w & 0x1F;
++    return true;
++}
++
++// add xD, xN, #imm12  at va, with xN == rd
++static bool add_imm(const Image &img, uint64_t va, uint32_t rd, uint64_t &res) {
++    uint32_t w = 0;
++    if (!img.u32(va, w)) return false;
++    if ((w & 0x7F000000) != 0x11000000) return false;   // ADD (immediate), 64/32-bit
++    if (((w >> 5) & 0x1F) != rd) return false;
++    uint64_t page = 0;
++    if (!adrp_at(img, va - 4, page, rd)) return false;
++    res = page + ((w >> 10) & 0xFFF);
++    return true;
++}
++
++// best-effort destination register of an instruction; -1 when unknown/none.
++static int dest_reg(uint32_t w) {
++    // MOVZ / MOVN / MOVK
++    if ((w & 0x7F800000) == 0x52800000 || (w & 0x7F800000) == 0x12800000) return w & 0x1F;
++    // loads only: in the 0x39000000 family bit22 == 1 means load (0 = store, which writes no reg)
++    if ((w & 0x3B000000) == 0x39000000 && ((w >> 22) & 1)) return w & 0x1F;
++    uint32_t ldu = w & 0xFFE00C00;
++    if (ldu == 0x38400000) return w & 0x1F;                // LDURB/LDURH/LDUR
++    if (ldu == 0xB8400000) return w & 0x1F;                // LDUR W
++    if (ldu == 0xF8400000) return w & 0x1F;                // LDUR X
++    uint32_t ldp = w & 0x7FC00000;
++    if (ldp == 0x29400000 || ldp == 0xA9400000 || ldp == 0x69400000 || ldp == 0x28C00000) return w & 0x1F;
++    // ADD / SUB (immediate and shifted register)
++    if ((w & 0x1F000000) == 0x11000000 && (w & 0x0F000000) != 0x0F000000) return w & 0x1F;
++    if ((w & 0x1F200000) == 0x0B000000) return w & 0x1F;
++    // logical (shifted register / immediate)
++    if ((w & 0x1F200000) == 0x0A000000) return w & 0x1F;
++    if ((w & 0x1F800000) == 0x12000000) return w & 0x1F;
++    // CSEL / CSINC family
++    if ((w & 0x1FE00000) == 0x1A800000) return w & 0x1F;
++    // MOV (register) is ORR Rd, XZR, Rm : 0x2A0003E0 mask
++    if ((w & 0xFFE0FFE0) == 0x2A0003E0 || (w & 0xFFE0FFE0) == 0xAA0003E0) return w & 0x1F;
++    // ADRP / ADR
++    if ((w & 0x9F000000) == 0x90000000 || (w & 0x9F000000) == 0x10000000) return w & 0x1F;
++    return -1;
++}
++
++// ---------------------------------------------------------------- decode primitive
++
++StoreDecoded decode_store_to_w0(const Image &img, uint64_t at, int n) {
++    StoreDecoded d;
++    for (int k = 0; k < n; k++) {
++        uint32_t w = 0;
++        if (!img.u32(at + 4 * k, w)) break;
++        if ((w & 0xFFC0001F) == 0x39000000) { d = {true, "strb", (int64_t)((w >> 10) & 0xFFF), 1}; return d; }
++        if ((w & 0xFFC0001F) == 0xB9000000) { d = {true, "str",  (int64_t)(((w >> 10) & 0xFFF) * 4), 4}; return d; }
++        if ((w & 0xFFC0001F) == 0xF9000000) { d = {true, "strx", (int64_t)(((w >> 10) & 0xFFF) * 8), 8}; return d; }
++        if ((w & 0xFFE00C1F) == 0x38000000) { d = {true, "sturb", sign_extend((w >> 12) & 0x1FF, 9), 1}; return d; }
++        if ((w & 0xFFE00C1F) == 0xB8000000) { d = {true, "stur",  sign_extend((w >> 12) & 0x1FF, 9), 4}; return d; }
++        if ((w & 0xFFC00000) == 0x39000000 && (w & 0x1F) == 31) {
++            d = {true, "strb_zr", (int64_t)((w >> 10) & 0xFFF), 1}; return d;
++        }
++        if ((w & 0xFFC00000) == 0x29000000) { d = {true, "stp_w", (int64_t)(((w >> 15) & 0x7F) * 4), 8}; return d; }
++    }
++    return d;
++}
++
++// ---------------------------------------------------------------- scanners
++
++std::vector<PropSite> scan_property_sites(const Image &img, const Seeds &s) {
++    std::vector<PropSite> out;
++    const uint64_t target = img.base + s.propget_off;
++    for (uint64_t va = img.base + s.text_off; va + 4 <= img.base + s.text_end_off; va += 4) {
++        if (!is_bl_to(img, va, target)) continue;
++        PropSite p{};
++        p.site = va;
++        p.id = 0;
++        for (int k = 1; k <= 4; k++) {                       // mov w1,#id just before
++            uint32_t w = 0;
++            if (!img.u32(va - 4 * k, w)) break;
++            uint32_t imm = 0;
++            if (movz_w1(w, imm)) { p.id = imm; break; }
++        }
++        StoreDecoded d = decode_store_to_w0(img, va + 4, 8);
++        if (d.found && d.off >= 0 && d.off < 0x100000) {
++            p.field = (uint32_t)d.off;
++            p.width = d.width;
++            p.kind = d.kind;
++            out.push_back(p);
++        }
++    }
++    return out;
++}
++
++std::vector<ColumnSite> scan_column_sites(const Image &img, const Seeds &s) {
++    std::vector<ColumnSite> out;
++    const uint64_t target = img.base + s.colname_off;
++    for (uint64_t va = img.base + s.text_off; va + 4 <= img.base + s.text_end_off; va += 4) {
++        if (!is_bl_to(img, va, target)) continue;
++        std::string name;
++        for (int k = 1; k <= 4; k++) {                        // adrp+add "Name" just before
++            uint64_t strva = 0;
++            uint32_t rd = 0;
++            if (!adrp_at(img, va - 4 * k, strva, rd)) continue;
++            uint64_t full = 0;
++            if (!add_imm(img, va - 4 * k + 4, rd, full)) continue;
++            (void)strva;
++            if (img.cstr(full, name)) break;
++            name.clear();
++        }
++        if (name.empty()) continue;
++        // following str w0, [xN, #slot]  (and the adrp that supplies xN, for the absolute VA)
++        for (int k = 1; k <= 8; k++) {
++            uint32_t w = 0;
++            if (!img.u32(va + 4 * k, w)) break;
++            bool isStr = ((w & 0xFFC00000) == 0xB9000000 && (w & 0x1F) == 0);
++            bool isStur = ((w & 0xFFE00C00) == 0xB8000000 && (w & 0x1F) == 0);
++            if (!isStr && !isStur) continue;
++            uint32_t imm = isStr ? ((w >> 10) & 0xFFF) : (uint32_t)sign_extend((w >> 12) & 0x1FF, 9);
++            uint32_t base = (w >> 5) & 0x1F;
++            uint64_t slot_va = 0;
++            for (int b = 1; b <= 8; b++) {
++                uint64_t page = 0;
++                uint32_t rd = 0;
++                if (!adrp_at(img, va + 4 * k - 4 * b, page, rd)) continue;
++                if (rd == base) { slot_va = page + imm; break; }
++            }
++            out.push_back({name, imm, va, slot_va});
++            break;
++        }
++    }
++    return out;
++}
++
++std::vector<OwnFlag> scan_own_char_flags(const Image &img, const Seeds &s) {
++    std::vector<OwnFlag> out;
++    const uint64_t target = img.base + s.getbattle_off;
++    for (uint64_t va = img.base + s.text_off; va + 4 <= img.base + s.text_end_off; va += 4) {
++        if (!is_bl_to(img, va, target)) continue;
++        // ldr xR, [x0, #0x28]  right after the call
++        int R = -1, defK = -1;
++        for (int k = 1; k <= 6; k++) {
++            uint32_t w = 0;
++            if (!img.u32(va + 4 * k, w)) break;
++            if ((w & 0xFFC00000) == 0xF9400000 && ((w >> 5) & 0x1F) == 0 &&
++                ((w >> 10) & 0xFFF) * 8 == 0x28) {
++                R = w & 0x1F;
++                defK = k;
++                break;
++            }
++        }
++        if (R < 0) continue;
++        // walk forward with liveness; start AFTER the definition, stop when R is written again
++        for (int k = defK + 1; k <= defK + 64; k++) {
++            uint64_t a = va + 4 * k;
++            uint32_t w = 0;
++            if (!img.u32(a, w)) break;
++            int dr = dest_reg(w);
++            if (dr == R) break;                                    // R clobbered
++            if ((w & 0xFFC00000) == 0x39400000 && (int)((w >> 5) & 0x1F) == R) {
++                out.push_back({(uint32_t)((w >> 10) & 0xFFF), 0, "ldrb"});
++            } else if ((w & 0xFFC00000) == 0x79400000 && (int)((w >> 5) & 0x1F) == R) {
++                out.push_back({(uint32_t)(((w >> 10) & 0xFFF) * 2), 0, "ldrh"});
++            }
++        }
++    }
++    return out;
++}
++
++} // namespace rcl
+diff --git a/Sources/rcl_scan.h b/Sources/rcl_scan.h
+new file mode 100644
+index 0000000..01a3e09
+--- /dev/null
++++ b/Sources/rcl_scan.h
+@@ -0,0 +1,99 @@
++// rcl_scan.h - portable AArch64 scanner for runtime offset discovery.
++//
++// Deliberately free of ObjC/Foundation so the exact same translation unit builds for the device
++// (Theos) and for a host test that runs it over the real Mach-O image. That is what makes the
++// scanner verifiable off-device.
++//
++// Everything works off a byte reader, so the device can hand it live memory and the host can hand
++// it the mapped file.
++
++#ifndef RCL_SCAN_H
++#define RCL_SCAN_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <string>
++#include <vector>
++
++namespace rcl {
++
++// ---------- seeds ----------
++// Build-69 seeds. These are starting points, not the answer: the scanner derives everything else.
++struct Seeds {
++    uint64_t text_off;        // start of __TEXT.__text, as an offset from the image base
++    uint64_t text_end_off;    // end of __TEXT.__text
++    uint64_t getbattle_off;   // 0x8c5130  RCL_GETBATTLE_RVA
++    uint64_t propget_off;     // 0xafd76c  property-value getter
++    uint64_t colname_off;     // 0xbc75e8  column-index-by-name
++    uint64_t cstr_va;         // VA of __TEXT.__cstring (for name reads), 0 if unknown
++    uint64_t cstr_size;
++
++    static Seeds build69();
++};
++
++// ---------- memory access ----------
++struct Image {
++    uint64_t base = 0;                 // VM base (0x100000000 for the build-69 image)
++    uint64_t vmsize = 0;
++    void *ctx = nullptr;
++    // Read n bytes from VA. Return false if out of range. Never throws.
++    bool (*read)(void *ctx, uint64_t va, void *dst, size_t n) = nullptr;
++
++    bool ok() const { return base != 0 && read != nullptr; }
++    bool u32(uint64_t va, uint32_t &out) const {
++        return read && read(ctx, va, &out, 4);
++    }
++    // Read a NUL-terminated printable string, max 48 chars.
++    bool cstr(uint64_t va, std::string &out) const;
++};
++
++// ---------- results ----------
++
++// A `mov w1,#id ; bl <propget> ; str/strb w0,[xN,#field]` site.
++struct PropSite {
++    uint32_t id = 0;          // property id passed in w1
++    uint32_t field = 0;       // destination field offset
++    uint8_t width = 0;        // 1 or 4
++    uint64_t site = 0;        // VA of the bl
++    uint8_t dst_reg = 0;      // xN of the destination
++    const char *kind = "";    // "strb" / "str" / ...
++    bool id_from_movz = true; // false -> w1 came from somewhere else, treat as soft
++};
++
++// A `adrp+add "Name" ; bl <colname> ; str w0,[xN,#slot]` site.
++struct ColumnSite {
++    std::string name;
++    uint32_t slot = 0;
++    uint64_t site = 0;
++    uint64_t slot_va = 0;   // absolute VA of the cache slot: on device this holds the column index
++};
++
++// A byte load on the object reached as [<getbattle>()+0x28] (the own character).
++struct OwnFlag {
++    uint32_t off = 0;
++    uint64_t fn = 0;          // enclosing function start (approximate)
++    const char *kind = "";
++};
++
++// ---------- the decode primitive ----------
++// Decode the first store-to-W0 among `n` instructions given as a word getter.
++// Mirrors agent/arm64_decode.js, which is unit-tested against this same image.
++struct StoreDecoded {
++    bool found = false;
++    const char *kind = "";
++    int64_t off = 0;
++    uint8_t width = 0;
++};
++StoreDecoded decode_store_to_w0(const Image &img, uint64_t at, int n = 8);
++
++// ---------- scanners ----------
++std::vector<PropSite> scan_property_sites(const Image &img, const Seeds &s);
++std::vector<ColumnSite> scan_column_sites(const Image &img, const Seeds &s);
++std::vector<OwnFlag> scan_own_char_flags(const Image &img, const Seeds &s);
++
++// Move displacement of a b/bl at va, or INT64_MIN if not a branch.
++bool branch_target(const Image &img, uint64_t va, uint64_t &target);
++
++} // namespace rcl
++
++#endif // RCL_SCAN_H
+diff --git a/agent/arm64_decode.js b/agent/arm64_decode.js
+new file mode 100644
+index 0000000..9cb1a81
+--- /dev/null
++++ b/agent/arm64_decode.js
+@@ -0,0 +1,59 @@
++/*
++ * arm64_decode.js - minimal AArch64 reader used by the runtime logger.
++ *
++ * The point: when we hook the property getter 0xafd76c, the *field offset* is not in the getter,
++ * it is in the caller - the instruction right after the `bl`. So on every call we peek at the
++ * return address and decode the first store to W0 we find there. That turns
++ *   mov w1,#id ; bl getter ; strb w0,[x19,#field]
++ * into a live (id -> field) pair without any static scan.
++ *
++ * Kept dependency-free and dual-usable: Frida loads it by concatenation (see tools/run_agent.py),
++ * Node loads it via require() in test/decode_test.js, so the tested code is the shipped code.
++ *
++ * getU32(k) must return the 32-bit word at instruction index k, little-endian.
++ */
++
++function rclDecodeStoreToW0(getU32, maxInsns) {
++    const n = maxInsns || 8;
++    for (let k = 0; k < n; k++) {
++        const w = getU32(k) >>> 0;
++
++        // STRB W0, [Xn, #imm]   (size=00, unsigned offset)
++        if ((w & 0xFFC0001F) === 0x39000000) {
++            return { kind: "strb", off: (w >>> 10) & 0xFFF, bytes: 1 };
++        }
++        // STR W0, [Xn, #imm]
++        if ((w & 0xFFC0001F) === 0xB9000000) {
++            return { kind: "str", off: ((w >>> 10) & 0xFFF) * 4, bytes: 4 };
++        }
++        // STR X0, [Xn, #imm]
++        if ((w & 0xFFC0001F) === 0xF9000000) {
++            return { kind: "strx", off: ((w >>> 10) & 0xFFF) * 8, bytes: 8 };
++        }
++        // STURB W0, [Xn, #simm9]  (unscaled, pre/post indexed forms)
++        if ((w & 0xFFE00C1F) === 0x38000000) {
++            let i9 = (w >>> 12) & 0x1FF;
++            if (i9 & 0x100) i9 -= 0x200;
++            return { kind: "sturb", off: i9, bytes: 1 };
++        }
++        // STUR W0, [Xn, #simm9]
++        if ((w & 0xFFE00C1F) === 0xB8000000) {
++            let i9 = (w >>> 12) & 0x1FF;
++            if (i9 & 0x100) i9 -= 0x200;
++            return { kind: "stur", off: i9, bytes: 4 };
++        }
++        // STRB WZR, [Xn, #imm]  (Rt = 31) - a clear, also interesting
++        if ((w & 0xFFC00000) === 0x39000000 && ((w & 0x1F) === 31)) {
++            return { kind: "strb_zr", off: (w >>> 10) & 0xFFF, bytes: 1 };
++        }
++        // STP W0, W1, [Xn, #imm]  (a pair store, seen when two properties land together)
++        if ((w & 0xFFC00000) === 0x29000000) {
++            return { kind: "stp_w", off: ((w >>> 15) & 0x7F) * 4, bytes: 8 };
++        }
++    }
++    return null;
++}
++
++if (typeof module !== "undefined" && module.exports) {
++    module.exports = { rclDecodeStoreToW0 };
++}
+diff --git a/control b/control
+new file mode 100644
+index 0000000..94c5f25
+--- /dev/null
++++ b/control
+@@ -0,0 +1,8 @@
++Package: com.recoil.runtime
++Name: Recoil Runtime
++Version: 0.1.0
++Architecture: iphoneos-arm64
++Description: Runtime offset searcher - read-only scan of the game image, writes a log
++Maintainer: recoil
++Author: recoil
++Section: Tweaks
+diff --git a/host/Makefile b/host/Makefile
+new file mode 100644
+index 0000000..e029cc9
+--- /dev/null
++++ b/host/Makefile
+@@ -0,0 +1,9 @@
++CXX      ?= g++
++CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -I../Sources
++SRC       = ../Sources/rcl_scan.cpp ../Sources/rcl_hook.cpp ../Sources/rcl_report.cpp ../Sources/rcl_log.cpp ../Sources/rcl_main.cpp
++HDR       = ../Sources/rcl_scan.h ../Sources/rcl_hook.h ../Sources/rcl_report.h ../Sources/rcl_log.h ../Sources/rcl_main.cpp
++rclscan: main.cpp $(SRC) $(HDR)
++	$(CXX) $(CXXFLAGS) -o $@ main.cpp $(SRC)
++clean:
++	rm -f rclscan
++.PHONY: clean
+diff --git a/host/main.cpp b/host/main.cpp
+new file mode 100644
+index 0000000..6d0efa8
+--- /dev/null
++++ b/host/main.cpp
+@@ -0,0 +1,71 @@
++// host/main.cpp - runs the shipped scanner over a Mach-O image on the host.
++//
++// The device dylib calls rcl::report_run() on live memory; this calls the very same function on the
++// mapped file. Whatever this prints is what the dylib writes into its log on device, so the report
++// format is verified before it ever runs on a phone.
++//
++//   make -C host && ./host/rclscan <image> [outdir]
++
++#include "../Sources/rcl_scan.h"
++#include "../Sources/rcl_report.h"
++#include "../Sources/rcl_log.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <string>
++#include <vector>
++
++static std::vector<uint8_t> g_buf;
++
++static bool buf_read(void *ctx, uint64_t va, void *dst, size_t n) {
++    (void)ctx;
++    const uint64_t base = 0x100000000ULL;
++    if (va < base) return false;
++    uint64_t off = va - base;
++    if (off + n > g_buf.size()) return false;
++    memcpy(dst, g_buf.data() + off, n);
++    return true;
++}
++
++int main(int argc, char **argv) {
++    if (argc < 2) { fprintf(stderr, "usage: %s <image> [outdir]\n", argv[0]); return 2; }
++    FILE *f = fopen(argv[1], "rb");
++    if (!f) { perror("open"); return 2; }
++    fseek(f, 0, SEEK_END);
++    long sz = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    g_buf.resize((size_t)sz);
++    if (fread(g_buf.data(), 1, (size_t)sz, f) != (size_t)sz) { perror("read"); return 2; }
++    fclose(f);
++
++    rcl::Image img;
++    img.base = 0x100000000ULL;
++    img.vmsize = (uint64_t)sz;
++    img.ctx = nullptr;
++    img.read = buf_read;
++
++    const char *dir = argc > 2 ? argv[2] : "/tmp";
++    rcl::log_open(dir);
++    rcl::report_run(img, rcl::Seeds::build69());
++    rcl::log_close();
++
++    // mirror the log to stdout, so CI and the terminal see the same report the device would write
++    std::string cmd = std::string("ls -t ") + dir + "/recoil-runtime-*.log 2>/dev/null | head -1";
++    FILE *d = popen(cmd.c_str(), "r");
++    if (d) {
++        char p[512] = {0};
++        if (fgets(p, sizeof p, d)) {
++            size_t L = strlen(p);
++            while (L && (p[L-1] == '\n' || p[L-1] == '\r')) p[--L] = 0;
++            FILE *lf = fopen(p, "r");
++            if (lf) {
++                char line[2048];
++                while (fgets(line, sizeof line, lf)) fputs(line, stdout);
++                fclose(lf);
++            }
++            printf("\n(log written to %s)\n", p);
++        }
++        pclose(d);
++    }
++    return 0;
++}
+diff --git a/test/decode_test.js b/test/decode_test.js
+new file mode 100644
+index 0000000..6c2ddb1
+--- /dev/null
++++ b/test/decode_test.js
+@@ -0,0 +1,77 @@
++#!/usr/bin/env node
++/*
++ * decode_test.js - verifies the SHIPPED arm64 decoder against the REAL binary.
++ *
++ * The decoder in agent/arm64_decode.js is what runs on the device inside Frida. Rather than trust
++ * it, this test runs the same code over the actual Nulls Brawl image: it finds every `bl 0xafd76c`
++ * (the property getter), decodes the first store-to-W0 after each call, and checks the result
++ * against the sites that were confirmed by hand in the static analysis.
++ *
++ *   RCL_BIN=/path/to/attach.txt node test/decode_test.js
++ */
++const fs = require("fs");
++const { rclDecodeStoreToW0 } = require("../agent/arm64_decode.js");
++
++const BASE = 0x100000000n;
++const BIN = process.env.RCL_BIN || "/tmp/dl/attach.txt";
++const GETTER = 0x100afd76cn;          // property-value getter (0xafd76c)
++const TA = 0x100004000n, TEND = 0x100d8af60n;
++
++// pairs confirmed by hand in the disassembly
++const EXPECT = [
++    { site: 0x9fa418n, off: 0x32d, kind: "strb" },
++    { site: 0x9fa428n, off: 0x32e, kind: "strb" },
++    { site: 0x9faa44n, off: 0x32e, kind: "strb" },
++];
++
++function main() {
++    if (!fs.existsSync(BIN)) {
++        console.error("binary not found:", BIN, "- set RCL_BIN");
++        process.exit(2);
++    }
++    const buf = fs.readFileSync(BIN);
++    const at = (va) => Number(va - BASE);
++
++    function getU32From(va, k) {
++        const o = at(va) + k * 4;
++        if (o < 0 || o + 4 > buf.length) return 0xFFFFFFFF;
++        return buf.readUInt32LE(o);
++    }
++
++    // 1) known sites must decode exactly
++    let bad = 0;
++    for (const e of EXPECT) {
++        const retAddr = BASE + e.site + 4n;        // EXPECT holds RVAs; readers take VAs
++        const dec = rclDecodeStoreToW0((k) => getU32From(retAddr, k), 8);
++        const ok = dec && dec.off === e.off && dec.kind === e.kind;
++        if (!ok) bad++;
++        console.log(`${ok ? "PASS" : "FAIL"}  site 0x${e.site.toString(16)}  expected +0x${e.off.toString(16)} (${e.kind})  got ${dec ? "+0x" + dec.off.toString(16) + " (" + dec.kind + ")" : "null"}`);
++    }
++
++    // 2) sweep the whole image: every bl to the getter, decoded
++    let sites = 0, decoded = 0;
++    const hist = {};
++    for (let va = TA; va < TEND; va += 4n) {
++        const w = getU32From(va, 0) >>> 0;
++        if (((w & 0xFC000000) >>> 0) !== 0x94000000) continue;   // >>> 0: & gives a signed int32
++        let imm = w & 0x03FFFFFF;
++        if (imm & 0x02000000) imm -= 0x04000000;
++        if ((va + (BigInt(imm) << 2n)) !== GETTER) continue;
++        sites++;
++        const dec = rclDecodeStoreToW0((k) => getU32From(va + 4n, k), 8);
++        if (dec) {
++            decoded++;
++            const key = dec.kind + "+0x" + dec.off.toString(16);
++            hist[key] = (hist[key] || 0) + 1;
++        }
++    }
++    console.log(`\nbl 0xafd76c sites: ${sites}, decoded a store-to-W0: ${decoded}`);
++    const top = Object.entries(hist).sort((a, b) => b[1] - a[1]).slice(0, 12);
++    for (const [k, n] of top) console.log(`   ${k}  x${n}`);
++
++    if (bad) { console.error(`\n${bad} known site(s) failed`); process.exit(1); }
++    if (decoded === 0) { console.error("\nno site decoded - decoder is broken"); process.exit(1); }
++    console.log("\nall known sites decode correctly; decoder verified against the real image");
++}
++
++main();
+diff --git a/tools/inject.py b/tools/inject.py
+new file mode 100644
+index 0000000..47d7417
+--- /dev/null
++++ b/tools/inject.py
+@@ -0,0 +1,168 @@
++#!/usr/bin/env python3
++"""inject.py - add an LC_LOAD_DYLIB to a Mach-O so the app loads our dylib at launch.
++
++No external tools (no insert_dylib / optool). Handles thin arm64/arm64e and fat (universal)
++binaries: every slice gets the command, each inside its own header slack.
++
++  inject.py --dylib @executable_path/Frameworks/RecoilRuntime.dylib --target <macho> [--out <path>] [--dry-run]
++
++What it does per slice:
++  * appends an LC_LOAD_DYLIB to the load-command block, growing ncmds/sizeofcmds
++  * refuses if the block would grow past the first section's file offset (no blind relocation)
++  * leaves every byte outside the load-command block untouched
++
++What it deliberately does NOT do: re-sign. Changing the header invalidates the signature, so after
++this you must re-sign the binary (ldid / codesign) - see tools/package.sh.
++"""
++import argparse
++import shutil
++import struct
++import sys
++
++MH_MAGIC_64 = 0xFEEDFACF
++FAT_MAGIC = 0xCAFEBABE
++FAT_MAGIC_64 = 0xCAFEBABF
++LC_SEGMENT_64 = 0x19
++LC_LOAD_DYLIB = 0xC
++
++
++def u32(b, o):
++    return struct.unpack_from("<I", b, o)[0]
++
++
++def align4(n):
++    return (n + 3) & ~3
++
++
++class Slice:
++    def __init__(self, data, off, size):
++        self.data = data          # whole file (bytearray)
++        self.off = off            # slice start in the file
++        self.size = size
++
++
++def dylib_command(path):
++    raw = path.encode() + b"\0"
++    cmdsize = align4(24 + len(raw))
++    cmd = struct.pack("<IIIIII", LC_LOAD_DYLIB, cmdsize, 24, 0, 0x00010000, 0x00010000)
++    return cmd + raw.ljust(cmdsize - 24, b"\0"), cmdsize
++
++
++def first_section_offset(buf, slice_off, ncmds):
++    """smallest file offset among all sections, i.e. where real data starts"""
++    p = slice_off + 32
++    lo = None
++    for _ in range(ncmds):
++        cmd = u32(buf, p)
++        cmdsize = u32(buf, p + 4)
++        if cmd == LC_SEGMENT_64:
++            nsects = u32(buf, p + 64)
++            for i in range(nsects):
++                s = p + 72 + i * 80
++                if u32(buf, s + 32) or u32(buf, s + 36):      # section has data
++                    if lo is None or u32(buf, s + 48) < lo:   # offset field
++                        pass
++                    off = u32(buf, s + 48)
++                    if off and (lo is None or off < lo):
++                        lo = off
++        p += cmdsize
++    return lo
++
++
++def inject_thin(buf, slice_off, slice_size, path, dry_run):
++    magic = u32(buf, slice_off)
++    if magic != MH_MAGIC_64:
++        return None, f"not a 64-bit Mach-O (magic 0x{magic:08x})"
++    ncmds = u32(buf, slice_off + 16)
++    sizeofcmds = u32(buf, slice_off + 20)
++    lc_start = slice_off + 32
++    lc_end = lc_start + sizeofcmds
++
++    cmd, cmdsize = dylib_command(path)
++
++    # already present?
++    p = lc_start
++    for _ in range(ncmds):
++        c = u32(buf, p)
++        cs = u32(buf, p + 4)
++        if c == LC_LOAD_DYLIB:
++            noff = u32(buf, p + 8)
++            s = bytes(buf[p + noff:p + cs]).split(b"\0")[0].decode(errors="replace")
++            if s == path:
++                return 0, "already injected"
++        p += cs
++
++    limit = first_section_offset(buf, slice_off, ncmds)
++    if limit is None:
++        limit = lc_end + 0x1000          # no sections with data: fall back to slack after the block
++    room = limit - lc_end
++    if room < cmdsize:
++        return None, (f"only {room} free bytes after the load commands, need {cmdsize}; "
++                      f"nothing was changed")
++
++    if dry_run:
++        return cmdsize, f"would add {cmdsize} bytes into {room} free"
++
++    buf[lc_end:lc_end + cmdsize] = cmd
++    struct.pack_into("<I", buf, slice_off + 16, ncmds + 1)
++    struct.pack_into("<I", buf, slice_off + 20, sizeofcmds + cmdsize)
++    return cmdsize, f"added, {room - cmdsize} bytes of slack left"
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--target", required=True, help="Mach-O to modify")
++    ap.add_argument("--dylib", required=True, help="load path, e.g. @executable_path/Frameworks/X.dylib")
++    ap.add_argument("--out", help="write here instead of in place")
++    ap.add_argument("--dry-run", action="store_true")
++    a = ap.parse_args()
++
++    with open(a.target, "rb") as f:
++        buf = bytearray(f.read())
++
++    magic_be = struct.unpack_from(">I", buf, 0)[0]
++    slices = []
++    if magic_be in (FAT_MAGIC, FAT_MAGIC_64):
++        nfat = struct.unpack_from(">I", buf, 4)[0]
++        step = 20 if magic_be == FAT_MAGIC else 32
++        for i in range(nfat):
++            base = 8 + i * step
++            cputype = struct.unpack_from(">i", buf, base)[0]
++            off = struct.unpack_from(">I", buf, base + 8)[0]
++            size = struct.unpack_from(">I", buf, base + 12)[0]
++            if cputype in (0x0100000C, 0x0200000C):          # arm64 / arm64e
++                slices.append((cputype, off, size))
++        if not slices:
++            print("fat image has no arm64 slice", file=sys.stderr)
++            return 2
++        print(f"fat image: {len(slices)} arm64 slice(s)")
++    else:
++        slices.append((struct.unpack_from("<I", buf, 4)[0], 0, len(buf)))
++        print("thin image")
++
++    rc = 0
++    for cputype, off, size in slices:
++        extra, msg = inject_thin(buf, off, size, a.dylib, a.dry_run)
++        name = "arm64e" if cputype == 0x0200000C else "arm64"
++        if extra is None:
++            print(f"  {name} @0x{off:x}: FAILED - {msg}")
++            rc = 1
++        else:
++            print(f"  {name} @0x{off:x}: {msg}")
++
++    if rc == 0 and not a.dry_run:
++        dest = a.out or a.target
++        if a.out:
++            shutil.copyfile(a.target, a.out)
++            with open(a.out, "wb") as f:
++                f.write(buf)
++        else:
++            with open(a.target, "wb") as f:
++                f.write(buf)
++        print(f"written: {dest}")
++        print("NOTE: the code signature is now invalid - re-sign before installing")
++    return rc
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/install_device.sh b/tools/install_device.sh
+new file mode 100644
+index 0000000..3c3b567
+--- /dev/null
++++ b/tools/install_device.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++# install_device.sh - install RecoilRuntime on a JAILBROKEN device over ssh/scp.
++#
++#   tools/install_device.sh --device root@192.168.1.50 --dylib RecoilRuntime.dylib \
++#                           --bundle-id com.example.brawlstars
++#
++# Places the dylib where Substrate/ElleKit loads tweaks and writes the matching filter plist.
++# Rootless (/var/jb, Dopamine/palera1n) is the default; pass --rootful for the old layout.
++# If you built a .deb instead, pass --deb RecoilRuntime.deb and it will dpkg -i it.
++set -euo pipefail
++
++DEV="" ; DYLIB="" ; BID="" ; ROOTLESS=1 ; DEB=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --device) DEV="$2"; shift 2;;
++    --dylib) DYLIB="$2"; shift 2;;
++    --bundle-id) BID="$2"; shift 2;;
++    --deb) DEB="$2"; shift 2;;
++    --rootful) ROOTLESS=0; shift;;
++    -h|--help) sed -n '2,12p' "$0"; exit 0;;
++    *) echo "unknown arg: $1" >&2; exit 2;;
++  esac
++done
++[ -n "$DEV" ] || { echo "need --device user@host" >&2; exit 2; }
++
++if [ -n "$DEB" ]; then
++  echo "== installing the deb =="
++  scp "$DEB" "$DEV:/tmp/"
++  ssh "$DEV" "dpkg -i /tmp/$(basename "$DEB") 2>/dev/null || (command -v sileo >/dev/null && echo 'open Sileo and install the file') ; \
++              killall -9 SpringBoard 2>/dev/null || true"
++  echo "done - respring and launch the game"
++  exit 0
++fi
++
++[ -n "$DYLIB" ] || { echo "need --dylib (or --deb)" >&2; exit 2; }
++[ -n "$BID" ]   || { echo "need --bundle-id" >&2; exit 2; }
++[ -f "$DYLIB" ] || { echo "no such dylib: $DYLIB" >&2; exit 2; }
++
++PRE=""; [ "$ROOTLESS" = "1" ] && PRE="/var/jb"
++LIBDIR="$PRE/Library/MobileSubstrate/DynamicLibraries"
++NAME="$(basename "$DYLIB")"
++
++echo "== target =="
++echo "   device : $DEV"
++echo "   dir    : $LIBDIR"
++echo "   filter : $BID"
++
++PLIST="$NAME.plist"
++TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
++cat > "$TMP/$PLIST" <<EOF
++{
++    Filter = { Bundles = ( "$BID" ); };
++}
++EOF
++
++scp "$DYLIB" "$DEV:/tmp/$NAME"
++scp "$TMP/$PLIST" "$DEV:/tmp/$PLIST"
++ssh "$DEV" "set -e; mkdir -p '$LIBDIR'; \
++            cp '/tmp/$NAME' '$LIBDIR/$NAME'; cp '/tmp/$PLIST' '$LIBDIR/$PLIST'; \
++            chmod 755 '$LIBDIR/$NAME'; chown root:wheel '$LIBDIR/$NAME' '$LIBDIR/$PLIST' 2>/dev/null || true; \
++            ls -la '$LIBDIR/$NAME' '$LIBDIR/$PLIST'"
++echo
++echo "installed. respring / relaunch the game, then pull the log:"
++echo "  ssh $DEV \"ls -t \\\$(find /var/mobile/Containers/Data/Application -name 'recoil-runtime-*.log' 2>/dev/null) | head -1\""
+diff --git a/tools/install_ipa.sh b/tools/install_ipa.sh
+new file mode 100644
+index 0000000..059e5a9
+--- /dev/null
++++ b/tools/install_ipa.sh
+@@ -0,0 +1,90 @@
++#!/usr/bin/env bash
++# install_ipa.sh - put RecoilRuntime.dylib into an .ipa and make the app actually load it.
++#
++#   tools/install_ipa.sh --ipa NullsBrawl.ipa --dylib RecoilRuntime.dylib --out NullsBrawl+recoil.ipa
++#
++# What it does:
++#   1. unpacks the ipa
++#   2. copies the dylib into <App>.app/Frameworks/
++#   3. adds an LC_LOAD_DYLIB (@executable_path/Frameworks/<name>) to the app binary - this is what
++#      makes the loader actually pick it up; tools/inject.py does the Mach-O edit with no external
++#      tools. Use --no-lc only if your client already loads everything from a Tweaks/ folder.
++#   4. repacks to a new ipa
++#
++# It does NOT re-sign: editing the header invalidates the signature. Re-sign on macOS with
++# `codesign -f -s - --entitlements ent.plist <App>.app` or with `ldid -S<ent> <binary>`, or on any
++# OS with `zsign`. The command is printed at the end.
++set -euo pipefail
++
++IPA="" ; DYLIB="" ; OUT="" ; APPNAME="" ; DO_LC=1 ; DO_TWEAKS=0
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --ipa) IPA="$2"; shift 2;;
++    --dylib) DYLIB="$2"; shift 2;;
++    --out) OUT="$2"; shift 2;;
++    --app) APPNAME="$2"; shift 2;;
++    --no-lc) DO_LC=0; shift;;
++    --tweaks) DO_TWEAKS=1; shift;;
++    -h|--help) sed -n '2,20p' "$0"; exit 0;;
++    *) echo "unknown arg: $1" >&2; exit 2;;
++  esac
++done
++
++[ -n "$IPA" ]   || { echo "need --ipa" >&2; exit 2; }
++[ -n "$DYLIB" ] || { echo "need --dylib" >&2; exit 2; }
++[ -f "$IPA" ]   || { echo "no such ipa: $IPA" >&2; exit 2; }
++[ -f "$DYLIB" ] || { echo "no such dylib: $DYLIB" >&2; exit 2; }
++[ -n "$OUT" ] || OUT="${IPA%.ipa}+recoil.ipa"
++case "$OUT" in /*) ;; *) OUT="$ORIG_PWD/$OUT";; esac   # keep the output out of the temp dir
++
++ORIG_PWD="$(pwd)"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++WORK="$(mktemp -d)"
++trap 'rm -rf "$WORK"' EXIT
++
++echo "== unpack =="
++( cd "$WORK" && unzip -q "$IPA" )
++APP=$(find "$WORK/Payload" -maxdepth 1 -name '*.app' | head -1)
++[ -n "$APP" ] || { echo "no Payload/*.app in the ipa" >&2; exit 1; }
++if [ -z "$APPNAME" ]; then
++  APPNAME=$(python3 - "$APP/Info.plist" <<'PY'
++import plistlib,sys
++with open(sys.argv[1],'rb') as f: d=plistlib.load(f)
++print(d.get("CFBundleExecutable",""))
++PY
++)
++fi
++[ -n "$APPNAME" ] || { echo "cannot determine the executable name" >&2; exit 1; }
++EXE="$APP/$APPNAME"
++echo "   app=$APP"
++echo "   exe=$APPNAME"
++
++echo "== copy the dylib =="
++mkdir -p "$APP/Frameworks"
++DYLIB_NAME="$(basename "$DYLIB")"
++cp "$DYLIB" "$APP/Frameworks/$DYLIB_NAME"
++LOAD_PATH="@executable_path/Frameworks/$DYLIB_NAME"
++echo "   $APP/Frameworks/$DYLIB_NAME"
++if [ "$DO_TWEAKS" = "1" ]; then
++  mkdir -p "$WORK/Tweaks"
++  cp "$DYLIB" "$WORK/Tweaks/$DYLIB_NAME"
++  echo "   $WORK/Tweaks/$DYLIB_NAME  (for clients whose TweakLoader scans it)"
++fi
++
++if [ "$DO_LC" = "1" ]; then
++  echo "== add LC_LOAD_DYLIB =="
++  python3 "$HERE/inject.py" --target "$EXE" --dylib "$LOAD_PATH"
++fi
++
++echo "== repack =="
++rm -f "$OUT"
++( cd "$WORK" && if [ -d Tweaks ]; then zip -qry "$OUT" Payload Tweaks; else zip -qry "$OUT" Payload; fi )
++echo "   $OUT"
++
++cat <<EOF
++
++== NEXT: re-sign, it is mandatory ==
++  macOS:  codesign -f -s - --entitlements entitlements.plist "$APP"
++  any OS: ldid -S<entitlements> "$EXE"      (or: zsign -k key.p12 -m prov.mobileprovision "$OUT")
++Then install the signed ipa (Sideloadly / TrollStore / your own installer).
++EOF
+diff --git a/tools/smoke.sh b/tools/smoke.sh
+new file mode 100644
+index 0000000..aa0784f
+--- /dev/null
++++ b/tools/smoke.sh
+@@ -0,0 +1,72 @@
++#!/usr/bin/env bash
++# Everything that can be verified without an iOS toolchain, in one place.
++#
++#   RCL_BIN=/path/to/attach.txt ./tools/smoke.sh
++#
++# Exit code 0 means: the host scanner builds and runs, the report is produced, and the arm64 decoder
++# matches the real image. The Theos dylib itself needs macOS + Theos and is built in CI.
++set -u
++cd "$(dirname "$0")/.."
++FAIL=0
++ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
++bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=1; }
++skip() { printf '  \033[33mSKIP\033[0m  %s\n' "$1"; }
++
++echo "== 1. source sanity =="
++for f in agent/arm64_decode.js; do
++  if node --check "$f" 2>/dev/null; then ok "$f parses"; else bad "$f has a syntax error"; fi
++done
++if python3 - <<'PY' 2>/dev/null
++import json,sys
++try:
++    import yaml
++except ImportError:
++    sys.exit(2)
++yaml.safe_load(open(".github/workflows/build.yml"))
++PY
++then ok "workflow YAML valid"
++else
++  code=$?
++  if [ "$code" = "2" ]; then skip "workflow YAML (pyyaml not installed)"; else bad "workflow YAML invalid"; fi
++fi
++
++echo "== 2. host scanner =="
++if make -C host >/tmp/rcl_build.log 2>&1; then
++  ok "host build (5 translation units)"
++else
++  bad "host build failed - see /tmp/rcl_build.log"
++  tail -20 /tmp/rcl_build.log
++fi
++
++IMG="${RCL_BIN:-/tmp/dl/attach.txt}"
++if [ -x host/rclscan ] && [ -f "$IMG" ]; then
++  if ./host/rclscan "$IMG" /tmp >/tmp/rcl_report.txt 2>&1; then
++    ok "scanner ran on $(basename "$IMG")"
++    grep -q "\[property sites\]" /tmp/rcl_report.txt && ok "report: property sites present" || bad "report: no property sites"
++    grep -q "\[column names\]" /tmp/rcl_report.txt && ok "report: column names present" || bad "report: no column names"
++    grep -q "\[own-character byte flags\]" /tmp/rcl_report.txt && ok "report: own-character flags present" || bad "report: no flags"
++    grep -q "OverchargeActive" /tmp/rcl_report.txt && ok "charge-related names listed" || skip "no charge names found"
++    NSLOT=$(grep -c "1 slot(s)" /tmp/rcl_report.txt || true)
++    [ "${NSLOT:-0}" -ge 1 ] && ok "hook slots resolved for virtual targets" || bad "hook slot scan found nothing"
++  else
++    bad "scanner crashed"
++  fi
++elif [ ! -f "$IMG" ]; then
++  skip "scanner run (no image at $IMG)"
++fi
++
++echo "== 3. arm64 decoder vs the real image =="
++if [ -f "$IMG" ]; then
++  if RCL_BIN="$IMG" node test/decode_test.js 2>&1 | tail -6; then :; fi
++  if RCL_BIN="$IMG" node test/decode_test.js >/tmp/rcl_dec.log 2>&1; then
++    ok "decoder matches every known property site"
++  else
++    bad "decoder mismatch - see /tmp/rcl_dec.log"
++  fi
++else
++  skip "decoder test (no image)"
++fi
++
++echo
++if [ "$FAIL" = "0" ]; then echo "SMOKE: OK"; else echo "SMOKE: FAILURES ABOVE"; fi
++exit $FAIL

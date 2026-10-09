@@ -1,0 +1,75 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Toolchain-free checks: the scanner builds and runs on the host, and the arm64 decoder is
+  # exercised against the real image when one is supplied through the RCL_IMAGE_URL secret.
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the game image (optional)
+        continue-on-error: true
+        run: |
+          if [ -n "${{ secrets.RCL_IMAGE_URL }}" ]; then
+            curl -fsSL "${{ secrets.RCL_IMAGE_URL }}" -o /tmp/attach.txt
+            ls -la /tmp/attach.txt
+          else
+            echo "no RCL_IMAGE_URL secret - structural checks only"
+          fi
+      - name: Host scanner build + run
+        env:
+          RCL_BIN: /tmp/attach.txt
+        run: |
+          make -C host
+          if [ -f "$RCL_BIN" ]; then ./host/rclscan "$RCL_BIN" /tmp; else echo "no image, skipping run"; fi
+      - name: Decoder unit test
+        env:
+          RCL_BIN: /tmp/attach.txt
+        run: |
+          if [ -f "$RCL_BIN" ]; then node test/decode_test.js; else echo "no image, skipping"; fi
+
+  # The deliverable: Theos on macOS builds the .dylib for LiveContainer / jailbreak.
+  dylib:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          export THEOS="$RUNNER_TEMP/theos"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          xcode-select -s "$(xcode-select -p)"
+          xcrun --sdk iphoneos --show-sdk-path
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      # arm64 only: that is the slice LiveContainer loads. For a jailbreak build that also wants
+      # arm64e, run with ARCHS="arm64 arm64e".
+      - name: Build the dylib
+        run: make -j4 ARCHS="arm64"
+
+      - name: Inspect the artifact
+        run: |
+          ls -la RecoilRuntime.dylib || true
+          file RecoilRuntime.dylib || true
+          xcrun vtool -show-build RecoilRuntime.dylib || true
+
+      - name: Upload the dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: RecoilRuntime-dylib
+          path: RecoilRuntime.dylib
+          if-no-files-found: error
+
+      - name: Attach to a release on a tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: RecoilRuntime.dylib
+          generate_release_notes: true

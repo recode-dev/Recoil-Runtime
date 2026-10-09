@@ -1,0 +1,14 @@
+{
+    Filter = {
+        Bundles = (
+            "com.supercell.brawlstars",
+            "com.nulls.brawlstars"
+        );
+    };
+    /* Substrate / ElleKit filter.
+     *
+     * Replace the bundle ids with the ones your install actually uses - tools/install_device.sh can
+     * do it for you:  ./tools/install_device.sh --bundle-id <id> --dylib <dylib>
+     * Find the real id with:  plutil -p Payload/*.app/Info.plist | grep CFBundleIdentifier
+     */
+}

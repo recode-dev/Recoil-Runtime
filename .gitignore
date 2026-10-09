@@ -1,0 +1,6 @@
+.theos/
+packages/
+*.dylib
+host/rclscan
+*.o
+*.log
