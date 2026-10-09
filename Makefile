@@ -5,9 +5,10 @@ include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = RecoilRuntime
 RecoilRuntime_FILES = Sources/rcl_main.cpp Sources/rcl_scan.cpp Sources/rcl_report.cpp Sources/rcl_log.cpp
-RecoilRuntime_CFLAGS = -ISources -O2 -fvisibility=hidden
+RecoilRuntime_CFLAGS = -ISources -O2 -std=c++17 -fvisibility=hidden
 RecoilRuntime_CXXFLAGS = -ISources -O2 -std=c++17 -fvisibility=hidden
 RecoilRuntime_INSTALL_PATH = /usr/lib
+ADDITIONAL_CXXFLAGS = -std=c++17
 
 include $(THEOS_MAKE_PATH)/library.mk
 

@@ -1,6 +1,10 @@
 #ifndef RCL_SCAN_H
 #define RCL_SCAN_H
 
+#if __cplusplus < 201703L
+#error "Recoil-Runtime needs C++17: -std=c++17 is missing from the build flags"
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 #include <string>
