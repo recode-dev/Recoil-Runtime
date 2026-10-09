@@ -726,6 +726,18 @@ void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slo
 
 std::map<uint32_t, std::string> g_table_class;
 
+struct DeepSummary {
+    uint32_t starts = 0;
+    uint32_t strings = 0;
+    uint32_t anchored = 0;
+    uint32_t globals = 0;
+    uint32_t named = 0;
+    uint32_t tables = 0;
+    uint32_t slots = 0;
+};
+
+DeepSummary g_deep;
+
 void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
                               const std::vector<ClassTable> &tables,
                               const std::map<uint32_t, FnAgg> &fns) {
@@ -839,8 +851,17 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     write_unknown_named(img, strs, tables, fns, root);
     write_globals(gh, root);
     write_anchors_extra(tables, root);
-    RCL_LOGLN("[deep] starts=%zu strings=%zu slots=%zu anchored_fns=%zu globals=%zu tables=%zu",
-              starts.size(), strs.size(), slots.sorted.size(), fns.size(), gh.size(), tables.size());
+    g_deep.starts = (uint32_t)starts.size();
+    g_deep.strings = (uint32_t)strs.size();
+    g_deep.anchored = (uint32_t)fns.size();
+    g_deep.globals = (uint32_t)gh.size();
+    g_deep.named = (uint32_t)g_table_class.size();
+    g_deep.tables = (uint32_t)tables.size();
+    g_deep.slots = (uint32_t)slots.sorted.size();
+    RCL_LOGLN("[deep] starts=%zu strings=%zu slots=%zu anchored_fns=%zu globals=%zu tables=%zu "
+              "named_from_strings=%zu",
+              starts.size(), strs.size(), slots.sorted.size(), fns.size(), gh.size(), tables.size(),
+              g_table_class.size());
 }
 
 }  // namespace
@@ -1106,9 +1127,12 @@ void write_class_docs(const Image &img) {
         snprintf(path, sizeof path, "%s/Unknown/vt_%06x.md", root, t.start);
         FILE *f = fopen(path, "w");
         if (!f) continue;
-        fprintf(f, "# vt_%06x\n\n**Class Table:** `%#x`  **Slots:** %u  **Segment:** `%s`\n\n"
+        std::map<uint32_t, std::string>::const_iterator gu = g_table_class.find(t.start);
+        fprintf(f, "# vt_%06x%s%s\n\n**Class Table:** `%#x`  **Slots:** %u  **Segment:** `%s`\n\n"
                    "No documented class claims this table.\n\n| slot | rva | address | method |\n"
-                   "|------|-----|---------|--------|\n", t.start, t.start, t.slots, t.seg);
+                   "|------|-----|---------|--------|\n", t.start,
+                (gu == g_table_class.end()) ? "" : " - ", (gu == g_table_class.end()) ? "" : gu->second.c_str(),
+                t.start, t.slots, t.seg);
         for (uint32_t s = 0; s < t.slots; s++) {
             uint64_t raw = 0;
             if (!img.read || !img.read(img.ctx, img.base + t.start + s * 8, &raw, sizeof(raw))) break;
@@ -1147,6 +1171,10 @@ void write_class_docs(const Image &img) {
         fprintf(dg, "- tables %zu (strict %u, loose %u, loose words %llu)  class files %u  "
                     "table files %u\n", ix.tables.size(), st.tables_strict, st.tables_loose,
                 (unsigned long long)st.loose_words, files, unknown);
+        fprintf(dg, "- deep: starts %u strings %u anchored functions %u globals %u "
+                    "tables named from strings %u of %u\n",
+                g_deep.starts, g_deep.strings, g_deep.anchored, g_deep.globals, g_deep.named,
+                g_deep.tables);
         fclose(dg);
     }
 
@@ -1327,6 +1355,14 @@ void write_missing(const Image &img, const char *root) {
         if (strcmp(ref_name(c.start), "-") == 0) missing_tables++;
     }
     fprintf(f, "# what is missing from the class reference\n\n");
+    fprintf(f, "- deep scan: starts %u strings %u anchored functions %u globals %u tables named "
+               "from strings %u of %u\n", g_deep.starts, g_deep.strings, g_deep.anchored,
+            g_deep.globals, g_deep.named, g_deep.tables);
+    uint32_t by_string = 0;
+    for (std::map<uint32_t, std::string>::const_iterator it = g_table_class.begin();
+         it != g_table_class.end(); ++it)
+        if (strcmp(doc_class_name(it->first), "-") == 0) by_string++;
+    fprintf(f, "- tables named ONLY by their strings (not in the reference): %u\n", by_string);
     fprintf(f, "- tables in image %zu  slots %llu  slots with a known method %llu\n", t.size(),
             (unsigned long long)slots, (unsigned long long)named);
     fprintf(f, "- tables without a reference class: %u\n", missing_tables);
@@ -1341,12 +1377,15 @@ void write_missing(const Image &img, const char *root) {
     }
     fprintf(f, "\nobserved-and-unknown count: %u\n", missing_live);
     fprintf(f, "\n## tables without a reference class (first 400)\n\n"
-               "| vtable | slots | unresolved |\n|--------|-------|------------|\n");
+               "| vtable | slots | unresolved | class from strings |\n"
+               "|--------|-------|------------|--------------------|\n");
     int n = 0;
     for (const ClassTable &c : t) {
         if (strcmp(ref_name(c.start), "-") != 0) continue;
         if (n++ >= 400) break;
-        fprintf(f, "| `%#x` | %u | %u |\n", c.start, c.slots, c.slots - c.named);
+        std::map<uint32_t, std::string>::const_iterator rt = g_table_class.find(c.start);
+        fprintf(f, "| `%#x` | %u | %u | %s |\n", c.start, c.slots, c.slots - c.named,
+                (rt == g_table_class.end()) ? "-" : rt->second.c_str());
     }
     fclose(f);
 }
