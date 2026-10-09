@@ -1111,13 +1111,32 @@ void deep_functions(const Image &img, const MachInsight &mi, const FnStarts &fs,
         const char *n = deep_ref_class(tables[i].start);
         if (n && n[0]) tab_cls[tables[i].start] = n;
     }
+    std::map<uint32_t, std::string> slot_of;
+    for (size_t i = 0; i < tables.size(); i++) {
+        const ClassTable &t = tables[i];
+        const char *cn = deep_ref_class(t.start);
+        if (!cn || !cn[0]) continue;
+        for (uint32_t s = 0; s < t.slots; s++) {
+            uint64_t raw = 0;
+            if (!d_rd(img, img.base + t.start + (uint64_t)s * 8, &raw, 8)) break;
+            int how = 0;
+            const uint64_t v = macho_slot_value(img, mi, raw, &how);
+            if (!v) continue;
+            const uint32_t r = (uint32_t)(v - img.base);
+            if (!slot_of.count(r)) {
+                char b[160];
+                snprintf(b, sizeof b, "%s#%u", cn, s);
+                slot_of[r] = b;
+            }
+        }
+    }
 
     st.func_total = (uint32_t)fs.v.size();
 
     char path[1024];
     snprintf(path, sizeof path, "%s/_functions.tsv", root);
     FILE *f = fopen(path, "w");
-    if (f) fprintf(f, "rva\tsize\tkind\tdetail\tstrings\tcalls\twhole\n");
+    if (f) fprintf(f, "rva\tsize\tkind\tdetail\tstrings\tcalls\toffsets\tslot\twhole\n");
 
     for (size_t i = 0; i < fs.v.size(); i++) {
         const uint32_t rva = fs.v[i];
@@ -1128,43 +1147,194 @@ void deep_functions(const Image &img, const MachInsight &mi, const FnStarts &fs,
         std::string detail;
         uint32_t nstr = 0;
         uint32_t ncalls = 0;
+        uint32_t nglobs = 0;
+        bool tab_store = false;
+        std::vector<uint32_t> offs;
 
-        for (uint32_t k = 0; k < insns && k < 48u; k++) {
+        for (uint32_t k = 0; k < insns && k < 64u; k++) {
             const uint64_t va = tb.lo + (uint64_t)rva + (uint64_t)k * 4;
             const uint32_t w = tb_word(tb, va);
             if ((w & 0xFC000000u) == 0x94000000u) {
                 ncalls++;
                 continue;
             }
+            const uint32_t mm = w & 0xFFC00000u;
+            const uint32_t rn = (w >> 5) & 0x1Fu;
+            const uint32_t rt = w & 0x1Fu;
+            const uint32_t imm12 = (w >> 10) & 0xFFFu;
+            if (rn == 0) {
+                bool isld = (mm == 0xF9400000u || mm == 0xB9400000u || mm == 0x39400000u ||
+                             mm == 0x79400000u || mm == 0xFD400000u || mm == 0xBD400000u ||
+                             mm == 0xB9800000u);
+                bool isst = (mm == 0xF9000000u || mm == 0xB9000000u || mm == 0x39000000u ||
+                             mm == 0x79000000u || mm == 0xFD000000u || mm == 0xBD000000u);
+                if (isld || isst) {
+                    uint32_t mul = 1;
+                    if (mm == 0xF9400000u || mm == 0xF9000000u || mm == 0xFD400000u ||
+                        mm == 0xFD000000u)
+                        mul = 8;
+                    else if (mm == 0xB9400000u || mm == 0xB9000000u || mm == 0xB9800000u ||
+                             mm == 0xBD400000u || mm == 0xBD000000u)
+                        mul = 4;
+                    else if (mm == 0x79400000u || mm == 0x79000000u)
+                        mul = 2;
+                    offs.push_back(imm12 * mul);
+                    if (isst && rt == 0 && imm12 == 0) tab_store = true;
+                    continue;
+                }
+            }
             uint64_t page = 0;
             uint32_t rd = 0;
             if (!adrp_calc(w, va, page, rd)) continue;
             uint64_t full = 0;
-            if (!add_same(tb_word(tb, va + 4), rd, page, full)) continue;
-            const uint32_t trva = (uint32_t)(full - img.base);
-            std::map<uint32_t, std::string>::const_iterator it = tab_cls.find(trva);
-            if (it != tab_cls.end()) {
-                const uint32_t w3 = tb_word(tb, va + 8);
-                if ((w3 & 0xFFC00000u) == 0xF9000000u && ((w3 >> 5) & 0x1Fu) == 0u &&
-                    (w3 & 0x1Fu) == rd && ((w3 >> 10) & 0xFFFu) == 0u) {
-                    kind = "ctor";
-                    detail = it->second;
-                    st.func_ctor++;
+            if (add_same(tb_word(tb, va + 4), rd, page, full)) {
+                const uint32_t trva = (uint32_t)(full - img.base);
+                std::map<uint32_t, std::string>::const_iterator it = tab_cls.find(trva);
+                if (it != tab_cls.end()) {
+                    const uint32_t w3 = tb_word(tb, va + 8);
+                    if ((w3 & 0xFFC00000u) == 0xF9000000u && ((w3 >> 5) & 0x1Fu) == 0u &&
+                        (w3 & 0x1Fu) == rd && ((w3 >> 10) & 0xFFFu) == 0u) {
+                        tab_store = true;
+                        detail = it->second;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if (nstr < 3u) {
-                std::string s;
-                if (d_cstr(img, full, s) && s.size() >= 3u && s.size() <= 120u) nstr++;
+                if (nstr < 3u) {
+                    std::string s;
+                    if (d_cstr(img, full, s) && s.size() >= 3u && s.size() <= 120u) nstr++;
+                }
+            } else if ((tb_word(tb, va + 4) & 0xFFC00000u) == 0xF9400000u &&
+                       ((tb_word(tb, va + 4) >> 5) & 0x1Fu) == rd) {
+                nglobs++;
             }
         }
+
+        std::sort(offs.begin(), offs.end());
+        offs.erase(std::unique(offs.begin(), offs.end()), offs.end());
+        char ob[256];
+        size_t op = 0;
+        ob[0] = 0;
+        for (size_t q = 0; q < offs.size() && q < 10u; q++)
+            op += (size_t)snprintf(ob + op, sizeof ob - op, "%s%#x", q ? "," : "", offs[q]);
+
+        if (tab_store) {
+            if (ncalls) {
+                kind = "dtor";
+                st.func_dtor++;
+            } else {
+                kind = "ctor";
+                st.func_ctor++;
+            }
+        } else if (nglobs && !ncalls && offs.size() <= 2u) {
+            kind = "singleton";
+            st.func_singletons++;
+        }
+
+        std::map<uint32_t, std::string>::const_iterator sl = slot_of.find(rva);
         if (f) {
-            fprintf(f, "%#x\t%u\t%s\t%s\t%u\t%u\t%d\n", rva, size, kind,
-                    detail.empty() ? "-" : detail.c_str(), nstr, ncalls, fs.is_start(rva) ? 1 : 0);
+            fprintf(f, "%#x\t%u\t%s\t%s\t%u\t%u\t%s\t%s\t%d\n", rva, size, kind,
+                    detail.empty() ? "-" : detail.c_str(), nstr, ncalls, ob[0] ? ob : "-",
+                    sl == slot_of.end() ? "-" : sl->second.c_str(), fs.is_start(rva) ? 1 : 0);
         }
     }
     if (f) fclose(f);
-    RCL_LOGLN("[deep] functions: total=%u ctor=%u", st.func_total, st.func_ctor);
+    RCL_LOGLN("[deep] functions: total=%u ctor=%u dtor=%u singleton=%u", st.func_total,
+              st.func_ctor, st.func_dtor, st.func_singletons);
+}
+
+void deep_globals(const Image &img, const MachInsight &mi, const FnStarts &fs,
+                  const std::vector<ClassTable> &tables, const char *root, DeepStats &st) {
+    const TextBuf &tb = text_buf_get(img, mi);
+    if (!tb.ok) return;
+
+    std::map<uint32_t, std::string> tab_cls;
+    for (size_t i = 0; i < tables.size(); i++) {
+        const char *n = deep_ref_class(tables[i].start);
+        if (n && n[0]) tab_cls[tables[i].start] = n;
+    }
+
+    std::map<uint64_t, std::pair<uint32_t, uint32_t> > refs;
+    const uint64_t n = mi.text_vmsize / 4;
+    for (uint64_t i = 0; i + 1 < n; i++) {
+        const uint64_t va = tb.lo + i * 4;
+        const uint32_t w = tb_word(tb, va);
+        uint64_t page = 0;
+        uint32_t rd = 0;
+        if (!adrp_calc(w, va, page, rd)) continue;
+        const uint32_t w2 = tb_word(tb, va + 4);
+        uint64_t full = 0;
+        if (!add_same(w2, rd, page, full)) {
+            if ((w2 & 0xFFC00000u) == 0xF9400000u && ((w2 >> 5) & 0x1Fu) == rd)
+                full = page + (uint64_t)((w2 >> 10) & 0xFFFu) * 8u;
+            else
+                continue;
+        }
+        std::map<uint64_t, std::pair<uint32_t, uint32_t> >::iterator it = refs.find(full);
+        if (it == refs.end()) {
+            std::vector<uint32_t>::const_iterator b =
+                std::upper_bound(fs.v.begin(), fs.v.end(), (uint32_t)(va - img.base));
+            const uint32_t owner = (b == fs.v.begin()) ? 0u : *(b - 1);
+            refs[full] = std::pair<uint32_t, uint32_t>(1u, owner);
+        } else {
+            it->second.first++;
+        }
+    }
+
+    char path[1024];
+    snprintf(path, sizeof path, "%s/_globals.tsv", root);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "slot\tvalue\tkind\tclass\trefs\tfirst_fn\n");
+
+    for (size_t si = 0; si < mi.sections.size(); si++) {
+        const SecRange &s = mi.sections[si];
+        if (strncmp(s.seg, "__DATA", 6) != 0 && strncmp(s.seg, "__BSS", 5) != 0) continue;
+        if (!s.start || s.end <= s.start) continue;
+        for (uint64_t a = (s.start + 7) & ~(uint64_t)7; a + 8 <= s.end; a += 8) {
+            uint64_t v = 0;
+            if (!d_rd(img, a, &v, 8) || !v) continue;
+            int how = 0;
+            uint64_t tgt = macho_slot_value(img, mi, v, &how);
+            if (!tgt) tgt = v;
+            const char *kind = NULL;
+            const char *cls = "-";
+            if (tgt >= mi.text_lo && tgt < mi.text_hi) {
+                kind = "text";
+            } else {
+                for (size_t sj = 0; sj < mi.sections.size(); sj++) {
+                    if (tgt >= mi.sections[sj].start && tgt < mi.sections[sj].end) {
+                        kind = "data";
+                        break;
+                    }
+                }
+                if (kind) {
+                    std::map<uint32_t, std::string>::const_iterator ci =
+                        tab_cls.find((uint32_t)(tgt - img.base));
+                    if (ci != tab_cls.end()) cls = ci->second.c_str();
+                    else {
+                        uint64_t first = 0;
+                        if (d_rd(img, tgt, &first, 8) && first) {
+                            uint64_t fv = macho_slot_value(img, mi, first, &how);
+                            if (!fv) fv = first;
+                            std::map<uint32_t, std::string>::const_iterator cj =
+                                tab_cls.find((uint32_t)(fv - img.base));
+                            if (cj != tab_cls.end()) cls = cj->second.c_str();
+                        }
+                    }
+                }
+            }
+            if (!kind) continue;
+            std::map<uint64_t, std::pair<uint32_t, uint32_t> >::const_iterator it = refs.find(tgt);
+            const uint32_t rc = (it == refs.end()) ? 0u : it->second.first;
+            const uint32_t ff = (it == refs.end()) ? 0u : it->second.second;
+            fprintf(f, "%#llx\t%#llx\t%s\t%s\t%u\t%#x\n", (unsigned long long)(a - img.base),
+                    (unsigned long long)tgt, kind, cls, rc, ff);
+            st.globals++;
+            if (cls[0] != '-') st.globals_named++;
+        }
+    }
+    fclose(f);
+    RCL_LOGLN("[deep] globals: %u, with a class: %u", st.globals, st.globals_named);
 }
 
 void deep_indirect(const Image &img, const MachInsight &mi, const FnStarts &fs,
