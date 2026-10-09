@@ -1683,7 +1683,7 @@ void tu_cluster(const Image &img, const std::vector<ClassTable> &tables, uint32_
 #if defined(__APPLE__) || defined(RCL_HOST_TEST)
 extern "C" int mach_vm_region(unsigned int task, unsigned long long *address,
                               unsigned long long *size, int flavor, void *info,
-                              unsigned int *count);
+                              unsigned int *count, unsigned int *object_name);
 struct VmRegion64 {
     unsigned long long protection;
     unsigned long long max_protection;
@@ -1700,11 +1700,15 @@ void live_census(const Image &img, const std::vector<uint32_t> &tabs) {
     VmRegion64 info;
     unsigned int cnt = 9;
     int guard = 0;
-    while (guard < 6000 && mach_vm_region(mach_task_self_, &addr, &size, 9, &info, &cnt) == 0) {
+    unsigned int obj = 0;
+    uint64_t budget = 4u << 20;
+    while (guard < 6000 && budget &&
+           mach_vm_region(mach_task_self_, &addr, &size, 9, &info, &cnt, &obj) == 0) {
         if (size >= 0x1000 && size <= 0x4000000ULL && info.protection == 3) {
-            for (unsigned long long a = addr; a + 8 <= addr + size; a += 8) {
+            for (unsigned long long a = addr; a + 8 <= addr + size && budget; a += 8) {
                 uint64_t w = 0;
                 unsigned long long got = 0;
+                budget--;
                 if (mach_vm_read_overwrite(mach_task_self_, a, 8, (unsigned long long)&w, &got) != 0)
                     break;
                 uint32_t r = (uint32_t)((w & 0xFFFFFFFFFULL) - img.base);

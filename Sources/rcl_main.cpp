@@ -100,9 +100,18 @@ static bool pick_image(Image &out, std::string &why, std::vector<Loaded> &all) {
         why = "no image passed the structural filter";
         return false;
     }
-    int best = 0;
-    for (size_t i = 1; i < all.size(); i++)
-        if (all[i].text > all[best].text) best = (int)i;
+    int best = -1;
+    for (size_t i = 0; i < all.size(); i++) {
+        const bool app = all[i].name.find(".app/") != std::string::npos &&
+                         all[i].name.find(".framework/") == std::string::npos;
+        if (!app) continue;
+        if (best < 0 || all[i].text > all[best].text) best = (int)i;
+    }
+    if (best < 0) {
+        best = 0;
+        for (size_t i = 1; i < all.size(); i++)
+            if (all[i].text > all[best].text) best = (int)i;
+    }
     const Stamp st = text_stamp(all[best].img);
     out = all[best].img;
     why = all[best].name;
