@@ -17,7 +17,8 @@
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#elif defined(RCL_HOST_TEST)
+extern "C" const char *_dyld_get_image_name(unsigned int);
 #endif
 
 namespace rcl {
@@ -557,7 +558,7 @@ void objc_dump_methods(const Image &img, const MachInsight &mi, FILE *f, uint64_
     }
 }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(RCL_HOST_TEST)
 typedef char *(*swift_demangle_t)(const char *, size_t, char *, size_t *, uint32_t);
 
 std::string swift_name(const std::string &raw) {
@@ -730,7 +731,7 @@ void deep_objc(const Image &img, const MachInsight &mi, const char *root, DeepSt
         }
     }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(RCL_HOST_TEST)
     if (!swt.empty()) fprintf(f, "\n## swift types\n");
     for (size_t r = 0; r < swt.size(); r++) {
         for (uint64_t va = swt[r].start; va + 4 <= swt[r].end; va += 4) {
@@ -992,7 +993,7 @@ void deep_logic(const char *root, DeepStats &st) {
     std::string base;
     const char *env = getenv("RCL_APP_DIR");
     if (env && *env) base = env;
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(RCL_HOST_TEST)
     if (base.empty()) {
         const char *p0 = _dyld_get_image_name(0);
         if (p0 && *p0) {
@@ -1065,11 +1066,25 @@ void deep_logic(const char *root, DeepStats &st) {
     RCL_LOGLN("[deep] logic assets: files=%u fields=%u", st.logic_files, st.logic_fields);
 }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(RCL_HOST_TEST)
 
 extern "C" unsigned int mach_task_self_;
 extern "C" int mach_vm_read_overwrite(unsigned int, unsigned long long, unsigned long long,
                                       unsigned long long, unsigned long long *);
+extern "C" int mach_vm_region(unsigned int, unsigned long long *, unsigned long long *, int, void *,
+                              unsigned int *, unsigned int *);
+
+struct VmRegionBasic64 {
+    unsigned int protection;
+    unsigned int max_protection;
+    unsigned int inheritance;
+    unsigned int shared;
+    unsigned int reserved;
+    unsigned int pad;
+    unsigned long long offset;
+    unsigned int behavior;
+    unsigned int user_wired_count;
+};
 
 void deep_heap(const Image &img, const MachInsight &mi, const FnStarts &fs, const char *root,
                DeepStats &st) {
@@ -1078,18 +1093,20 @@ void deep_heap(const Image &img, const MachInsight &mi, const FnStarts &fs, cons
     uint32_t regions = 0;
     uint64_t words = 0;
     const uint64_t max_words = 8u << 20;
+    const unsigned int kBasicInfo64 = 9;
+    const unsigned int kProtWrite = 2;
+    const unsigned int kProtExec = 4;
     while (addr < 0x8000000000ULL && regions < 4000 && words < max_words) {
-        vm_size_t sz = 0;
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t obj = MACH_PORT_NULL;
-        mach_vm_address_t q = addr;
-        if (mach_vm_region(mach_task_self_, &q, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
-                           &cnt, &obj) != KERN_SUCCESS)
-            break;
-        unsigned long long rsz = (unsigned long long)sz;
+        unsigned long long sz = 0;
+        VmRegionBasic64 info;
+        memset(&info, 0, sizeof info);
+        unsigned int cnt = (unsigned int)(sizeof info / sizeof(unsigned int));
+        unsigned int obj = 0;
+        unsigned long long q = addr;
+        if (mach_vm_region(mach_task_self_, &q, &sz, (int)kBasicInfo64, &info, &cnt, &obj) != 0) break;
+        const uint64_t rsz = sz;
         const uint64_t next = addr + (rsz ? rsz : 0x1000);
-        if (!(info.protection & VM_PROT_WRITE) || (info.protection & VM_PROT_EXECUTE)) {
+        if (!(info.protection & kProtWrite) || (info.protection & kProtExec)) {
             addr = next;
             continue;
         }
@@ -1145,7 +1162,7 @@ void deep_heap(const Image &img, const MachInsight &mi, const FnStarts &fs, cons
         uint32_t slots = 0;
         for (uint32_t s = 0; s < 512; s++) {
             bool ok = false;
-            uint64_t v = img_slot(img, mi, img.base + it->first + (uint64_t)s * 8, &ok);
+            img_slot(img, mi, img.base + it->first + (uint64_t)s * 8, &ok);
             if (!ok) break;
             slots++;
         }
