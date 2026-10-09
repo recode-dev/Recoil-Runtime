@@ -41,7 +41,7 @@ void log_printf(const char *fmt, ...) {
         (void)r;
     }
 
-    if (getenv("RCL_STDERR")) fwrite(buf, 1, (size_t)n, stderr);
+    if (g_fd < 0 || getenv("RCL_STDERR")) fwrite(buf, 1, (size_t)n, stderr);
 }
 
 }
