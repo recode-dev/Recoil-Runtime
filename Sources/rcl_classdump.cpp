@@ -2101,6 +2101,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
         deep_objc(img, *g_mi, root, ds);
         deep_mangled(img, *g_mi, root, ds);
         deep_fieldmap(img, *g_mi, *g_fs, root, ds);
+        deep_accessors(img, *g_mi, *g_fs, tables, root, ds);
         deep_logic(root, ds);
         deep_heap(img, *g_mi, *g_fs, root, ds);
         std::vector<ClassTable> extra;
@@ -2139,6 +2140,8 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
                   "fp_carried=%u cache=%u",
                   ds.objc_classes, ds.mangled_found, ds.loaders, ds.indirect_added, ds.heap_tables,
                   ds.order_named, ds.fp_named, ds.cache_names);
+        RCL_LOGLN("[deep] accessors: getters=%u setters=%u with_class=%u", ds.getters, ds.setters,
+                  ds.accessors_owned);
     }
     g_deep_ready = true;
 }

@@ -29,6 +29,11 @@ struct DeepStats {
     uint32_t loaders = 0;
     uint32_t field_pairs = 0;
 
+    uint32_t accessors = 0;
+    uint32_t getters = 0;
+    uint32_t setters = 0;
+    uint32_t accessors_owned = 0;
+
     uint32_t indirect_bases = 0;
     uint32_t indirect_calls = 0;
     uint32_t indirect_added = 0;
@@ -55,6 +60,8 @@ void deep_objc(const Image &img, const MachInsight &mi, const char *root, DeepSt
 void deep_mangled(const Image &img, const MachInsight &mi, const char *root, DeepStats &st);
 void deep_fieldmap(const Image &img, const MachInsight &mi, const FnStarts &fs, const char *root,
                    DeepStats &st);
+void deep_accessors(const Image &img, const MachInsight &mi, const FnStarts &fs,
+                    const std::vector<ClassTable> &tables, const char *root, DeepStats &st);
 void deep_indirect(const Image &img, const MachInsight &mi, const FnStarts &fs,
                    std::vector<ClassTable> &extra, DeepStats &st);
 void deep_logic(const char *root, DeepStats &st);

@@ -936,6 +936,171 @@ void deep_fieldmap(const Image &img, const MachInsight &mi, const FnStarts &fs, 
     RCL_LOGLN("[deep] fieldmap: loaders=%u pairs=%u", st.loaders, st.field_pairs);
 }
 
+void deep_accessors(const Image &img, const MachInsight &mi, const FnStarts &fs,
+                    const std::vector<ClassTable> &tables, const char *root, DeepStats &st) {
+    const TextBuf &tb = text_buf_get(img, mi);
+    if (!tb.ok || tb.b.size() < 64) return;
+
+    struct Acc {
+        uint32_t rva;
+        uint32_t off;
+        uint32_t owner;
+        uint32_t size;
+        uint8_t width;
+        uint8_t kind;
+    };
+    std::vector<Acc> acc;
+    acc.reserve(16384);
+
+    const uint64_t n = mi.text_vmsize / 4;
+    for (uint64_t i = 0; i + 4 < n; i++) {
+        const uint64_t va = tb.lo + i * 4;
+        const uint32_t w = tb_word(tb, va);
+        if (((w >> 5) & 0x1Fu) != 0u) continue;
+        const uint32_t rt = w & 0x1Fu;
+        const uint32_t m12 = w & 0xFFC00000u;
+        uint32_t off = 0;
+        uint8_t width = 0;
+        uint8_t kind = 0;
+        if (m12 == 0xF9400000u && rt == 0) {
+            off = ((w >> 10) & 0xFFFu) * 8u; width = 8; kind = 1;
+        } else if (m12 == 0xB9400000u && rt == 0) {
+            off = ((w >> 10) & 0xFFFu) * 4u; width = 4; kind = 1;
+        } else if (m12 == 0x39400000u && rt == 0) {
+            off = (w >> 10) & 0xFFFu; width = 1; kind = 1;
+        } else if (m12 == 0x79400000u && rt == 0) {
+            off = ((w >> 10) & 0xFFFu) * 2u; width = 2; kind = 1;
+        } else if (m12 == 0xFD400000u && rt == 0) {
+            off = ((w >> 10) & 0xFFFu) * 8u; width = 8; kind = 2;
+        } else if (m12 == 0xBD400000u && rt == 0) {
+            off = ((w >> 10) & 0xFFFu) * 4u; width = 4; kind = 2;
+        } else if (m12 == 0xB9800000u && rt == 0) {
+            off = ((w >> 10) & 0xFFFu) * 4u; width = 4; kind = 3;
+        } else if (m12 == 0xF9000000u) {
+            off = ((w >> 10) & 0xFFFu) * 8u; width = 8; kind = 4;
+        } else if (m12 == 0xB9000000u) {
+            off = ((w >> 10) & 0xFFFu) * 4u; width = 4; kind = 4;
+        } else if (m12 == 0x39000000u) {
+            off = (w >> 10) & 0xFFFu; width = 1; kind = 4;
+        } else if (m12 == 0x79000000u) {
+            off = ((w >> 10) & 0xFFFu) * 2u; width = 2; kind = 4;
+        } else if (m12 == 0xFD000000u) {
+            off = ((w >> 10) & 0xFFFu) * 8u; width = 8; kind = 5;
+        } else if (m12 == 0xBD000000u) {
+            off = ((w >> 10) & 0xFFFu) * 4u; width = 4; kind = 5;
+        } else {
+            continue;
+        }
+        if (off > 0x100000u) continue;
+
+        uint32_t tail = 0;
+        const uint32_t b = tb_word(tb, va + 4);
+        if (b == 0xD65F03C0u) {
+            tail = 8;
+        } else {
+            const uint32_t sh = b & 0x7F800000u;
+            if (sh != 0x53000000u && sh != 0x13000000u) continue;
+            if (tb_word(tb, va + 8) == 0xD65F03C0u) {
+                tail = 12;
+            } else {
+                const uint32_t sh2 = tb_word(tb, va + 8) & 0x7F800000u;
+                if ((sh2 != 0x53000000u && sh2 != 0x13000000u) ||
+                    tb_word(tb, va + 12) != 0xD65F03C0u)
+                    continue;
+                tail = 16;
+            }
+        }
+        Acc a;
+        a.rva = (uint32_t)(va - img.base);
+        a.off = off;
+        a.owner = 0;
+        a.size = tail;
+        a.width = width;
+        a.kind = kind;
+        acc.push_back(a);
+    }
+
+    std::map<uint32_t, uint32_t> slot_owner;
+    for (size_t i = 0; i < tables.size(); i++) {
+        const ClassTable &t = tables[i];
+        for (uint32_t s = 0; s < t.slots; s++) {
+            uint64_t raw = 0;
+            if (!d_rd(img, img.base + t.start + (uint64_t)s * 8, &raw, 8)) break;
+            int how = 0;
+            const uint64_t v = macho_slot_value(img, mi, raw, &how);
+            if (!v) continue;
+            const uint32_t r = (uint32_t)(v - img.base);
+            if (!slot_owner.count(r)) slot_owner[r] = t.start;
+        }
+    }
+    for (size_t i = 0; i < acc.size(); i++) {
+        std::map<uint32_t, uint32_t>::const_iterator it = slot_owner.find(acc[i].rva);
+        if (it != slot_owner.end()) acc[i].owner = it->second;
+    }
+
+    st.accessors = (uint32_t)acc.size();
+    for (size_t i = 0; i < acc.size(); i++) {
+        if (acc[i].kind <= 3) st.getters++;
+        else st.setters++;
+        if (acc[i].owner) st.accessors_owned++;
+    }
+
+    static const char *kKind[] = {"", "load", "load-fp", "load-sx", "store", "store-fp"};
+
+    char path[1024];
+    snprintf(path, sizeof path, "%s/_accessors.tsv", root);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "rva\tclass\tkind\toffset\twidth\tsize\tat_function_start\n");
+        for (size_t i = 0; i < acc.size(); i++) {
+            const Acc &a = acc[i];
+            fprintf(f, "%#x\t%s\t%s\t%u\t%u\t%u\t%d\n", a.rva,
+                    a.owner ? deep_ref_class(a.owner) : "-", kKind[a.kind], a.off,
+                    (unsigned)a.width, a.size, fs.is_start(a.rva) ? 1 : 0);
+        }
+        fclose(f);
+    }
+
+    snprintf(path, sizeof path, "%s/_getters.md", root);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "# leaf getters, found by disassembling this image's own __text\n\n");
+        fprintf(f, "A getter is the whole function: `ldr Rd,[x0,#imm]` then `ret` "
+                   "(one or two shifts allowed).\nThe class comes from the class table that "
+                   "holds this function in a slot; `-` means the function is not virtual.\n\n");
+        fprintf(f, "getters %u | with a class %u | setters %u | all accessors %u\n\n",
+                st.getters, st.accessors_owned, st.setters, st.accessors);
+        fprintf(f, "| rva | class | field | width | shape | at start |\n");
+        fprintf(f, "|-----|-------|-------|-------|-------|----------|\n");
+        for (size_t i = 0; i < acc.size(); i++) {
+            const Acc &a = acc[i];
+            if (a.kind > 3) continue;
+            fprintf(f, "| `%#x` | %s | `+%#x` | %u | %s | %d |\n", a.rva,
+                    a.owner ? deep_ref_class(a.owner) : "-", a.off, (unsigned)a.width,
+                    kKind[a.kind], fs.is_start(a.rva) ? 1 : 0);
+        }
+        fclose(f);
+    }
+
+    snprintf(path, sizeof path, "%s/_setters.md", root);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "# leaf setters, found by disassembling this image's own __text\n\n");
+        fprintf(f, "setters %u | all accessors %u\n\n", st.setters, st.accessors);
+        fprintf(f, "| rva | class | field | width | shape |\n|-----|-------|-------|-------|-------|\n");
+        for (size_t i = 0; i < acc.size(); i++) {
+            const Acc &a = acc[i];
+            if (a.kind <= 3) continue;
+            fprintf(f, "| `%#x` | %s | `+%#x` | %u | %s |\n", a.rva,
+                    a.owner ? deep_ref_class(a.owner) : "-", a.off, (unsigned)a.width,
+                    kKind[a.kind]);
+        }
+        fclose(f);
+    }
+    RCL_LOGLN("[deep] accessors: getters=%u setters=%u with_class=%u", st.getters, st.setters,
+              st.accessors_owned);
+}
+
 void deep_indirect(const Image &img, const MachInsight &mi, const FnStarts &fs,
                    std::vector<ClassTable> &extra, DeepStats &st) {
     const TextBuf &tb = text_buf_get(img, mi);
