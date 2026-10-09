@@ -12,18 +12,6 @@
 
 namespace rcl {
 
-struct Seeds {
-    uint64_t text_off;
-    uint64_t text_end_off;
-    uint64_t getbattle_off;
-    uint64_t propget_off;
-    uint64_t colname_off;
-    uint64_t cstr_va;
-    uint64_t cstr_size;
-
-    static Seeds build69();
-};
-
 uint64_t macho_image_size(const void *macho_header);
 
 struct Image {
@@ -40,6 +28,30 @@ struct Image {
     }
 
     bool cstr(uint64_t va, std::string &out) const;
+};
+
+bool macho_text_range(const Image &img, uint64_t &lo, uint64_t &hi);
+bool macho_data_ranges(const Image &img, uint64_t *lo, uint64_t *hi, int cap, int &count);
+
+struct AnchorHit {
+    uint64_t addr = 0;
+    uint32_t score = 0;
+};
+
+struct Seeds {
+    uint64_t text_off = 0;
+    uint64_t text_end_off = 0;
+    uint64_t getbattle_off = 0;
+    uint64_t propget_off = 0;
+    uint64_t colname_off = 0;
+    uint64_t cstr_va = 0;
+    uint64_t cstr_size = 0;
+    uint32_t getbattle_score = 0;
+    uint32_t propget_score = 0;
+    uint32_t colname_score = 0;
+    bool auto_found = false;
+
+    static Seeds discover(const Image &img);
 };
 
 struct PropSite {
@@ -72,6 +84,12 @@ struct ClassColumns {
     std::vector<ClassColumn> items;
 };
 
+struct ClassBoundary {
+    uint32_t start = 0;
+    uint32_t slots = 0;
+    const char *name = "";
+};
+
 struct OwnFlag {
     uint32_t off = 0;
     uint64_t fn = 0;
@@ -86,9 +104,12 @@ struct StoreDecoded {
 };
 StoreDecoded decode_store_to_w0(const Image &img, uint64_t at, int n = 8);
 
+std::vector<ClassBoundary> discover_class_boundaries(const Image &img);
+
 std::vector<PropSite> scan_property_sites(const Image &img, const Seeds &s);
 std::vector<ColumnSite> scan_column_sites(const Image &img, const Seeds &s);
-std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s);
+std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s,
+                                             const std::vector<ClassBoundary> &boundaries);
 std::vector<OwnFlag> scan_own_char_flags(const Image &img, const Seeds &s);
 
 bool branch_target(const Image &img, uint64_t va, uint64_t &target);

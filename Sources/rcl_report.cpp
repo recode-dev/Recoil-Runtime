@@ -30,10 +30,16 @@ static void dump_column_names(const Image &img, const std::vector<ColumnSite> &c
 
     RCL_LOGLN("[column names] sites=%zu  unique=%zu", cols.size(), byPageOff.size());
     RCL_LOGLN("   name and the address it was loaded from (the schema's own strings)");
+    const char *mx = getenv("RCL_COLNAMES_MAX");
+    const int maxn = (mx && *mx) ? atoi(mx) : 0;
     int shown = 0;
     for (auto &kv : byPageOff) {
         RCL_LOGLN("   rva 0x%06x  \"%s\"", (unsigned)(kv.first - img.base), kv.second.c_str());
-        if (++shown >= 32) { RCL_LOGLN("   ... (%zu total, first 32 shown)", byPageOff.size()); break; }
+        if (maxn > 0 && ++shown >= maxn) {
+            RCL_LOGLN("   ... (%zu total, first %d shown; RCL_COLNAMES_MAX=0 for all)",
+                      byPageOff.size(), maxn);
+            break;
+        }
     }
     RCL_LOGLN("   -- names mentioning charge / hyper, listed in full --");
     for (auto &kv : byPageOff) {
@@ -53,7 +59,8 @@ static void dump_own_char_flags(const Image &img, const Seeds &s) {
 }
 
 static void dump_class_columns(const Image &img, const Seeds &s) {
-    std::vector<ClassColumns> cls = scan_class_columns(img, s);
+    const std::vector<ClassBoundary> bounds = discover_class_boundaries(img);
+    std::vector<ClassColumns> cls = scan_class_columns(img, s, bounds);
     size_t total = 0, mism = 0, unresolved_classes = 0;
     for (auto &c : cls) total += c.items.size();
     RCL_LOGLN("[class columns] classes=%zu  columns=%zu  (all columns of every data class, live)",
@@ -64,7 +71,8 @@ static void dump_class_columns(const Image &img, const Seeds &s) {
             if (it.id) all_zero = false;
         if (c.items.size() != c.cols) mism++;
         if (all_zero) unresolved_classes++;
-        RCL_LOGLN("  %-30s loader=0x%06x  cols=%3zu/%u%s%s", c.name, c.start, c.items.size(), c.cols,
+        const char *nm = c.name ? c.name : "?";
+        RCL_LOGLN("  %-30s loader=0x%06x  cols=%3zu/%u%s%s", nm, c.start, c.items.size(), c.cols,
                   c.items.size() == c.cols ? "" : "  MISMATCH",
                   all_zero ? "  ids not resolved yet" : "");
         RCL_LOG("     ");
@@ -100,12 +108,13 @@ void report_run(const Image &img, const Seeds &s) {
     RCL_LOGLN("");
     dump_own_char_flags(img, s);
     RCL_LOGLN("");
+    dump_class_tree(img);
+    RCL_LOGLN("");
     {
         const char *e = getenv("RCL_CLASS_COLUMNS");
         if (!e || *e != '0') dump_class_columns(img, s);
         RCL_LOGLN("");
     }
-    dump_class_tree(img);
     write_class_docs(img);
     RCL_LOGLN("");
     RCL_LOGLN("== end ==");

@@ -1,19 +1,86 @@
 #include "rcl_scan.h"
-#include "rcl_classes.h"
+#include "rcl_log.h"
+#include <algorithm>
+#include <map>
+#include <stdlib.h>
 #include <string.h>
 
 namespace rcl {
 
-Seeds Seeds::build69() {
-    Seeds s{};
-    s.text_off      = 0x4000;
-    s.text_end_off  = 0xd8af60;
-    s.getbattle_off = 0x8c5130;
-    s.propget_off   = 0xafd76c;
-    s.colname_off   = 0xbc75e8;
-    s.cstr_va       = 0;
-    s.cstr_size     = 0;
-    return s;
+static bool rd_raw(const Image &img, uint64_t va, void *dst, size_t n) {
+    return img.read && img.read(img.ctx, va, dst, n);
+}
+
+bool macho_text_range(const Image &img, uint64_t &lo, uint64_t &hi) {
+    lo = 0;
+    hi = 0;
+    uint8_t hdr[32];
+    if (!rd_raw(img, img.base, hdr, sizeof hdr)) return false;
+    const uint32_t ncmds = *(const uint32_t *)(hdr + 16);
+    uint64_t cursor = img.base + 32;
+    for (uint32_t c = 0; c < ncmds && c < 4096; c++) {
+        uint8_t lc[8];
+        if (!rd_raw(img, cursor, lc, sizeof lc)) return false;
+        const uint32_t cmd = *(const uint32_t *)lc;
+        const uint32_t sz = *(const uint32_t *)(lc + 4);
+        if (sz < 8) return false;
+        if (cmd == 0x19) {
+            uint8_t sg[72];
+            if (rd_raw(img, cursor, sg, sizeof sg)) {
+                const char *nm = (const char *)(sg + 8);
+                const uint64_t vmaddr = *(const uint64_t *)(sg + 24);
+                const uint64_t vmsize = *(const uint64_t *)(sg + 32);
+                if (vmsize && strncmp(nm, "__TEXT", 16) == 0) {
+                    const uint64_t slide = img.base >= vmaddr ? img.base - vmaddr : 0;
+                    lo = vmaddr + slide;
+                    hi = vmaddr + vmsize + slide;
+                    return hi > lo;
+                }
+            }
+        }
+        cursor += sz;
+    }
+    return false;
+}
+
+bool macho_data_ranges(const Image &img, uint64_t *lo, uint64_t *hi, int cap, int &count) {
+    count = 0;
+    uint8_t hdr[32];
+    if (!rd_raw(img, img.base, hdr, sizeof hdr)) return false;
+    const uint32_t ncmds = *(const uint32_t *)(hdr + 16);
+    uint64_t cursor = img.base + 32;
+    uint64_t text_vmaddr = 0;
+    for (uint32_t c = 0; c < ncmds && c < 4096; c++) {
+        uint8_t lc[8];
+        if (!rd_raw(img, cursor, lc, sizeof lc)) break;
+        const uint32_t cmd = *(const uint32_t *)lc;
+        const uint32_t sz = *(const uint32_t *)(lc + 4);
+        if (sz < 8) break;
+        if (cmd == 0x19) {
+            uint8_t sg[72];
+            if (rd_raw(img, cursor, sg, sizeof sg)) {
+                const char *nm = (const char *)(sg + 8);
+                const uint64_t vmaddr = *(const uint64_t *)(sg + 24);
+                const uint64_t vmsize = *(const uint64_t *)(sg + 32);
+                if (vmsize) {
+                    if (strncmp(nm, "__TEXT", 16) == 0) text_vmaddr = vmaddr;
+                    else if (strncmp(nm, "__LINKEDIT", 16) != 0 &&
+                             strncmp(nm, "__PAGEZERO", 16) != 0 && count < cap) {
+                        lo[count] = vmaddr;
+                        hi[count] = vmaddr + vmsize;
+                        count++;
+                    }
+                }
+            }
+        }
+        cursor += sz;
+    }
+    const uint64_t slide = img.base >= text_vmaddr ? img.base - text_vmaddr : 0;
+    for (int i = 0; i < count; i++) {
+        lo[i] += slide;
+        hi[i] += slide;
+    }
+    return count > 0;
 }
 
 uint64_t macho_image_size(const void *macho_header) {
@@ -154,8 +221,137 @@ StoreDecoded decode_store_to_w0(const Image &img, uint64_t at, int n) {
     return d;
 }
 
+static void anchor_scores(const Image &img, const Seeds &s, std::map<uint64_t, uint32_t> &prop,
+                          std::map<uint64_t, uint32_t> &col, std::map<uint64_t, uint32_t> &bat) {
+    const uint64_t lo = img.base + s.text_off;
+    const uint64_t hi = img.base + s.text_end_off;
+    if (hi <= lo) return;
+    for (uint64_t va = lo; va + 4 <= hi; va += 4) {
+        uint32_t w = 0;
+        if (!img.u32(va, w)) continue;
+        if ((w & 0xFC000000) != 0x94000000) continue;
+        const uint64_t t = va + ((uint64_t)(sign_extend(w & 0x03FFFFFF, 26)) << 2);
+        if (t < lo || t >= hi) continue;
+
+        bool id_ok = false;
+        for (int k = 1; k <= 4; k++) {
+            uint32_t p = 0;
+            if (!img.u32(va - 4 * k, p)) break;
+            uint32_t imm = 0;
+            if (movz_w1(p, imm)) { id_ok = true; break; }
+        }
+        StoreDecoded d = decode_store_to_w0(img, va + 4, 8);
+        const bool store_ok = d.found && d.off >= 0 && d.off < 0x100000;
+        if (id_ok && store_ok) prop[t]++;
+
+        bool str_ok = false;
+        for (int k = 1; k <= 4; k++) {
+            uint64_t page = 0;
+            uint32_t rd = 0;
+            if (!adrp_at(img, va - 4 * k, page, rd)) continue;
+            uint64_t full = 0;
+            if (!add_imm(img, va - 4 * k + 4, rd, full)) continue;
+            std::string nm;
+            if (img.cstr(full, nm)) { str_ok = true; break; }
+        }
+        if (str_ok && store_ok) col[t]++;
+
+        for (int k = 1; k <= 6; k++) {
+            uint32_t p = 0;
+            if (!img.u32(va + 4 * k, p)) break;
+            if ((p & 0xFFC00000) == 0xF9400000 && ((p >> 5) & 0x1F) == 0 &&
+                ((p >> 10) & 0xFFF) * 8 == 0x28) {
+                bat[t]++;
+                break;
+            }
+        }
+    }
+}
+
+static std::vector<AnchorHit> rank_hits(const std::map<uint64_t, uint32_t> &m) {
+    std::vector<AnchorHit> v;
+    v.reserve(m.size());
+    for (std::map<uint64_t, uint32_t>::const_iterator it = m.begin(); it != m.end(); ++it)
+        v.push_back({it->first, it->second});
+    std::sort(v.begin(), v.end(),
+              [](const AnchorHit &a, const AnchorHit &b) { return a.score > b.score; });
+    return v;
+}
+
+static void log_hits(const char *tag, const std::vector<AnchorHit> &v, uint64_t base) {
+    RCL_LOGLN("[anchor] %s:", tag);
+    if (v.empty()) {
+        RCL_LOGLN("   (no candidate)");
+        return;
+    }
+    for (size_t i = 0; i < v.size() && i < 6; i++)
+        RCL_LOGLN("   score=%-4u rva=0x%06x", v[i].score, (unsigned)(v[i].addr - base));
+}
+
+static uint64_t env_rva(const char *name) {
+    const char *v = getenv(name);
+    if (!v || !*v) return 0;
+    return strtoull(v, nullptr, 0);
+}
+
+Seeds Seeds::discover(const Image &img) {
+    Seeds s;
+    uint64_t lo = 0, hi = 0;
+    if (!macho_text_range(img, lo, hi)) {
+        lo = img.base;
+        hi = img.base + (img.image_vmsize ? img.image_vmsize : img.vmsize);
+    }
+    s.text_off = lo > img.base ? lo - img.base : 0;
+    s.text_end_off = hi > img.base ? hi - img.base : (img.vmsize ? img.vmsize : 0);
+    if (s.text_end_off <= s.text_off) return s;
+
+    std::map<uint64_t, uint32_t> prop, col, bat;
+    anchor_scores(img, s, prop, col, bat);
+
+    const std::vector<AnchorHit> pr = rank_hits(prop);
+    const std::vector<AnchorHit> cr = rank_hits(col);
+    const std::vector<AnchorHit> br = rank_hits(bat);
+    log_hits("getProperty", pr, img.base);
+    log_hits("getColumnName", cr, img.base);
+    log_hits("getBattle", br, img.base);
+
+    const uint32_t kMinAnchorScore = 2;
+    const uint64_t ov_p = env_rva("RCL_PROPGET_RVA");
+    const uint64_t ov_c = env_rva("RCL_COLNAME_RVA");
+    const uint64_t ov_b = env_rva("RCL_GETBATTLE_RVA");
+
+    if (ov_p) {
+        s.propget_off = ov_p;
+    } else if (!pr.empty() && pr[0].score >= kMinAnchorScore) {
+        s.propget_off = pr[0].addr - img.base;
+        s.propget_score = pr[0].score;
+    }
+    if (ov_c) {
+        s.colname_off = ov_c;
+    } else if (!cr.empty() && cr[0].score >= kMinAnchorScore) {
+        s.colname_off = cr[0].addr - img.base;
+        s.colname_score = cr[0].score;
+    }
+    if (ov_b) {
+        s.getbattle_off = ov_b;
+    } else if (!br.empty() && br[0].score >= kMinAnchorScore) {
+        s.getbattle_off = br[0].addr - img.base;
+        s.getbattle_score = br[0].score;
+    }
+
+    s.auto_found = true;
+    RCL_LOGLN("[anchor] selected getbattle=0x%06llx(%u) propget=0x%06llx(%u) colname=0x%06llx(%u) "
+              "text=0x%llx..0x%llx",
+              (unsigned long long)s.getbattle_off, s.getbattle_score,
+              (unsigned long long)s.propget_off, s.propget_score,
+              (unsigned long long)s.colname_off, s.colname_score,
+              (unsigned long long)s.text_off, (unsigned long long)s.text_end_off);
+    return s;
+}
+
 std::vector<PropSite> scan_property_sites(const Image &img, const Seeds &s) {
     std::vector<PropSite> out;
+    if (!s.propget_off) return out;
     const uint64_t target = img.base + s.propget_off;
     for (uint64_t va = img.base + s.text_off; va + 4 <= img.base + s.text_end_off; va += 4) {
         if (!is_bl_to(img, va, target)) continue;
@@ -181,6 +377,7 @@ std::vector<PropSite> scan_property_sites(const Image &img, const Seeds &s) {
 
 std::vector<ColumnSite> scan_column_sites(const Image &img, const Seeds &s) {
     std::vector<ColumnSite> out;
+    if (!s.colname_off) return out;
     const uint64_t target = img.base + s.colname_off;
     for (uint64_t va = img.base + s.text_off; va + 4 <= img.base + s.text_end_off; va += 4) {
         if (!is_bl_to(img, va, target)) continue;
@@ -219,8 +416,10 @@ std::vector<ColumnSite> scan_column_sites(const Image &img, const Seeds &s) {
     return out;
 }
 
-std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s) {
+std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s,
+                                             const std::vector<ClassBoundary> &boundaries) {
     std::vector<ClassColumns> out;
+    if (!s.colname_off) return out;
     const uint64_t target = img.base + s.colname_off;
     for (uint64_t va = img.base + s.text_off; va + 4 <= img.base + s.text_end_off; va += 4) {
         if (!is_bl_to(img, va, target)) continue;
@@ -269,16 +468,16 @@ std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s) {
 
         const uint32_t site = (uint32_t)(va - img.base);
         int idx = -1;
-        for (uint32_t c = 0; c < kClassCount; c++) {
-            if (kClasses[c].start > site) continue;
-            if (idx < 0 || kClasses[c].start > kClasses[idx].start) idx = (int)c;
+        for (size_t c = 0; c < boundaries.size(); c++) {
+            if (boundaries[c].start > site) continue;
+            if (idx < 0 || boundaries[c].start > boundaries[idx].start) idx = (int)c;
         }
         if (idx < 0) continue;
-        if (out.empty() || out.back().start != kClasses[idx].start) {
+        if (out.empty() || out.back().start != boundaries[idx].start) {
             ClassColumns cc;
-            cc.start = kClasses[idx].start;
-            cc.cols = kClasses[idx].cols;
-            cc.name = kClasses[idx].name;
+            cc.start = boundaries[idx].start;
+            cc.cols = boundaries[idx].slots;
+            cc.name = boundaries[idx].name;
             out.push_back(cc);
         }
         ClassColumn item;
@@ -293,6 +492,7 @@ std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s) {
 
 std::vector<OwnFlag> scan_own_char_flags(const Image &img, const Seeds &s) {
     std::vector<OwnFlag> out;
+    if (!s.getbattle_off) return out;
     const uint64_t target = img.base + s.getbattle_off;
     for (uint64_t va = img.base + s.text_off; va + 4 <= img.base + s.text_end_off; va += 4) {
         if (!is_bl_to(img, va, target)) continue;

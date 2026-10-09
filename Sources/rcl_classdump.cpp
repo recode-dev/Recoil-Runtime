@@ -4,7 +4,7 @@
 #include "rcl_livedocs.h"
 #include "rcl_log.h"
 #include "rcl_names.h"
-#include "rcl_tablenames.h"
+#include "rcl_live.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -62,10 +62,10 @@ struct Range {
 
 const uint32_t kLcSegment64 = 0x19;
 const uint32_t kLcFunctionStarts = 0x26;
-const uint32_t kRunMin = 3;
-const uint32_t kLooseRunMin = 4;
-const uint32_t kRunMax = 512;
-const uint32_t kStrMax = 512;
+const uint32_t kRunMin = 2;
+const uint32_t kLooseRunMin = 3;
+const uint32_t kRunMax = 4096;
+const uint32_t kStrMax = 1024;
 const uint32_t kStrMin = 4;
 const uint32_t kFnStrMax = 8;
 const uint64_t kBlockGap = 0x400;
@@ -127,7 +127,11 @@ bool entry(uint32_t w) {
     if (w == 0xD503233Fu || w == 0xD503237Fu || w == 0xD65F03C0u || w == 0xD503201Fu) return true;
     if ((w & 0xFFFFFF1Fu) == 0xD503241Fu) return true;
     if ((w & 0xFF800000u) == 0xA9800000u && ((w >> 5) & 31u) == 31u) return true;
+    if ((w & 0xFF800000u) == 0xA9000000u && ((w >> 5) & 31u) == 31u) return true;
+    if ((w & 0xFFC003FFu) == 0xD10003FFu) return true;
     if ((w & 0xFF8003FFu) == 0xD10003FFu) return true;
+    if ((w & 0xFFFFFFE0u) == 0x910003E0u) return true;
+    if ((w & 0xFFFFFC1Fu) == 0xD4200000u) return true;
     if ((w & 0xFC000000u) == 0x14000000u) return true;
     return false;
 }
@@ -356,9 +360,8 @@ void *live_main(void *arg) {
     for (;;) {
         sleep(2);
         uint32_t state = 0;
-        uint64_t home = 0;
-        if (a->img.read && a->img.read(a->img.ctx, a->img.base + 0x1123e58, &home, 8) && home)
-            a->img.read(a->img.ctx, home + 0x50, &state, 4);
+        uint64_t home = 0, cur = 0;
+        live_home(a->img, home, state, cur);
         live_docs_note(a->img, state, ++tick);
     }
     return nullptr;
@@ -368,6 +371,11 @@ void live_boot(const Image &img) {
     static bool started = false;
     if (started) return;
     started = true;
+    {
+        uint64_t h = 0, c = 0;
+        uint32_t st = 0;
+        live_home(img, h, st, c);
+    }
     LiveArg *a = new LiveArg();
     a->img = img;
     pthread_t th;
@@ -1316,18 +1324,6 @@ void external_align(const char *root) {
     fclose(f);
 }
 
-void apply_seeds(uint32_t *out) {
-    CandMap cand;
-    for (uint32_t i = 0; i < kSeedNameCount; i++)
-        cand[kSeedNames[i].vt] = std::make_pair(std::string(kSeedNames[i].name), "seed");
-    commit_names(cand);
-    uint32_t n = 0;
-    for (std::map<uint32_t, const char *>::const_iterator it = g_table_src.begin();
-         it != g_table_src.end(); ++it)
-        if (strcmp(it->second, "seed") == 0) n++;
-    if (out) *out = n;
-}
-
 void branch_starts(const Image &img, const Layout &L, std::vector<uint32_t> &out) {
     const int64_t hi = (int64_t)(L.code_hi - img.base);
     for (uint64_t va = L.code_lo; va + 4 <= L.code_hi; va += 4) {
@@ -1727,7 +1723,6 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     uint32_t method_named = 0;
     name_from_method_index(img, tables, &method_named, root);
     uint32_t seeded = 0;
-    apply_seeds(&seeded);
     uint32_t families = 0;
     cluster_families(img, tables, root, &families);
     uint32_t tu = 0;
@@ -1835,6 +1830,21 @@ void dump_class_tree(const Image &img) {
               (unsigned long long)slots, (unsigned long long)named);
 }
 
+std::vector<ClassBoundary> discover_class_boundaries(const Image &img) {
+    std::vector<ClassBoundary> out;
+    const std::vector<ClassTable> t = scan_class_tables(img);
+    for (size_t i = 0; i < t.size(); i++) {
+        ClassBoundary b;
+        b.start = t[i].start;
+        b.slots = t[i].slots;
+        b.name = name_of_table(t[i].start);
+        out.push_back(b);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const ClassBoundary &x, const ClassBoundary &y) { return x.start < y.start; });
+    return out;
+}
+
 
 
 
@@ -1872,7 +1882,11 @@ bool entry_ok(uint32_t w) {
     if (w == 0xD503233Fu || w == 0xD503237Fu || w == 0xD65F03C0u || w == 0xD503201Fu) return true;
     if ((w & 0xFFFFFF1Fu) == 0xD503241Fu) return true;
     if ((w & 0xFF800000u) == 0xA9800000u && ((w >> 5) & 31u) == 31u) return true;
+    if ((w & 0xFF800000u) == 0xA9000000u && ((w >> 5) & 31u) == 31u) return true;
+    if ((w & 0xFFC003FFu) == 0xD10003FFu) return true;
     if ((w & 0xFF8003FFu) == 0xD10003FFu) return true;
+    if ((w & 0xFFFFFFE0u) == 0x910003E0u) return true;
+    if ((w & 0xFFFFFC1Fu) == 0xD4200000u) return true;
     if ((w & 0xFC000000u) == 0x14000000u) return true;
     return false;
 }
@@ -1926,6 +1940,19 @@ void write_class_docs(const Image &img) {
         ix.by_rva.push_back({kDocMethods[i].rva, i});
     std::sort(ix.by_rva.begin(), ix.by_rva.end(),
               [](const SlotName &a, const SlotName &b) { return a.rva < b.rva; });
+
+    uint32_t probe_all = 0, probe_ok = 0;
+    for (uint32_t i = 0; i < kDocMethodCount; i++) {
+        probe_all++;
+        uint32_t w = 0;
+        if (img.read && img.read(img.ctx, img.base + kDocMethods[i].rva, &w, sizeof w) && entry_ok(w))
+            probe_ok++;
+    }
+    const bool ref_match = probe_all == 0 || (uint64_t)probe_ok * 4 >= (uint64_t)probe_all * 3;
+    if (!ref_match)
+        RCL_LOGLN("[ref] reference hits %u/%u method addresses, image looks like a different "
+                  "build: reference names are unreliable",
+                  probe_ok, probe_all);
 
     std::vector<uint32_t> claimed;
     char cat[128];
@@ -2082,6 +2109,8 @@ void write_class_docs(const Image &img) {
                     "order constrained %u | registry pairs %u | tu clustered %u\n",
                 g_deep.named, g_deep.tables, g_deep.method_named, g_deep.seeded, g_deep.families,
                 g_deep.sandwiched, g_deep.registry, g_deep.tu_clustered);
+        fprintf(dg, "- reference method addresses: %u/%u match%s\n", probe_ok, probe_all,
+                ref_match ? "" : " (different build, names unreliable)");
         fclose(dg);
     }
 
@@ -2096,14 +2125,6 @@ void write_class_docs(const Image &img) {
 
 namespace {
 
-const uint64_t kHomeGlobal = 0x1123e58;
-const uint64_t kCtrlGlobal = 0x1123b48;
-const uint64_t kStateOff = 0x50;
-const uint64_t kCurrentOff = 0x48;
-const uint64_t kMgrOff = 0x28;
-const uint64_t kArrOff = 0x0;
-const uint64_t kCapOff = 0x8;
-const uint64_t kCntOff = 0xc;
 const uint32_t kObjMax = 1024;
 
 struct Obs {
@@ -2115,7 +2136,6 @@ struct Obs {
 };
 
 std::map<uint32_t, Obs> g_obs;
-std::map<uint32_t, uint32_t> g_chain;
 int g_last_state = -1;
 int g_ticks = 0;
 uint32_t g_last_home = 0;
@@ -2176,10 +2196,6 @@ void observe(const Image &img, uint64_t va, uint32_t state, int tick) {
     o.hits++;
 }
 
-void note_offset(uint32_t off, uint32_t value) {
-    if (value) g_chain[off] = value;
-}
-
 void mkdir_p(const char *path) { mkdir(path, 0755); }
 
 void write_observed(const Image &img, const char *root) {
@@ -2231,18 +2247,19 @@ void write_observed(const Image &img, const char *root) {
     snprintf(path, sizeof path, "%s/_live/anchors.md", root);
     FILE *a = fopen(path, "w");
     if (!a) return;
+    uint64_t slot = 0;
+    uint32_t so = 0, co = 0, mo = 0, ao = 0, cao = 0, cno = 0;
+    const bool have = live_chain(img, slot, so, co, mo, ao, cao, cno);
     fprintf(a, "# anchors seen live (RVAs worth keeping)\n\n");
+    if (!have) fprintf(a, "- singleton chain not discovered\n\n");
     fprintf(a, "| what | offset / global | value seen |\n|------|------------------|------------|\n");
-    fprintf(a, "| home singleton | `BASE+%#llx` | `%#x` |\n", (unsigned long long)kHomeGlobal,
-            g_last_home);
-    fprintf(a, "| controller global | `BASE+%#llx` | `%#x` |\n", (unsigned long long)kCtrlGlobal,
-            g_chain.count((uint32_t)kCtrlGlobal) ? g_chain[(uint32_t)kCtrlGlobal] : 0);
-    fprintf(a, "| state | `home+%#llx` | - |\n", (unsigned long long)kStateOff);
-    fprintf(a, "| current | `home+%#llx` | `%#x` |\n", (unsigned long long)kCurrentOff, g_last_cur);
-    fprintf(a, "| manager | `current+%#llx` | `%#x` |\n", (unsigned long long)kMgrOff, g_last_mgr);
-    fprintf(a, "| array | `manager+%#llx` | - |\n", (unsigned long long)kArrOff);
-    fprintf(a, "| count | `manager+%#llx` | %u |\n", (unsigned long long)kCntOff, g_elem_count);
-    fprintf(a, "| capacity | `manager+%#llx` | %u |\n", (unsigned long long)kCapOff, g_elem_cap);
+    fprintf(a, "| home singleton | `BASE+%#llx` | `%#x` |\n", (unsigned long long)slot, g_last_home);
+    fprintf(a, "| state | `home+%#x` | - |\n", so);
+    fprintf(a, "| current | `home+%#x` | `%#x` |\n", co, g_last_cur);
+    fprintf(a, "| manager | `current+%#x` | `%#x` |\n", mo, g_last_mgr);
+    fprintf(a, "| array | `manager+%#x` | - |\n", ao);
+    fprintf(a, "| count | `manager+%#x` | %u |\n", cno, g_elem_count);
+    fprintf(a, "| capacity | `manager+%#x` | %u |\n", cao, g_elem_cap);
     fprintf(a, "| element vtable | `element+0x0` | `%#x` |\n", g_last_elem_vt);
     fprintf(a, "\nmanager elements: %u live of %u capacity\n", g_elem_count, g_elem_cap);
     fclose(a);
@@ -2303,29 +2320,30 @@ void live_docs_note(const Image &img, uint32_t state, int tick) {
     const char *mode = getenv("RCL_DOCS");
     if (mode && *mode == '0') return;
 
-    uint64_t home = 0, cur = 0, mgr = 0, ctrl = 0;
-    rd64(img, img.base + kHomeGlobal, home);
-    rd64(img, img.base + kCtrlGlobal, ctrl);
+    uint64_t home = 0, cur = 0, mgr = 0;
+    uint32_t live_state = state;
+    if (!live_home(img, home, live_state, cur)) return;
     if (!home) return;
-    rd64(img, home + kCurrentOff, cur);
+    uint64_t slot = 0;
+    uint32_t so = 0, co = 0, mo = 0, ao = 0, cao = 0, cno = 0;
+    live_chain(img, slot, so, co, mo, ao, cao, cno);
 
     g_ticks = tick;
-    note_offset((uint32_t)kCtrlGlobal, rva_of(img, ctrl));
     g_last_home = rva_of(img, home);
     g_last_cur = rva_of(img, cur);
 
     observe(img, home, state, tick);
     if (cur) {
         observe(img, cur, state, tick);
-        rd64(img, cur + kMgrOff, mgr);
+        rd64(img, cur + mo, mgr);
         g_last_mgr = rva_of(img, mgr);
         if (mgr) {
             uint64_t arr = 0;
             uint32_t cnt = 0;
             uint32_t cap = 0;
-            rd64(img, mgr + kArrOff, arr);
-            rd32(img, mgr + kCntOff, cnt);
-            rd32(img, mgr + kCapOff, cap);
+            rd64(img, mgr + ao, arr);
+            rd32(img, mgr + cno, cnt);
+            rd32(img, mgr + cao, cap);
             g_elem_cap = cap;
             if (cnt > kObjMax) cnt = kObjMax;
             g_elem_count = cnt;

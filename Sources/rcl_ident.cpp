@@ -18,38 +18,38 @@ uint32_t crc32_update(uint32_t c, const uint8_t *p, size_t n) {
     return c;
 }
 
-static const uint64_t kProbeRva[4] = {0x4000ULL, 0x8c5130ULL, 0xa23afcULL, 0x9cd834ULL};
-static const uint64_t kProbeWord[4] = {
-    0x45361f3f18209937ULL,
-    0xa9017bfda9be4ff4ULL,
-    0xd65f03c0b9403000ULL,
-    0xd65f03c0b9412400ULL,
-};
-static const uint64_t kTextOff = 0x4000ULL;
-static const uint64_t kTextEnd = 0xd8af60ULL;
-static const uint32_t kTextCrc = 0x5a34cc68u;
-
 Stamp text_stamp(const Image &img) {
     Stamp s;
     if (!img.ok()) return s;
-    for (int i = 0; i < 4; i++) {
-        uint64_t w = 0;
-        if (!img.read(img.ctx, img.base + kProbeRva[i], &w, sizeof w)) return s;
-        if (w != kProbeWord[i]) return s;
+
+    uint8_t hdr[32];
+    if (!img.read || !img.read(img.ctx, img.base, hdr, sizeof hdr)) return s;
+    const uint32_t magic = *(const uint32_t *)hdr;
+    if (magic != 0xFEEDFACFu) return s;
+    const uint32_t cputype = *(const uint32_t *)(hdr + 4);
+    if ((cputype & 0x00FFFFFFu) != 12u) {
+        RCL_LOGLN("[ident] cputype 0x%08x is not arm64", cputype);
+        return s;
     }
     s.probes_ok = true;
 
-    uint32_t c = 0xFFFFFFFFu;
-    uint8_t buf[8192];
-    for (uint64_t off = kTextOff; off < kTextEnd; ) {
-        uint64_t left = kTextEnd - off;
-        size_t n = (size_t)(left < (uint64_t)sizeof buf ? left : (uint64_t)sizeof buf);
-        if (!img.read(img.ctx, img.base + off, buf, n)) return s;
-        c = crc32_update(c, buf, n);
-        off += (uint64_t)n;
+    uint64_t lo = 0, hi = 0;
+    if (!macho_text_range(img, lo, hi)) {
+        lo = img.base;
+        hi = img.base + (img.vmsize ? img.vmsize : img.image_vmsize);
     }
-    s.crc = c ^ 0xFFFFFFFFu;
-    s.crc_ok = (s.crc == kTextCrc);
+    if (hi > lo) {
+        uint32_t c = 0xFFFFFFFFu;
+        uint8_t buf[8192];
+        for (uint64_t off = 0; lo + off < hi; ) {
+            uint64_t left = hi - (lo + off);
+            size_t n = (size_t)(left < (uint64_t)sizeof buf ? left : (uint64_t)sizeof buf);
+            if (!img.read(img.ctx, lo + off, buf, n)) break;
+            c = crc32_update(c, buf, n);
+            off += (uint64_t)n;
+        }
+        s.crc = c ^ 0xFFFFFFFFu;
+    }
     s.valid = true;
     return s;
 }
