@@ -1,4 +1,5 @@
 #include "rcl_scan.h"
+#include "rcl_classes.h"
 #include <string.h>
 
 namespace rcl {
@@ -209,11 +210,83 @@ std::vector<ColumnSite> scan_column_sites(const Image &img, const Seeds &s) {
                 uint64_t page = 0;
                 uint32_t rd = 0;
                 if (!adrp_at(img, va + 4 * k - 4 * b, page, rd)) continue;
-                if (rd == base) { slot_va = page + imm; break; }
+                if (rd == base) { slot_va = page + (uint64_t)imm * 4; break; }
             }
             out.push_back({name, imm, va, slot_va});
             break;
         }
+    }
+    return out;
+}
+
+std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s) {
+    std::vector<ClassColumns> out;
+    const uint64_t target = img.base + s.colname_off;
+    for (uint64_t va = img.base + s.text_off; va + 4 <= img.base + s.text_end_off; va += 4) {
+        if (!is_bl_to(img, va, target)) continue;
+        std::string name;
+        for (int k = 1; k <= 4; k++) {
+            uint64_t page = 0;
+            uint32_t rd = 0;
+            if (!adrp_at(img, va - 4 * k, page, rd)) continue;
+            uint64_t full = 0;
+            if (!add_imm(img, va - 4 * k + 4, rd, full)) continue;
+            if (img.cstr(full, name)) break;
+            name.clear();
+        }
+        if (name.empty()) continue;
+
+        uint64_t slot = 0;
+        for (int k = 1; k <= 8; k++) {
+            uint32_t w = 0;
+            if (!img.u32(va + 4 * k, w)) break;
+            uint32_t imm = 0, scale = 0;
+            const uint32_t op = w & 0xFFC00000;
+            if (op == 0xB9000000 && (w & 0x1F) == 0) {
+                imm = (w >> 10) & 0xFFF;
+                scale = 4;
+            } else if (op == 0xF9000000 && (w & 0x1F) == 0) {
+                imm = (w >> 10) & 0xFFF;
+                scale = 8;
+            } else if ((w & 0xFFE00C00) == 0xB8000000 && (w & 0x1F) == 0) {
+                imm = (uint32_t)sign_extend((w >> 12) & 0x1FF, 9);
+                scale = 4;
+            } else {
+                continue;
+            }
+            const uint32_t base = (w >> 5) & 0x1F;
+            for (int b = 1; b <= 8; b++) {
+                uint64_t page = 0;
+                uint32_t rd = 0;
+                if (!adrp_at(img, va + 4 * k - 4 * b, page, rd)) continue;
+                if (rd == base) {
+                    slot = page + (uint64_t)imm * scale;
+                    break;
+                }
+            }
+            break;
+        }
+
+        const uint32_t site = (uint32_t)(va - img.base);
+        int idx = -1;
+        for (uint32_t c = 0; c < kClassCount; c++) {
+            if (kClasses[c].start > site) continue;
+            if (idx < 0 || kClasses[c].start > kClasses[idx].start) idx = (int)c;
+        }
+        if (idx < 0) continue;
+        if (out.empty() || out.back().start != kClasses[idx].start) {
+            ClassColumns cc;
+            cc.start = kClasses[idx].start;
+            cc.cols = kClasses[idx].cols;
+            cc.name = kClasses[idx].name;
+            out.push_back(cc);
+        }
+        ClassColumn item;
+        item.name = name;
+        item.slot_va = slot;
+        item.id = 0;
+        if (slot) img.u32(slot, item.id);
+        out.back().items.push_back(item);
     }
     return out;
 }

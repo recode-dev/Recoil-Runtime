@@ -1,5 +1,6 @@
 #include "rcl_report.h"
 #include "rcl_log.h"
+#include <stdlib.h>
 #include <map>
 #include <set>
 #include <string>
@@ -21,7 +22,7 @@ static void dump_property_sites(const Image &img, const Seeds &s) {
     }
 }
 
-static void dump_column_names(const std::vector<ColumnSite> &cols) {
+static void dump_column_names(const Image &img, const std::vector<ColumnSite> &cols) {
     std::map<uint64_t, std::string> byPageOff;
     for (auto &c : cols) if (c.slot_va) byPageOff[c.slot_va] = c.name;
 
@@ -29,7 +30,7 @@ static void dump_column_names(const std::vector<ColumnSite> &cols) {
     RCL_LOGLN("   name and the address it was loaded from (the schema's own strings)");
     int shown = 0;
     for (auto &kv : byPageOff) {
-        RCL_LOGLN("   0x%llx  \"%s\"", (unsigned long long)(kv.first - 0x100000000ULL), kv.second.c_str());
+        RCL_LOGLN("   rva 0x%06x  \"%s\"", (unsigned)(kv.first - img.base), kv.second.c_str());
         if (++shown >= 32) { RCL_LOGLN("   ... (%zu total, first 32 shown)", byPageOff.size()); break; }
     }
     RCL_LOGLN("   -- names mentioning charge / hyper, listed in full --");
@@ -37,7 +38,7 @@ static void dump_column_names(const std::vector<ColumnSite> &cols) {
         const std::string &nm = kv.second;
         if (nm.find("vercharge") == std::string::npos && nm.find("yper") == std::string::npos &&
             nm.find("Charge") == std::string::npos) continue;
-        RCL_LOGLN("   0x%llx  \"%s\"", (unsigned long long)(kv.first - 0x100000000ULL), nm.c_str());
+        RCL_LOGLN("   rva 0x%06x  \"%s\"", (unsigned)(kv.first - img.base), nm.c_str());
     }
 }
 
@@ -47,6 +48,37 @@ static void dump_own_char_flags(const Image &img, const Seeds &s) {
     for (auto &f : flags) uniq.insert(f.off);
     RCL_LOGLN("[own-character byte flags] hits=%zu  unique offsets=%zu", flags.size(), uniq.size());
     for (auto o : uniq) RCL_LOGLN("   +0x%04x", o);
+}
+
+static void dump_class_columns(const Image &img, const Seeds &s) {
+    std::vector<ClassColumns> cls = scan_class_columns(img, s);
+    size_t total = 0, mism = 0, unresolved_classes = 0;
+    for (auto &c : cls) total += c.items.size();
+    RCL_LOGLN("[class columns] classes=%zu  columns=%zu  (all columns of every data class, live)",
+              cls.size(), total);
+    for (auto &c : cls) {
+        bool all_zero = !c.items.empty();
+        for (auto &it : c.items)
+            if (it.id) all_zero = false;
+        if (c.items.size() != c.cols) mism++;
+        if (all_zero) unresolved_classes++;
+        RCL_LOGLN("  %-30s loader=0x%06x  cols=%3zu/%u%s%s", c.name, c.start, c.items.size(), c.cols,
+                  c.items.size() == c.cols ? "" : "  MISMATCH",
+                  all_zero ? "  ids not resolved yet" : "");
+        RCL_LOG("     ");
+        int n = 0;
+        for (auto &it : c.items) {
+            if (it.id == 0xFFFFFFFFu) RCL_LOG("%s%s=?", n ? " " : "", it.name.c_str());
+            else RCL_LOG("%s%s=%u", n ? " " : "", it.name.c_str(), it.id);
+            if (++n % 8 == 0) {
+                RCL_LOGLN("");
+                RCL_LOG("     ");
+            }
+        }
+        RCL_LOGLN("");
+    }
+    if (mism || unresolved_classes)
+        RCL_LOGLN("[class columns] mismatched=%zu  not-yet-resolved=%zu", mism, unresolved_classes);
 }
 
 void report_run(const Image &img, const Seeds &s) {
@@ -62,10 +94,15 @@ void report_run(const Image &img, const Seeds &s) {
 
     dump_property_sites(img, s);
     RCL_LOGLN("");
-    dump_column_names(cols);
+    dump_column_names(img, cols);
     RCL_LOGLN("");
     dump_own_char_flags(img, s);
     RCL_LOGLN("");
+    {
+        const char *e = getenv("RCL_CLASS_COLUMNS");
+        if (!e || *e != '0') dump_class_columns(img, s);
+        RCL_LOGLN("");
+    }
     RCL_LOGLN("== end ==");
 }
 

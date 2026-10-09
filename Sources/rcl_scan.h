@@ -59,6 +59,19 @@ struct ColumnSite {
     uint64_t slot_va = 0;
 };
 
+struct ClassColumn {
+    std::string name;
+    uint64_t slot_va = 0;
+    uint32_t id = 0;
+};
+
+struct ClassColumns {
+    uint32_t start = 0;
+    uint32_t cols = 0;
+    const char *name = "";
+    std::vector<ClassColumn> items;
+};
+
 struct OwnFlag {
     uint32_t off = 0;
     uint64_t fn = 0;
@@ -75,6 +88,7 @@ StoreDecoded decode_store_to_w0(const Image &img, uint64_t at, int n = 8);
 
 std::vector<PropSite> scan_property_sites(const Image &img, const Seeds &s);
 std::vector<ColumnSite> scan_column_sites(const Image &img, const Seeds &s);
+std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s);
 std::vector<OwnFlag> scan_own_char_flags(const Image &img, const Seeds &s);
 
 bool branch_target(const Image &img, uint64_t va, uint64_t &target);
