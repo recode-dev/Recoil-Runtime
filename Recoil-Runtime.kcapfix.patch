@@ -1,0 +1,46 @@
+diff --git a/Sources/rcl_classdump.cpp b/Sources/rcl_classdump.cpp
+index 36012fa..0c5e548 100644
+--- a/Sources/rcl_classdump.cpp
++++ b/Sources/rcl_classdump.cpp
+@@ -670,6 +670,7 @@ uint32_t g_last_cur = 0;
+ uint32_t g_last_mgr = 0;
+ uint32_t g_last_elem_vt = 0;
+ uint32_t g_elem_count = 0;
++uint32_t g_elem_cap = 0;
+ 
+ bool rd(const Image &img, uint64_t va, void *dst, size_t n) {
+     return img.read && img.read(img.ctx, va, dst, n);
+@@ -738,8 +739,8 @@ void write_observed(const Image &img, const char *root) {
+     fprintf(f, "# observed classes (every vtable that was live on the heap)\n\n");
+     fprintf(f, "- ticks seen %d  distinct vtables %zu  image tables %zu\n", g_ticks, g_obs.size(),
+             tables(img).size());
+-    fprintf(f, "- last home `%#x`  current `%#x`  manager `%#x`  elements %u\n", g_last_home,
+-            g_last_cur, g_last_mgr, g_elem_count);
++    fprintf(f, "- last home `%#x`  current `%#x`  manager `%#x`  elements %u/%u\n", g_last_home,
++            g_last_cur, g_last_mgr, g_elem_count, g_elem_cap);
+     fprintf(f, "\n| vtable | slots | states | hits | first tick | reference class |\n");
+     fprintf(f, "|--------|-------|--------|------|-----------|-----------------|\n");
+     for (const auto &kv : g_obs) {
+@@ -788,8 +789,9 @@ void write_observed(const Image &img, const char *root) {
+     fprintf(a, "| manager | `current+%#llx` | `%#x` |\n", (unsigned long long)kMgrOff, g_last_mgr);
+     fprintf(a, "| array | `manager+%#llx` | - |\n", (unsigned long long)kArrOff);
+     fprintf(a, "| count | `manager+%#llx` | %u |\n", (unsigned long long)kCntOff, g_elem_count);
++    fprintf(a, "| capacity | `manager+%#llx` | %u |\n", (unsigned long long)kCapOff, g_elem_cap);
+     fprintf(a, "| element vtable | `element+0x0` | `%#x` |\n", g_last_elem_vt);
+-    fprintf(a, "\nlast manager field values: cap `base+%#x` count `%u`\n", 0, g_elem_count);
++    fprintf(a, "\nmanager elements: %u live of %u capacity\n", g_elem_count, g_elem_cap);
+     fclose(a);
+ }
+ 
+@@ -856,8 +858,11 @@ void live_docs_note(const Image &img, uint32_t state, int tick) {
+         if (mgr) {
+             uint64_t arr = 0;
+             uint32_t cnt = 0;
++            uint32_t cap = 0;
+             rd64(img, mgr + kArrOff, arr);
+             rd32(img, mgr + kCntOff, cnt);
++            rd32(img, mgr + kCapOff, cap);
++            g_elem_cap = cap;
+             if (cnt > kObjMax) cnt = kObjMax;
+             g_elem_count = cnt;
+             for (uint32_t i = 0; i < cnt; i++) {
