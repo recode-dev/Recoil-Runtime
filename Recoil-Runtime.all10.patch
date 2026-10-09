@@ -1,5 +1,5 @@
 diff --git a/Sources/rcl_classdump.cpp b/Sources/rcl_classdump.cpp
-index b396a6c..7fc7e5f 100644
+index b396a6c..cc0e8c5 100644
 --- a/Sources/rcl_classdump.cpp
 +++ b/Sources/rcl_classdump.cpp
 @@ -4,6 +4,7 @@
@@ -139,7 +139,22 @@ index b396a6c..7fc7e5f 100644
              break;
          }
      }
-@@ -779,28 +799,89 @@ struct DeepSummary {
+@@ -749,9 +769,12 @@ void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slo
+     FILE *f = fopen(path, "w");
+     if (!f) return;
+     fprintf(f, "# every offset this build can find, in one file\n\n");
++    uint32_t str_only = 0;
++    for (std::map<uint32_t, FnAgg>::const_iterator it = fns.begin(); it != fns.end(); ++it)
++        if (it->second.first_string) str_only++;
+     fprintf(f, "documented classes %u | class tables %zu | table slots %zu | globals holding known "
+-               "objects %zu | functions with a string anchor %zu\n\n",
+-            kDocClassCount, tables.size(), slots.sorted.size(), gh.size(), fns.size());
++               "objects %zu | functions with a string anchor %u (of %zu scanned)\n\n",
++            kDocClassCount, tables.size(), slots.sorted.size(), gh.size(), str_only, fns.size());
+     fprintf(f, "| class | table (vt) | slots | slots named by string | field candidates |\n");
+     fprintf(f, "|-------|-----------|-------|----------------------|------------------|\n");
+     for (size_t i = 0; i < tables.size(); i++) {
+@@ -779,28 +802,104 @@ struct DeepSummary {
      uint32_t named = 0;
      uint32_t tables = 0;
      uint32_t slots = 0;
@@ -154,6 +169,25 @@ index b396a6c..7fc7e5f 100644
  
 +std::map<uint32_t, std::string> g_table_family;
 +std::map<uint32_t, const char *> g_table_src;
++
++typedef std::map<uint32_t, std::pair<std::string, const char *>> CandMap;
++
++void commit_names(const CandMap &cand) {
++    std::map<std::string, uint32_t> used;
++    for (CandMap::const_iterator it = cand.begin(); it != cand.end(); ++it) used[it->second.first]++;
++    for (std::map<uint32_t, std::string>::const_iterator it = g_table_class.begin();
++         it != g_table_class.end(); ++it)
++        used[it->second]++;
++    for (CandMap::const_iterator it = cand.begin(); it != cand.end(); ++it) {
++        if (g_table_class.count(it->first)) continue;
++        if (used[it->second.first] > 1) {
++            g_table_family[it->first] = it->second.first;
++            continue;
++        }
++        g_table_class[it->first] = it->second.first;
++        g_table_src[it->first] = it->second.second;
++    }
++}
 +
 +const char *name_of_table(uint32_t start) {
 +    std::map<uint32_t, std::string>::iterator it = g_table_class.find(start);
@@ -202,11 +236,7 @@ index b396a6c..7fc7e5f 100644
                                const std::map<uint32_t, FnAgg> &fns) {
      char buf[512];
 +    char cbuf[128];
-+    struct Cand {
-+        std::string name;
-+        const char *src;
-+    };
-+    std::map<uint32_t, Cand> cand;
++    CandMap cand;
      for (size_t i = 0; i < tables.size(); i++) {
          const ClassTable &t = tables[i];
          std::map<std::string, uint32_t> votes;
@@ -235,7 +265,7 @@ index b396a6c..7fc7e5f 100644
          }
          uint32_t best = 0;
          std::string bestn;
-@@ -809,8 +890,469 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
+@@ -809,8 +908,454 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
                  best = it->second;
                  bestn = it->first;
              }
@@ -249,25 +279,9 @@ index b396a6c..7fc7e5f 100644
 +                }
 +            src = "class::method";
 +        }
-+        if (best) {
-+            Cand c;
-+            c.name = bestn;
-+            c.src = src;
-+            cand[t.start] = c;
-+        }
++        if (best) cand[t.start] = std::make_pair(bestn, src);
 +    }
-+    std::map<std::string, uint32_t> used;
-+    for (std::map<uint32_t, Cand>::iterator it = cand.begin(); it != cand.end(); ++it)
-+        used[it->second.name]++;
-+    for (std::map<uint32_t, Cand>::iterator it = cand.begin(); it != cand.end(); ++it) {
-+        if (used[it->second.name] > 1) {
-+            g_table_family[it->first] = it->second.name;
-+            continue;
-+        }
-+        if (g_table_class.count(it->first)) continue;
-+        g_table_class[it->first] = it->second.name;
-+        g_table_src[it->first] = it->second.src;
-+    }
++    commit_names(cand);
 +}
 +
 +void name_from_method_index(const Image &img, const std::vector<ClassTable> &tables,
@@ -285,6 +299,7 @@ index b396a6c..7fc7e5f 100644
 +            if (m2c.count(sv[k])) occ[sv[k]]++;
 +    }
 +    uint32_t named = 0;
++    CandMap cand;
 +    char path[1024];
 +    snprintf(path, sizeof path, "%s/_method_index.md", root);
 +    FILE *f = fopen(path, "w");
@@ -308,13 +323,13 @@ index b396a6c..7fc7e5f 100644
 +                top = it->second;
 +                best = it->first;
 +            }
-+        if (!top || g_table_class.count(t.start)) continue;
-+        g_table_class[t.start] = best;
-+        g_table_src[t.start] = "method-index";
++        if (!top) continue;
++        cand[t.start] = std::make_pair(best, "method-index");
 +        named++;
 +        if (f) fprintf(f, "| `%#x` | %u | %u | %s |\n", t.start, t.slots, top, best.c_str());
 +    }
 +    if (f) fclose(f);
++    commit_names(cand);
 +    if (out_named) *out_named = named;
 +}
 +
@@ -525,8 +540,8 @@ index b396a6c..7fc7e5f 100644
 +            SegCmd sg;
 +            if (at(img, p, &sg, sizeof(sg))) {
 +                struct Sec {
-+                    char seg[16];
-+                    char sect[16];
++                    char sectname[16];
++                    char segname[16];
 +                    uint64_t addr;
 +                    uint64_t size;
 +                    uint32_t off;
@@ -542,10 +557,10 @@ index b396a6c..7fc7e5f 100644
 +                for (uint32_t s = 0; s < sg.nsects && n < cap; s++) {
 +                    Sec sc;
 +                    if (!at(img, sp, &sc, sizeof(sc))) break;
-+                    memcpy(out[n].seg, sc.seg, 16);
-+                    out[n].seg[16] = 0;
-+                    memcpy(out[n].sect, sc.sect, 16);
++                    memcpy(out[n].sect, sc.sectname, 16);
 +                    out[n].sect[16] = 0;
++                    memcpy(out[n].seg, sc.segname, 16);
++                    out[n].seg[16] = 0;
 +                    out[n].addr = sc.addr;
 +                    out[n].size = sc.size;
 +                    n++;
@@ -624,14 +639,14 @@ index b396a6c..7fc7e5f 100644
 +}
 +
 +void apply_seeds(uint32_t *out) {
++    CandMap cand;
 +    uint32_t n = 0;
 +    for (uint32_t i = 0; i < kSeedNameCount; i++) {
 +        uint32_t vt = kSeedNames[i].vt;
-+        if (g_table_class.count(vt)) continue;
-+        g_table_class[vt] = kSeedNames[i].name;
-+        g_table_src[vt] = "seed";
++        cand[vt] = std::make_pair(std::string(kSeedNames[i].name), "seed");
 +        n++;
 +    }
++    commit_names(cand);
 +    if (out) *out = n;
 +}
 +
@@ -706,7 +721,7 @@ index b396a6c..7fc7e5f 100644
  }
  
  void write_table_names(const std::vector<ClassTable> &tables, const char *root) {
-@@ -821,21 +1363,29 @@ void write_table_names(const std::vector<ClassTable> &tables, const char *root)
+@@ -821,21 +1366,29 @@ void write_table_names(const std::vector<ClassTable> &tables, const char *root)
      fprintf(f, "# class table -> class name, resolved from the strings its functions reference\n\n");
      fprintf(f, "| table rva | slots | class | source |\n|-----------|-------|-------|--------|\n");
      uint32_t named = 0;
@@ -741,7 +756,7 @@ index b396a6c..7fc7e5f 100644
  }
  
  void write_unknown_named(const Image &img, const std::vector<StrEnt> &strs,
-@@ -874,6 +1424,16 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+@@ -874,6 +1427,16 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
                     const char *root) {
      mkdir(root, 0755);
      const std::vector<uint32_t> starts = build_starts(img, L);
@@ -758,7 +773,7 @@ index b396a6c..7fc7e5f 100644
      const std::vector<StrEnt> strs = build_strings(img, L);
      SlotMap slots;
      slots.sorted.reserve(32768);
-@@ -886,7 +1446,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+@@ -886,7 +1449,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
          }
      finish_slot_map(slots);
      std::map<uint32_t, FnAgg> fns;
@@ -767,7 +782,7 @@ index b396a6c..7fc7e5f 100644
      std::vector<GlobalHit> gh;
      scan_globals(img, L, tables, gh);
      write_strings(img, strs, fns, root);
-@@ -894,22 +1454,47 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+@@ -894,22 +1457,47 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
      write_all_offsets(tables, slots, fns, gh, root);
      build_unique_strings();
      RCL_LOGLN("[deep] class-specific reference strings: %zu", g_unique_str.size());
@@ -820,7 +835,7 @@ index b396a6c..7fc7e5f 100644
  }
  
  }  // namespace
-@@ -1220,10 +1805,13 @@ void write_class_docs(const Image &img) {
+@@ -1220,10 +1808,13 @@ void write_class_docs(const Image &img) {
          fprintf(dg, "- tables %zu (strict %u, loose %u, loose words %llu)  class files %u  "
                      "table files %u\n", ix.tables.size(), st.tables_strict, st.tables_loose,
                  (unsigned long long)st.loose_words, files, unknown);

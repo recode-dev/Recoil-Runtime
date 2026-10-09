@@ -769,9 +769,12 @@ void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slo
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "# every offset this build can find, in one file\n\n");
+    uint32_t str_only = 0;
+    for (std::map<uint32_t, FnAgg>::const_iterator it = fns.begin(); it != fns.end(); ++it)
+        if (it->second.first_string) str_only++;
     fprintf(f, "documented classes %u | class tables %zu | table slots %zu | globals holding known "
-               "objects %zu | functions with a string anchor %zu\n\n",
-            kDocClassCount, tables.size(), slots.sorted.size(), gh.size(), fns.size());
+               "objects %zu | functions with a string anchor %u (of %zu scanned)\n\n",
+            kDocClassCount, tables.size(), slots.sorted.size(), gh.size(), str_only, fns.size());
     fprintf(f, "| class | table (vt) | slots | slots named by string | field candidates |\n");
     fprintf(f, "|-------|-----------|-------|----------------------|------------------|\n");
     for (size_t i = 0; i < tables.size(); i++) {
@@ -810,6 +813,25 @@ DeepSummary g_deep;
 
 std::map<uint32_t, std::string> g_table_family;
 std::map<uint32_t, const char *> g_table_src;
+
+typedef std::map<uint32_t, std::pair<std::string, const char *>> CandMap;
+
+void commit_names(const CandMap &cand) {
+    std::map<std::string, uint32_t> used;
+    for (CandMap::const_iterator it = cand.begin(); it != cand.end(); ++it) used[it->second.first]++;
+    for (std::map<uint32_t, std::string>::const_iterator it = g_table_class.begin();
+         it != g_table_class.end(); ++it)
+        used[it->second]++;
+    for (CandMap::const_iterator it = cand.begin(); it != cand.end(); ++it) {
+        if (g_table_class.count(it->first)) continue;
+        if (used[it->second.first] > 1) {
+            g_table_family[it->first] = it->second.first;
+            continue;
+        }
+        g_table_class[it->first] = it->second.first;
+        g_table_src[it->first] = it->second.second;
+    }
+}
 
 const char *name_of_table(uint32_t start) {
     std::map<uint32_t, std::string>::iterator it = g_table_class.find(start);
@@ -858,11 +880,7 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
                               const std::map<uint32_t, FnAgg> &fns) {
     char buf[512];
     char cbuf[128];
-    struct Cand {
-        std::string name;
-        const char *src;
-    };
-    std::map<uint32_t, Cand> cand;
+    CandMap cand;
     for (size_t i = 0; i < tables.size(); i++) {
         const ClassTable &t = tables[i];
         std::map<std::string, uint32_t> votes;
@@ -899,25 +917,9 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
                 }
             src = "class::method";
         }
-        if (best) {
-            Cand c;
-            c.name = bestn;
-            c.src = src;
-            cand[t.start] = c;
-        }
+        if (best) cand[t.start] = std::make_pair(bestn, src);
     }
-    std::map<std::string, uint32_t> used;
-    for (std::map<uint32_t, Cand>::iterator it = cand.begin(); it != cand.end(); ++it)
-        used[it->second.name]++;
-    for (std::map<uint32_t, Cand>::iterator it = cand.begin(); it != cand.end(); ++it) {
-        if (used[it->second.name] > 1) {
-            g_table_family[it->first] = it->second.name;
-            continue;
-        }
-        if (g_table_class.count(it->first)) continue;
-        g_table_class[it->first] = it->second.name;
-        g_table_src[it->first] = it->second.src;
-    }
+    commit_names(cand);
 }
 
 void name_from_method_index(const Image &img, const std::vector<ClassTable> &tables,
@@ -935,6 +937,7 @@ void name_from_method_index(const Image &img, const std::vector<ClassTable> &tab
             if (m2c.count(sv[k])) occ[sv[k]]++;
     }
     uint32_t named = 0;
+    CandMap cand;
     char path[1024];
     snprintf(path, sizeof path, "%s/_method_index.md", root);
     FILE *f = fopen(path, "w");
@@ -958,13 +961,13 @@ void name_from_method_index(const Image &img, const std::vector<ClassTable> &tab
                 top = it->second;
                 best = it->first;
             }
-        if (!top || g_table_class.count(t.start)) continue;
-        g_table_class[t.start] = best;
-        g_table_src[t.start] = "method-index";
+        if (!top) continue;
+        cand[t.start] = std::make_pair(best, "method-index");
         named++;
         if (f) fprintf(f, "| `%#x` | %u | %u | %s |\n", t.start, t.slots, top, best.c_str());
     }
     if (f) fclose(f);
+    commit_names(cand);
     if (out_named) *out_named = named;
 }
 
@@ -1175,8 +1178,8 @@ int image_sections(const Image &img, uint64_t base, SectionRef *out, int cap) {
             SegCmd sg;
             if (at(img, p, &sg, sizeof(sg))) {
                 struct Sec {
-                    char seg[16];
-                    char sect[16];
+                    char sectname[16];
+                    char segname[16];
                     uint64_t addr;
                     uint64_t size;
                     uint32_t off;
@@ -1192,10 +1195,10 @@ int image_sections(const Image &img, uint64_t base, SectionRef *out, int cap) {
                 for (uint32_t s = 0; s < sg.nsects && n < cap; s++) {
                     Sec sc;
                     if (!at(img, sp, &sc, sizeof(sc))) break;
-                    memcpy(out[n].seg, sc.seg, 16);
-                    out[n].seg[16] = 0;
-                    memcpy(out[n].sect, sc.sect, 16);
+                    memcpy(out[n].sect, sc.sectname, 16);
                     out[n].sect[16] = 0;
+                    memcpy(out[n].seg, sc.segname, 16);
+                    out[n].seg[16] = 0;
                     out[n].addr = sc.addr;
                     out[n].size = sc.size;
                     n++;
@@ -1274,14 +1277,14 @@ void external_align(const char *root) {
 }
 
 void apply_seeds(uint32_t *out) {
+    CandMap cand;
     uint32_t n = 0;
     for (uint32_t i = 0; i < kSeedNameCount; i++) {
         uint32_t vt = kSeedNames[i].vt;
-        if (g_table_class.count(vt)) continue;
-        g_table_class[vt] = kSeedNames[i].name;
-        g_table_src[vt] = "seed";
+        cand[vt] = std::make_pair(std::string(kSeedNames[i].name), "seed");
         n++;
     }
+    commit_names(cand);
     if (out) *out = n;
 }
 
