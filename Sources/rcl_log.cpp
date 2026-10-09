@@ -1,5 +1,3 @@
-// rcl_log.cpp
-
 #include "rcl_log.h"
 #include <fcntl.h>
 #include <unistd.h>
@@ -42,9 +40,8 @@ void log_printf(const char *fmt, ...) {
         ssize_t r = write(g_fd, buf, (size_t)n);
         (void)r;
     }
-    // mirror to stderr: LiveContainer and most installers show it in their console, which is a
-    // useful fallback when the container path cannot be located from the outside
+
     if (getenv("RCL_STDERR")) fwrite(buf, 1, (size_t)n, stderr);
 }
 
-} // namespace rcl
+}

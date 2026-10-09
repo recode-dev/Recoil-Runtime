@@ -1,19 +1,5 @@
-// rcl_main.cpp - entry point of the injected dylib.
-//
-// READ-ONLY by design: the dylib scans the loaded game image and writes a log. It installs no
-// inline hooks, patches no code and rewires no pointers - there is nothing to turn off, because the
-// write path is not used here at all.
-//
-// LiveContainer-aware: in LiveContainer the guest app is not image 0, it is a dylib loaded into the
-// host process, so the target is chosen by shape (an .app/ path, large __TEXT, not the host app)
-// rather than by index. RCL_IMAGE_MATCH forces a substring when needed.
-//
-// Darwin parts are guarded so this file also compiles on the host, which is how its build is
-// verified without an iOS toolchain.
-
 #include "rcl_scan.h"
 #include "rcl_report.h"
-#include "rcl_hook.h"
 #include "rcl_log.h"
 
 #include <string.h>
@@ -39,7 +25,7 @@ static bool live_read(void *ctx, uint64_t va, void *dst, size_t n) {
     if (va < im->base) return false;
     uint64_t off = va - im->base;
     if (off + n > im->vmsize) return false;
-    memcpy(dst, (const void *)(uintptr_t)va, n);      // VA == pointer in-process
+    memcpy(dst, (const void *)(uintptr_t)va, n);
     return true;
 }
 
@@ -59,20 +45,19 @@ static uint64_t text_vmsize(const struct mach_header_64 *h) {
     return t;
 }
 
-// Pick the target image; false while the guest app is not mapped yet.
 static bool find_image(Image &out, std::string &why) {
     const char *want = getenv("RCL_IMAGE_MATCH");
-    Cand best{nullptr, 0, nullptr, 0};        // best .app/ image that is not the host
-    Cand biggest{nullptr, 0, nullptr, 0};     // fallback: biggest non-system image
+    Cand best{nullptr, 0, nullptr, 0};
+    Cand biggest{nullptr, 0, nullptr, 0};
 
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const struct mach_header_64 *h = (const struct mach_header_64 *) _dyld_get_image_header(i);
         if (!h || h->magic != MH_MAGIC_64) continue;
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
-        if (strstr(name, kSelfName)) continue;                  // our own dylib
+        if (strstr(name, kSelfName)) continue;
         uint64_t ts = text_vmsize(h);
-        if (ts < 0x200000) continue;                            // system libs, small dylibs
+        if (ts < 0x200000) continue;
         Cand c{h, _dyld_get_image_vmaddr_slide(i), name, ts};
 
         if (want) { if (strstr(name, want) && ts > biggest.textsize) biggest = c; continue; }
@@ -108,8 +93,6 @@ static void log_image_list() {
     }
 }
 
-// First writable directory wins. LiveContainer gives the guest its own HOME, so $HOME/Documents is
-// the primary candidate; the shared and jailbreak paths are fallbacks.
 static void open_log_anywhere() {
     char home_docs[512] = {0}, home[512] = {0};
     const char *env = getenv("RCL_LOG_DIR");
@@ -141,7 +124,7 @@ static void run_once() {
 }
 
 static void *waiter(void *) {
-    // LiveContainer may inject the tweak before the guest app is mapped: poll up to ~60s.
+
     for (int i = 0; i < 120; i++) {
         Image img; std::string why;
         if (find_image(img, why)) {
@@ -163,7 +146,7 @@ __attribute__((constructor)) static void rcl_ctor(void) {
     else { open_log_anywhere(); waiter(nullptr); }
 }
 
-#else  // ---------- host ----------
+#else
 
 static bool host_read(void *, uint64_t, void *, size_t) { return false; }
 
@@ -182,4 +165,4 @@ void rcl_run_once_for_host() {
 
 #endif
 
-} // namespace rcl
+}

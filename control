@@ -1,8 +1,0 @@
-Package: com.recoil.runtime
-Name: Recoil Runtime
-Version: 0.1.0
-Architecture: iphoneos-arm64
-Description: Runtime offset searcher - read-only scan of the game image, writes a log
-Maintainer: recoil
-Author: recoil
-Section: Tweaks
