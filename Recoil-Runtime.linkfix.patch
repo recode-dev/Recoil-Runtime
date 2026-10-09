@@ -1,0 +1,56 @@
+diff --git a/Sources/rcl_classdump.cpp b/Sources/rcl_classdump.cpp
+index d16acff..c414edd 100644
+--- a/Sources/rcl_classdump.cpp
++++ b/Sources/rcl_classdump.cpp
+@@ -347,8 +347,6 @@ void live_boot(const Image &img) {
+ 
+ }  // namespace
+ 
+-const char *ref_name(uint32_t vt);
+-
+ namespace {
+ 
+ struct StrEnt {
+@@ -453,8 +451,14 @@ const char *ref_class_for_string(const char *s) {
+     return nullptr;
+ }
+ 
++const char *doc_class_name(uint32_t vt) {
++    for (uint32_t i = 0; i < kDocClassCount; i++)
++        if (kDocClasses[i].vt == vt) return kDocBlob + kDocClasses[i].name;
++    return "-";
++}
++
+ void class_label(uint32_t vt, char *dst, size_t cap) {
+-    const char *n = ref_name(vt);
++    const char *n = doc_class_name(vt);
+     if (n && *n && strcmp(n, "-") != 0) {
+         snprintf(dst, cap, "%s", n);
+         return;
+@@ -650,7 +654,7 @@ void write_strings(const Image &img, const std::vector<StrEnt> &strs,
+         const StrEnt *e = find_str(strs, kv.second.first_string);
+         if (!e || !read_str(img, *e, buf, sizeof buf)) continue;
+         char cl[128];
+-        const char *n = ref_name(kv.second.table);
++        const char *n = doc_class_name(kv.second.table);
+         snprintf(cl, sizeof cl, "%s", (n && strcmp(n, "-") != 0) ? n : "-");
+         const char *owner = ref_class_for_string(buf);
+         fprintf(f, "| `%#x` | `%#x` | %s | `%.80s` | %s |\n", kv.first, kv.second.table, cl, buf,
+@@ -669,7 +673,7 @@ void write_fields(const std::map<uint32_t, FnAgg> &fns, const char *root) {
+     std::map<std::string, std::map<uint32_t, uint32_t>> per;
+     for (const auto &kv : fns) {
+         if (!kv.second.table) continue;
+-        const char *n = ref_name(kv.second.table);
++        const char *n = doc_class_name(kv.second.table);
+         std::string lb = (n && strcmp(n, "-") != 0) ? n : "unnamed";
+         for (size_t i = 0; i < kv.second.fields.size(); i++) per[lb][kv.second.fields[i]]++;
+     }
+@@ -700,7 +704,7 @@ void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slo
+     fprintf(f, "|-------|-----------|-------|----------------------|------------------|\n");
+     for (size_t i = 0; i < tables.size(); i++) {
+         const ClassTable &t = tables[i];
+-        const char *n = ref_name(t.start);
++        const char *n = doc_class_name(t.start);
+         std::string lb = (n && strcmp(n, "-") != 0) ? n : ("vt_" + std::to_string(t.start));
+         uint32_t named = 0, flds = 0;
+         for (const auto &kv : fns)
