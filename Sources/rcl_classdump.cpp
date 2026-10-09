@@ -1271,12 +1271,14 @@ void import_foreign_names(const Image &img, const char *root) {
                 if (len >= 3 && at(img, p, buf, len)) {
                     buf[len] = 0;
                     total++;
+                    bool doc = false;
                     for (uint32_t c = 0; c < kDocClassCount; c++)
                         if (strcmp(kDocBlob + kDocClasses[c].name, buf) == 0) {
-                            ref++;
-                            fprintf(f, "- `%s` also exists in the class reference\n", buf);
+                            doc = true;
                             break;
                         }
+                    if (doc) ref++;
+                    fprintf(f, "- `%s`%s\n", buf, doc ? " (in the reference)" : "");
                 }
                 p += len + 1;
             }
@@ -1435,10 +1437,13 @@ uint32_t merge_runs(const std::vector<ClassTable> &tables) {
     std::sort(by.begin(), by.end(),
               [](const ClassTable *a, const ClassTable *b) { return a->start < b->start; });
     uint32_t n = 0;
-    for (size_t i = 1; i < by.size(); i++)
-        if (by[i - 1]->start + (uint64_t)by[i - 1]->slots * 8 == by[i]->start &&
-            by[i - 1]->slots < 8 && by[i]->slots < 8)
-            n++;
+    for (size_t i = 1; i < by.size(); i++) {
+        const uint64_t end = by[i - 1]->start + (uint64_t)by[i - 1]->slots * 8;
+        if (by[i]->start < end) continue;
+        if (by[i]->start - end > 0x20) continue;
+        if (by[i - 1]->slots + by[i]->slots > 256) continue;
+        n++;
+    }
     return n;
 }
 

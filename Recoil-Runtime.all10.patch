@@ -1,5 +1,5 @@
 diff --git a/Sources/rcl_classdump.cpp b/Sources/rcl_classdump.cpp
-index b396a6c..23062dd 100644
+index b396a6c..6dc9038 100644
 --- a/Sources/rcl_classdump.cpp
 +++ b/Sources/rcl_classdump.cpp
 @@ -4,8 +4,10 @@
@@ -308,7 +308,7 @@ index b396a6c..23062dd 100644
          }
          uint32_t best = 0;
          std::string bestn;
-@@ -809,8 +944,640 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
+@@ -809,8 +944,645 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
                  best = it->second;
                  bestn = it->first;
              }
@@ -555,7 +555,7 @@ index b396a6c..23062dd 100644
 +        const char *n = name_of_table(pairs[i].vt);
 +        fprintf(f, "| `%#x` | `%#x` | %s | `%.70s` |\n", pairs[i].cell, pairs[i].vt,
 +                n ? n : "?", pairs[i].text);
-     }
++    }
 +    fclose(f);
 +}
 +
@@ -640,12 +640,14 @@ index b396a6c..23062dd 100644
 +                if (len >= 3 && at(img, p, buf, len)) {
 +                    buf[len] = 0;
 +                    total++;
++                    bool doc = false;
 +                    for (uint32_t c = 0; c < kDocClassCount; c++)
 +                        if (strcmp(kDocBlob + kDocClasses[c].name, buf) == 0) {
-+                            ref++;
-+                            fprintf(f, "- `%s` also exists in the class reference\n", buf);
++                            doc = true;
 +                            break;
 +                        }
++                    if (doc) ref++;
++                    fprintf(f, "- `%s`%s\n", buf, doc ? " (in the reference)" : "");
 +                }
 +                p += len + 1;
 +            }
@@ -759,7 +761,7 @@ index b396a6c..23062dd 100644
 +        if (!ok || !delta) break;
 +        rva += delta;
 +        out.push_back(rva);
-+    }
+     }
 +    return !out.empty();
 +}
 +
@@ -804,10 +806,13 @@ index b396a6c..23062dd 100644
 +    std::sort(by.begin(), by.end(),
 +              [](const ClassTable *a, const ClassTable *b) { return a->start < b->start; });
 +    uint32_t n = 0;
-+    for (size_t i = 1; i < by.size(); i++)
-+        if (by[i - 1]->start + (uint64_t)by[i - 1]->slots * 8 == by[i]->start &&
-+            by[i - 1]->slots < 8 && by[i]->slots < 8)
-+            n++;
++    for (size_t i = 1; i < by.size(); i++) {
++        const uint64_t end = by[i - 1]->start + (uint64_t)by[i - 1]->slots * 8;
++        if (by[i]->start < end) continue;
++        if (by[i]->start - end > 0x20) continue;
++        if (by[i - 1]->slots + by[i]->slots > 256) continue;
++        n++;
++    }
 +    return n;
 +}
 +
@@ -950,7 +955,7 @@ index b396a6c..23062dd 100644
  }
  
  void write_table_names(const std::vector<ClassTable> &tables, const char *root) {
-@@ -821,21 +1588,29 @@ void write_table_names(const std::vector<ClassTable> &tables, const char *root)
+@@ -821,21 +1593,29 @@ void write_table_names(const std::vector<ClassTable> &tables, const char *root)
      fprintf(f, "# class table -> class name, resolved from the strings its functions reference\n\n");
      fprintf(f, "| table rva | slots | class | source |\n|-----------|-------|-------|--------|\n");
      uint32_t named = 0;
@@ -985,7 +990,7 @@ index b396a6c..23062dd 100644
  }
  
  void write_unknown_named(const Image &img, const std::vector<StrEnt> &strs,
-@@ -874,8 +1649,22 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+@@ -874,8 +1654,22 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
                     const char *root) {
      mkdir(root, 0755);
      const std::vector<uint32_t> starts = build_starts(img, L);
@@ -1008,7 +1013,7 @@ index b396a6c..23062dd 100644
      slots.sorted.reserve(32768);
      slots.table_of.reserve(32768);
      for (size_t i = 0; i < tables.size(); i++)
-@@ -886,30 +1675,66 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+@@ -886,30 +1680,66 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
          }
      finish_slot_map(slots);
      std::map<uint32_t, FnAgg> fns;
@@ -1081,7 +1086,7 @@ index b396a6c..23062dd 100644
  }
  
  }  // namespace
-@@ -1220,10 +2045,13 @@ void write_class_docs(const Image &img) {
+@@ -1220,10 +2050,13 @@ void write_class_docs(const Image &img) {
          fprintf(dg, "- tables %zu (strict %u, loose %u, loose words %llu)  class files %u  "
                      "table files %u\n", ix.tables.size(), st.tables_strict, st.tables_loose,
                  (unsigned long long)st.loose_words, files, unknown);
