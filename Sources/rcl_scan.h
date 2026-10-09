@@ -24,6 +24,8 @@ struct Seeds {
     static Seeds build69();
 };
 
+uint64_t macho_image_size(const void *macho_header);
+
 struct Image {
     uint64_t base = 0;
     uint64_t vmsize = 0;

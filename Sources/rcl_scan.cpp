@@ -15,6 +15,29 @@ Seeds Seeds::build69() {
     return s;
 }
 
+uint64_t macho_image_size(const void *macho_header) {
+    const uint8_t *h = (const uint8_t *)macho_header;
+    if (!h) return 0;
+    const uint32_t ncmds = *(const uint32_t *)(h + 16);
+    const uint8_t *p = h + 32;
+    uint64_t lo = 0, hi = 0;
+    for (uint32_t c = 0; c < ncmds; c++) {
+        const uint32_t cmd = *(const uint32_t *)p;
+        const uint32_t sz = *(const uint32_t *)(p + 4);
+        if (sz < 8) break;
+        if (cmd == 0x19) {
+            const uint64_t vm = *(const uint64_t *)(p + 24);
+            const uint64_t vs = *(const uint64_t *)(p + 32);
+            if (vm && vs) {
+                if (!lo || vm < lo) lo = vm;
+                if (vm + vs > hi) hi = vm + vs;
+            }
+        }
+        p += sz;
+    }
+    return hi > lo ? hi - lo : 0;
+}
+
 bool Image::cstr(uint64_t va, std::string &out) const {
     out.clear();
     for (int i = 0; i < 48; i++) {

@@ -45,26 +45,10 @@ static uint64_t text_vmsize(const struct mach_header_64 *h) {
     return t;
 }
 
-static uint64_t image_size(const struct mach_header_64 *h) {
-    uint64_t end = 0;
-    const uint8_t *p = (const uint8_t *)h + sizeof(struct mach_header_64);
-    for (uint32_t c = 0; c < h->ncmds; c++) {
-        const struct load_command *lc = (const struct load_command *)p;
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
-            const uint64_t e = sg->vmaddr + sg->vmsize;
-            if (e > end) end = e;
-        }
-        p += lc->cmdsize;
-    }
-    const uint64_t b = (uint64_t)(uintptr_t)h;
-    return end > b ? end - b : 0;
-}
-
 static bool stamp_image(const struct mach_header_64 *h, uint64_t ts, Image &img, Stamp &st) {
     img.base = (uint64_t)(uintptr_t)h;
     img.vmsize = ts;
-    img.image_vmsize = image_size(h);
+    img.image_vmsize = macho_image_size(h);
     img.ctx = &img;
     img.read = live_read;
     st = text_stamp(img);
@@ -111,15 +95,29 @@ static bool find_image(Image &out, std::string &why) {
 }
 
 static void log_image_list() {
-    RCL_LOGLN("[loaded images] >=512KB, with __TEXT vmsize - shows how the guest app is mapped");
+    const char *all_flag = getenv("RCL_IMAGES");
+    const bool all = all_flag && *all_flag;
+    uint32_t shown = 0;
+    uint32_t hits = 0;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const struct mach_header_64 *h = (const struct mach_header_64 *) _dyld_get_image_header(i);
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!h || h->magic != MH_MAGIC_64) continue;
+        if (text_vmsize(h) < 0x80000) continue;
+        hits++;
+    }
+    RCL_LOGLN("[loaded images] %u of %u are >=512KB%s", hits, _dyld_image_count(),
+              all ? "" : " (summary only, RCL_IMAGES=1 for the full list)");
+    if (!all) return;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!h || h->magic != MH_MAGIC_64) continue;
         uint64_t ts = text_vmsize(h);
         if (ts < 0x80000) continue;
         RCL_LOGLN("   [%2u] 0x%08llx  %s", i, (unsigned long long)ts,
                   _dyld_get_image_name(i) ? _dyld_get_image_name(i) : "?");
+        shown++;
     }
+    RCL_LOGLN("[loaded images] listed %u", shown);
 }
 
 static void open_log_anywhere() {
