@@ -565,6 +565,125 @@ void class_label(uint32_t vt, char *dst, size_t cap) {
     snprintf(dst, cap, "vt_%06x", vt);
 }
 
+std::string hex_label(uint32_t rva) {
+    char b[24];
+    snprintf(b, sizeof b, "vt_%06x", rva);
+    return std::string(b);
+}
+
+const char *name_of_table(uint32_t start);
+const char *category_of_name(const char *name);
+
+const char *doc_category_of_name(const char *name) {
+    if (!name || !*name) return nullptr;
+    for (uint32_t i = 0; i < kDocClassCount; i++)
+        if (strcmp(kDocBlob + kDocClasses[i].name, name) == 0) return kDocBlob + kDocClasses[i].cat;
+    return nullptr;
+}
+
+std::string word_join(const char *name) {
+    std::string out;
+    char prev = 0;
+    for (const char *p = name; *p; p++) {
+        const char c = *p;
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
+            if (!out.empty() && out[out.size() - 1] != ' ') out.push_back(' ');
+            prev = 0;
+            continue;
+        }
+        if (c >= 'A' && c <= 'Z') {
+            const bool prev_lower = (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9');
+            const bool prev_upper = prev >= 'A' && prev <= 'Z';
+            const bool next_lower = p[1] >= 'a' && p[1] <= 'z';
+            if (!out.empty() && out[out.size() - 1] != ' ' && (prev_lower || (prev_upper && next_lower)))
+                out.push_back(' ');
+            out.push_back((char)(c - 'A' + 'a'));
+        } else {
+            out.push_back(c);
+        }
+        prev = c;
+    }
+    while (!out.empty() && out[out.size() - 1] == ' ') out.pop_back();
+    return out;
+}
+
+const char *category_of_name(const char *name) {
+    if (!name || !*name) return "Other";
+    const char *exact = doc_category_of_name(name);
+    if (exact && *exact) return exact;
+    const std::string j = word_join(name);
+    if (j.find(':') != std::string::npos) {
+        const size_t cut = j.find(':');
+        return category_of_name(j.substr(0, cut).c_str());
+    }
+    static const struct {
+        const char *w;
+        const char *c;
+    } kSuf[] = {
+        {"popup", "UI_Popups"},       {"dialogue", "UI_Popups"},   {"dialog", "UI_Popups"},
+        {"toast", "UI_Popups"},       {"modal", "UI_Popups"},      {"overlay", "UI_Popups"},
+        {"data", "Logic_Data"},       {"config", "Logic_Data"},    {"entry", "Logic_Data"},
+        {"info", "Logic_Data"},       {"def", "Logic_Data"},       {"table", "Logic_Data"},
+        {"command", "Logic_Commands"},{"server", "Logic_Server"},  {"client", "Logic_Client"},
+        {"renderer", "Rendering"},    {"message", "Network_Messages"},
+        {"msg", "Network_Messages"},  {"component", "UI_Components"},
+        {"item", "UI_Components"},    {"field", "UI_Components"},  {"button", "UI_Components"},
+        {"icon", "UI_Components"},    {"tab", "UI_Components"},    {"screen", "UI_Screens"},
+        {"page", "UI_Screens"},       {"hud", "UI_Screens"},       {"scene", "UI_Screens"},
+        {"manager", "Logic_Core"},    {"system", "Logic_Core"},    {"core", "Logic_Core"},
+        {"handler", "Logic_Core"},    {"controller", "Logic_Core"},{"service", "Logic_Core"},
+        {"module", "Logic_Core"},     {"registry", "Logic_Core"},  {"state", "Logic_Core"},
+        {"audio", "Audio"},           {"sound", "Audio"},          {"sdk", "SDK_Integrations"},
+        {"engine", "Engine_Utility"}, {"util", "Engine_Utility"},  {"helper", "Engine_Utility"},
+        {"math", "Engine_Utility"},   {"json", "Engine_Utility"},  {"parser", "Engine_Utility"},
+        {"pool", "Engine_Utility"},   {"cache", "Engine_Utility"}, {"random", "Engine_Utility"},
+    };
+    if (!j.empty()) {
+        const size_t sp = j.rfind(' ');
+        const std::string last = (sp == std::string::npos) ? j : j.substr(sp + 1);
+        for (size_t i = 0; i < sizeof kSuf / sizeof kSuf[0]; i++)
+            if (last == kSuf[i].w) return kSuf[i].c;
+    }
+    static const struct {
+        const char *c;
+        const char *w;
+    } kWords[] = {
+        {"ThirdParty", " fmod absl boost openssl protobuf zlib lua curl "},
+        {"Audio", " audio sound music voice sfx bgm "},
+        {"SDK_Integrations",
+         " sdk firebase facebook adjust appsflyer gamecenter storekit blinder crashlytics analytics "},
+        {"Rendering", " render renderer texture shader sprite camera material particle mesh atlas "
+                      "tween vfx "},
+        {"Network_Messages", " network message packet protocol socket http rpc "},
+        {"Logic_Commands", " command commands "},
+        {"Logic_Server", " server "},
+        {"Logic_Client", " client "},
+        {"Logic_Data", " data config entry def info "},
+        {"UI_Popups", " popup dialog modal toast overlay banner alert "},
+        {"UI_Screens", " screen page hud scene window loading "},
+        {"UI_Components", " button item widget component cell icon tab label slider toggle input "
+                          "menu slot badge checkbox switch progress field "},
+        {"Logic_Core", " core manager system state controller service registry handler module logic "
+                       "process scheduler dispatcher router session "},
+        {"Game", " battle player hero match quest reward shop chest level mission event season "
+                 "trophy profile friend chat clan brawler arena gamemode character unit skill buff "
+                 "team club alliance card "},
+        {"Engine_Utility", " engine util helper math string file random json parser cache array hash "
+                           "alloc log time date sort buffer stream thread task debug tool "},
+    };
+    const std::string padded = " " + j + " ";
+    for (size_t i = 0; i < sizeof kWords / sizeof kWords[0]; i++) {
+        const std::string needle(kWords[i].w);
+        for (size_t p = 0; p + 1 < needle.size();) {
+            const size_t q = needle.find(' ', p + 1);
+            if (q == std::string::npos) break;
+            if (padded.find(needle.substr(p, q - p)) != std::string::npos) return kWords[i].c;
+            p = q;
+        }
+    }
+    return "Other";
+}
+
 struct GlobalHit {
     uint32_t cell;
     uint32_t vt;
@@ -855,19 +974,20 @@ void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slo
     fprintf(f, "documented classes %u | class tables %zu | table slots %zu | globals holding known "
                "objects %zu | functions with a string anchor %u (of %zu scanned)\n\n",
             kDocClassCount, tables.size(), slots.sorted.size(), gh.size(), str_only, fns.size());
-    fprintf(f, "| class | table (vt) | slots | slots named by string | field candidates |\n");
-    fprintf(f, "|-------|-----------|-------|----------------------|------------------|\n");
+    fprintf(f, "| class | folder | table rva | slots | slots named by string | field candidates |\n");
+    fprintf(f, "|-------|--------|-----------|-------|----------------------|------------------|\n");
     for (size_t i = 0; i < tables.size(); i++) {
         const ClassTable &t = tables[i];
-        const char *n = doc_class_name(t.start);
-        std::string lb = (n && strcmp(n, "-") != 0) ? n : ("vt_" + std::to_string(t.start));
+        const char *n = name_of_table(t.start);
+        std::string lb = n ? std::string(n) : hex_label(t.start);
         uint32_t named = 0, flds = 0;
         for (const auto &kv : fns)
             if (kv.second.table == t.start) {
                 if (kv.second.strings) named++;
                 flds += (uint32_t)kv.second.fields.size();
             }
-        fprintf(f, "| %s | `%#x` | %u | %u | %u |\n", lb.c_str(), t.start, t.slots, named, flds);
+        fprintf(f, "| %s | %s | `%#x` | %u | %u | %u |\n", lb.c_str(),
+                category_of_name(lb.c_str()), t.start, t.slots, named, flds);
     }
     fclose(f);
 }
@@ -1707,6 +1827,11 @@ void write_unknown_named(const Image &img, const std::vector<StrEnt> &strs,
     fclose(f);
 }
 
+void safe_name(char *dst, size_t cap, const char *src);
+void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
+                      const std::map<uint32_t, FnAgg> &fns, const std::vector<StrEnt> &strs,
+                      const char *root);
+
 void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTable> &tables,
                    const char *root) {
     mkdir(root, 0755);
@@ -1748,9 +1873,6 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     code_pass(img, L, starts, alt, strs, slots, tabs, fns);
     std::vector<GlobalHit> gh;
     scan_globals(img, L, tables, gh);
-    write_strings(img, strs, fns, root);
-    write_fields(fns, root);
-    write_all_offsets(tables, slots, fns, gh, root);
     data_refs(img, L, tabs);
     expand_calls(fns);
     uint32_t merge_cand = 0;
@@ -1770,6 +1892,9 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     uint32_t seeded = 0;
     uint32_t families = 0;
     cluster_families(img, tables, root, &families);
+    write_strings(img, strs, fns, root);
+    write_fields(fns, root);
+    write_all_offsets(tables, slots, fns, gh, root);
     uint32_t tu = 0;
     tu_cluster(img, tables, &tu);
     std::vector<Sandw> sw;
@@ -1849,6 +1974,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
             }
         }
         deep_cache_save(root, uuid, g_table_class);
+        write_class_tree(img, tables, fns, strs, root);
         write_deep_summary(*g_mi, root, ds);
         RCL_LOGLN("[deep] extra: objc=%u mangled=%u loaders=%u indirect=%u heap_tables=%u order=%u "
                   "fp_carried=%u cache=%u",
@@ -1856,6 +1982,81 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
                   ds.order_named, ds.fp_named, ds.cache_names);
     }
     g_deep_ready = true;
+}
+
+void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
+                      const std::map<uint32_t, FnAgg> &fns, const std::vector<StrEnt> &strs,
+                      const char *root) {
+    char dir[1024];
+    char path[1200];
+    char buf[512];
+    std::map<std::string, uint32_t> per_cat;
+    uint32_t written = 0;
+    for (size_t i = 0; i < tables.size(); i++) {
+        const ClassTable &t = tables[i];
+        const char *nm = name_of_table(t.start);
+        const std::string label = nm ? std::string(nm) : hex_label(t.start);
+        const char *cat = (nm && *nm) ? category_of_name(nm) : "Unknown";
+        char safe[192];
+        safe_name(safe, sizeof safe, label.c_str());
+        if (!*safe) snprintf(safe, sizeof safe, "%s", "vt");
+        snprintf(dir, sizeof dir, "%s/%s", root, cat);
+        mkdir(dir, 0755);
+        snprintf(path, sizeof path, "%s/%s.md", dir, safe);
+
+        FILE *probe = fopen(path, "r");
+        if (probe) {
+            fclose(probe);
+            per_cat[cat]++;
+            continue;
+        }
+        FILE *f = fopen(path, "w");
+        if (!f) continue;
+        fprintf(f, "# %s\n\n**Folder:** %s\n**Class Table:** `%#x`  **Slots:** %u  "
+                   "**Segment:** `%s`\n\n## Methods\n\n"
+                   "| slot | rva | address | name | string this function uses |\n"
+                   "|------|-----|---------|------|---------------------------|\n",
+                label.c_str(), cat, t.start, t.slots, t.seg.c_str());
+        for (uint32_t s = 0; s < t.slots; s++) {
+            uint64_t raw = 0;
+            if (!at(img, img.base + t.start + (uint64_t)s * 8, &raw, sizeof raw)) break;
+            const uint32_t sr = (uint32_t)((raw & 0xFFFFFFFFFULL) - img.base);
+            std::map<uint32_t, FnAgg>::const_iterator fi = fns.find(sr);
+            const char *txt = "-";
+            if (fi != fns.end() && fi->second.first_string) {
+                const StrEnt *e = find_str(strs, fi->second.first_string);
+                if (e && read_str(img, *e, buf, sizeof buf)) txt = buf;
+            }
+            fprintf(f, "| `+0x%03x` | `%#x` | `%#llx` | %s | `%.70s` |\n", s * 8, sr,
+                    (unsigned long long)(img.base + sr), name_for_rva(sr), txt);
+        }
+        std::map<uint32_t, uint32_t> off;
+        for (std::map<uint32_t, FnAgg>::const_iterator it = fns.begin(); it != fns.end(); ++it)
+            if (it->second.table == t.start)
+                for (size_t k = 0; k < it->second.fields.size(); k++) off[it->second.fields[k]]++;
+        fprintf(f, "\n## Field candidates\n\n| offset | hits |\n|--------|------|\n");
+        if (off.empty()) fprintf(f, "| - | - |\n");
+        for (std::map<uint32_t, uint32_t>::const_iterator it = off.begin(); it != off.end(); ++it)
+            fprintf(f, "| `%#x` | %u |\n", it->first, it->second);
+        fclose(f);
+        written++;
+        per_cat[cat]++;
+    }
+
+    snprintf(path, sizeof path, "%s/INDEX.md", root);
+    FILE *ix = fopen(path, "w");
+    if (ix) {
+        fprintf(ix, "# classes and their tables, laid out into folders\n\n");
+        fprintf(ix, "| folder | class files |\n|--------|-------------|\n");
+        for (std::map<std::string, uint32_t>::const_iterator it = per_cat.begin();
+             it != per_cat.end(); ++it)
+            fprintf(ix, "| `%s` | %u |\n", it->first.c_str(), it->second);
+        fprintf(ix, "\nclass tables %zu, files created %u, unclaimed tables live in `Unknown/`\n",
+                tables.size(), written);
+        fclose(ix);
+    }
+    RCL_LOGLN("[deep] folders: %zu, files created %u, tables %zu", per_cat.size(), written,
+              tables.size());
 }
 
 }  // namespace
