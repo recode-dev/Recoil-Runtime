@@ -979,6 +979,7 @@ void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slo
     for (size_t i = 0; i < tables.size(); i++) {
         const ClassTable &t = tables[i];
         const char *n = name_of_table(t.start);
+        const char *nf = (!n || !*n) ? family_of_table(t.start) : nullptr;
         std::string lb = n ? std::string(n) : hex_label(t.start);
         uint32_t named = 0, flds = 0;
         for (const auto &kv : fns)
@@ -987,7 +988,8 @@ void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slo
                 flds += (uint32_t)kv.second.fields.size();
             }
         fprintf(f, "| %s | %s | `%#x` | %u | %u | %u |\n", lb.c_str(),
-                category_of_name(lb.c_str()), t.start, t.slots, named, flds);
+                (n || nf) ? category_of_name(n ? lb.c_str() : nf) : "-", t.start, t.slots, named,
+                flds);
     }
     fclose(f);
 }
@@ -1012,6 +1014,7 @@ struct DeepSummary {
 
 DeepSummary g_deep;
 bool g_deep_ready = false;
+std::set<uint32_t> g_tree_written;
 
 std::map<uint32_t, std::string> g_table_family;
 std::map<uint32_t, const char *> g_table_src;
@@ -2023,6 +2026,7 @@ void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
         FILE *probe = fopen(path, "r");
         if (probe) {
             fclose(probe);
+            g_tree_written.insert(t.start);
             per_cat[cat]++;
             continue;
         }
@@ -2055,6 +2059,7 @@ void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
         for (std::map<uint32_t, uint32_t>::const_iterator it = off.begin(); it != off.end(); ++it)
             fprintf(f, "| `%#x` | %u |\n", it->first, it->second);
         fclose(f);
+        g_tree_written.insert(t.start);
         written++;
         per_cat[cat]++;
     }
@@ -2369,15 +2374,18 @@ void write_class_docs(const Image &img) {
     uint32_t unknown = 0;
     for (const ClassTable &t : ix.tables) {
         if (std::find(claimed.begin(), claimed.end(), t.start) != claimed.end()) continue;
+        if (g_tree_written.count(t.start)) continue;
         snprintf(path, sizeof path, "%s/Unknown/vt_%06x.md", root, t.start);
         FILE *f = fopen(path, "w");
         if (!f) continue;
         std::map<uint32_t, std::string>::const_iterator gu = g_table_class.find(t.start);
         const char *gu_fam = (gu == g_table_class.end()) ? family_of_table(t.start) : nullptr;
-        fprintf(f, "# vt_%06x%s%s%s%s\n\n**Class Table:** `%#x`  **Slots:** %u  **Segment:** `%s`\n\n",
-                t.start, (gu == g_table_class.end() && !gu_fam) ? "" : " - ",
-                (gu == g_table_class.end()) ? "" : gu->second.c_str(), gu_fam ? " - " : "",
-                gu_fam ? gu_fam : "", t.start, t.slots, t.seg.c_str());
+        std::string title = hex_label(t.start);
+        if (gu != g_table_class.end() && !gu->second.empty()) title += " - " + gu->second;
+        if (gu_fam && *gu_fam) title += " - " + std::string(gu_fam);
+        fprintf(f, "# %s\n\n**Class Table:** `%#x`  **Slots:** %u  **Segment:** `%s`\n\n"
+                   "| slot | rva | address | name |\n|------|-----|---------|------|\n",
+                title.c_str(), t.start, t.slots, t.seg.c_str());
         for (uint32_t s = 0; s < t.slots; s++) {
             uint64_t raw = 0;
             if (!img.read || !img.read(img.ctx, img.base + t.start + s * 8, &raw, sizeof(raw))) break;
