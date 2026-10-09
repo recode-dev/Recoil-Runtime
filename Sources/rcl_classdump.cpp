@@ -389,6 +389,21 @@ const char *dump_root() {
     return root;
 }
 
+const char *diag_root() {
+    static char root[512];
+    const char *env = getenv("RCL_REPORTS_DIR");
+    const char *d = getenv("RCL_DOCS_DIR");
+    const char *rd = getenv("RCL_LOG_DIR");
+    const char *home = getenv("HOME");
+    if (env && *env) snprintf(root, sizeof root, "%s", env);
+    else if (d && *d) snprintf(root, sizeof root, "%s_reports", d);
+    else if (rd && *rd) snprintf(root, sizeof root, "%s/RecoilReports", rd);
+    else if (home && *home) snprintf(root, sizeof root, "%s/Documents/RecoilReports", home);
+    else snprintf(root, sizeof root, "%s", "/var/mobile/Documents/RecoilReports");
+    mkdir(root, 0755);
+    return root;
+}
+
 struct LiveArg {
     Image img;
 };
@@ -1895,8 +1910,79 @@ void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
                       const std::map<uint32_t, FnAgg> &fns, const std::vector<StrEnt> &strs,
                       const char *root);
 
+bool name_taken(const std::string &name, uint32_t except_start) {
+    for (std::map<uint32_t, std::string>::const_iterator it = g_table_class.begin();
+         it != g_table_class.end(); ++it)
+        if (it->first != except_start && it->second == name) return true;
+    for (uint32_t i = 0; i < kDocClassCount; i++)
+        if (strcmp(kDocBlob + kDocClasses[i].name, name.c_str()) == 0) return true;
+    return false;
+}
+
+std::string shape_key(const std::vector<ClassTable> &tables, size_t i) {
+    char b[160];
+    const uint32_t prev = i ? tables[i - 1].slots : 0;
+    const uint32_t next = (i + 1 < tables.size()) ? tables[i + 1].slots : 0;
+    snprintf(b, sizeof b, "%s|%u|%u|%u", tables[i].seg.c_str(), prev, tables[i].slots, next);
+    return std::string(b);
+}
+
+uint32_t name_from_shape_cache(const std::vector<ClassTable> &tables, const char *root) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/cache", root);
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/cache/shapes.tsv", root);
+
+    std::map<std::string, std::string> known;
+    std::set<std::string> ambiguous;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            char *tab = strchr(line, '\t');
+            if (!tab) continue;
+            *tab = 0;
+            std::string name(tab + 1);
+            while (!name.empty() && (name[name.size() - 1] == '\n' || name[name.size() - 1] == '\r'))
+                name.erase(name.size() - 1);
+            if (name.empty()) continue;
+            const std::string key(line);
+            std::map<std::string, std::string>::iterator it = known.find(key);
+            if (it == known.end()) known[key] = name;
+            else if (it->second != name) ambiguous.insert(key);
+        }
+        fclose(f);
+    }
+
+    uint32_t named = 0;
+    for (size_t i = 0; i < tables.size(); i++) {
+        if (g_table_class.count(tables[i].start)) continue;
+        const std::string k = shape_key(tables, i);
+        if (ambiguous.count(k)) continue;
+        std::map<std::string, std::string>::iterator it = known.find(k);
+        if (it == known.end() || name_taken(it->second, tables[i].start)) continue;
+        g_table_class[tables[i].start] = it->second;
+        g_table_src[tables[i].start] = "shape cache";
+        named++;
+    }
+
+    f = fopen(path, "w");
+    if (f) {
+        for (size_t i = 0; i < tables.size(); i++) {
+            std::map<uint32_t, std::string>::const_iterator it = g_table_class.find(tables[i].start);
+            const char *nm = (it != g_table_class.end()) ? it->second.c_str()
+                                                         : family_of_table(tables[i].start);
+            if (!nm || !*nm) continue;
+            fprintf(f, "%s\t%s\n", shape_key(tables, i).c_str(), nm);
+        }
+        fclose(f);
+    }
+    return named;
+}
+
 void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTable> &tables,
-                   const char *root) {
+                   const char *dump) {
+    const char *root = diag_root();
     mkdir(root, 0755);
     ensure_insight(img);
     std::vector<uint32_t> starts;
@@ -1963,6 +2049,8 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     uint32_t seeded = 0;
     uint32_t families = 0;
     cluster_families(img, tables, root, &families);
+    const uint32_t shape_named = name_from_shape_cache(tables, root);
+    RCL_LOGLN("[deep] shape cache carried %u names from an earlier run", shape_named);
     write_strings(img, strs, fns, root);
     write_fields(fns, root);
     write_all_offsets(tables, slots, fns, gh, root);
@@ -2045,7 +2133,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
             }
         }
         deep_cache_save(root, uuid, g_table_class);
-        write_class_tree(img, tables, fns, strs, root);
+        write_class_tree(img, tables, fns, strs, dump);
         write_deep_summary(*g_mi, root, ds);
         RCL_LOGLN("[deep] extra: objc=%u mangled=%u loaders=%u indirect=%u heap_tables=%u order=%u "
                   "fp_carried=%u cache=%u",
@@ -2058,11 +2146,15 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
 void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
                       const std::map<uint32_t, FnAgg> &fns, const std::vector<StrEnt> &strs,
                       const char *root) {
+    mkdir(root, 0755);
     char dir[1024];
     char path[1200];
     char buf[512];
     std::map<std::string, uint32_t> per_cat;
     uint32_t written = 0;
+    RCL_LOGLN("[tree] root=%s tables=%zu named=%zu family=%zu first=%#x",
+              root, tables.size(), g_table_class.size(), g_table_family.size(),
+              tables.empty() ? 0 : tables[0].start);
     for (size_t i = 0; i < tables.size(); i++) {
         const ClassTable &t = tables[i];
         const char *nm = name_of_table(t.start);
@@ -2122,7 +2214,7 @@ void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
         per_cat[cat]++;
     }
 
-    snprintf(path, sizeof path, "%s/INDEX.md", root);
+    snprintf(path, sizeof path, "%s/INDEX.md", diag_root());
     FILE *ix = fopen(path, "w");
     if (ix) {
         fprintf(ix, "# classes and their tables, laid out into folders\n\n");
@@ -2457,7 +2549,7 @@ void write_class_docs(const Image &img) {
         unknown++;
     }
 
-    snprintf(path, sizeof path, "%s/_diag.md", root);
+    snprintf(path, sizeof path, "%s/_diag.md", diag_root());
     FILE *dg = fopen(path, "w");
     if (dg) {
         fprintf(dg, "# recoil dump diagnostics\n\n");
@@ -2742,8 +2834,7 @@ void live_docs_note(const Image &img, uint32_t state, int tick) {
         }
     }
 
-    char root[512];
-    snprintf(root, sizeof root, "%s", dump_root());
+    const char *root = diag_root();
     mkdir_p(root);
 
     if ((int)state != g_last_state || (tick % 5) == 0) {
@@ -2756,8 +2847,7 @@ void live_docs_note(const Image &img, uint32_t state, int tick) {
 void live_docs_flush(const Image &img) {
     const char *mode = getenv("RCL_DOCS");
     if (mode && *mode == '0') return;
-    char root[512];
-    snprintf(root, sizeof root, "%s", dump_root());
+    const char *root = diag_root();
     mkdir_p(root);
     write_observed(img, root);
     write_missing(img, root);
