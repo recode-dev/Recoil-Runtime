@@ -572,6 +572,7 @@ std::string hex_label(uint32_t rva) {
 }
 
 const char *name_of_table(uint32_t start);
+const char *family_of_table(uint32_t start);
 const char *category_of_name(const char *name);
 
 const char *doc_category_of_name(const char *name) {
