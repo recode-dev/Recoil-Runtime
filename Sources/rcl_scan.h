@@ -27,6 +27,7 @@ struct Seeds {
 struct Image {
     uint64_t base = 0;
     uint64_t vmsize = 0;
+    uint64_t image_vmsize = 0;
     void *ctx = nullptr;
 
     bool (*read)(void *ctx, uint64_t va, void *dst, size_t n) = nullptr;

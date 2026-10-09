@@ -45,9 +45,26 @@ static uint64_t text_vmsize(const struct mach_header_64 *h) {
     return t;
 }
 
+static uint64_t image_size(const struct mach_header_64 *h) {
+    uint64_t end = 0;
+    const uint8_t *p = (const uint8_t *)h + sizeof(struct mach_header_64);
+    for (uint32_t c = 0; c < h->ncmds; c++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            const uint64_t e = sg->vmaddr + sg->vmsize;
+            if (e > end) end = e;
+        }
+        p += lc->cmdsize;
+    }
+    const uint64_t b = (uint64_t)(uintptr_t)h;
+    return end > b ? end - b : 0;
+}
+
 static bool stamp_image(const struct mach_header_64 *h, uint64_t ts, Image &img, Stamp &st) {
     img.base = (uint64_t)(uintptr_t)h;
     img.vmsize = ts;
+    img.image_vmsize = image_size(h);
     img.ctx = &img;
     img.read = live_read;
     st = text_stamp(img);
@@ -129,8 +146,9 @@ static void run_once(const Image &img, const std::string &why) {
     const Seeds s = Seeds::build69();
     log_image_list();
     RCL_LOGLN("[target image] %s", why.c_str());
-    RCL_LOGLN("[target base] 0x%llx vmsize 0x%llx", (unsigned long long)img.base,
-              (unsigned long long)img.vmsize);
+    RCL_LOGLN("[target base] 0x%llx text_vmsize 0x%llx image_vmsize 0x%llx",
+              (unsigned long long)img.base, (unsigned long long)img.vmsize,
+              (unsigned long long)img.image_vmsize);
     report_run(img, s);
     live_session(img, s);
     log_close();

@@ -13,6 +13,17 @@
 
 namespace rcl {
 
+static const uint64_t kHomeGlobal     = 0x1123e58ULL;
+static const uint64_t kHomeStateOff   = 0x50ULL;
+static const uint64_t kHomeCurrentOff = 0x48ULL;
+static const uint64_t kClientMgrOff   = 0x28ULL;
+static const uint64_t kClientInputOff = 0x58ULL;
+static const uint64_t kMgrArrayOff    = 0x0ULL;
+static const uint64_t kMgrCapOff      = 0x8ULL;
+static const uint64_t kMgrCountOff    = 0xcULL;
+static const uint64_t kAuxGlobalA     = 0x11237c8ULL;
+static const uint64_t kAuxGlobalB     = 0x1154f50ULL;
+
 static bool safe_read(uint64_t va, void *dst, size_t n) {
 #if defined(__APPLE__)
     if (va == 0 || n == 0) return false;
@@ -43,29 +54,28 @@ static bool rd8(uint64_t va, uint8_t &out) {
     return safe_read(va, &out, sizeof out);
 }
 
-static const char *rva_of(const Image &img, uint64_t va) {
-    static char b[40];
-    if (va == 0) snprintf(b, sizeof b, "null");
-    else if (va >= img.base && va < img.base + img.vmsize)
-        snprintf(b, sizeof b, "rva=0x%06x", (unsigned)(va - img.base));
-    else snprintf(b, sizeof b, "0x%llx", (unsigned long long)va);
-    return b;
+static bool in_image(const Image &img, uint64_t v) {
+    uint64_t span = img.image_vmsize ? img.image_vmsize : img.vmsize;
+    if (!span) return false;
+    return v >= img.base && v < img.base + span + 0x400000ULL;
 }
 
-static void dump_vtable(const Image &img, uint64_t vptr, int slots, const char *tag) {
-    if (!vptr) {
-        RCL_LOGLN("[vt %s] vptr null", tag);
-        return;
-    }
-    RCL_LOGLN("[vt %s] vptr=%s", tag, rva_of(img, vptr));
-    for (int i = 0; i < slots; i++) {
-        uint64_t fn = 0;
-        if (!rd64(vptr + (uint64_t)i * 8, fn)) {
-            RCL_LOGLN("     [%2d] ?", i);
-            continue;
-        }
-        RCL_LOGLN("     [%2d] %s", i, rva_of(img, fn));
-    }
+static bool plausible_ptr(const Image &img, uint64_t v) {
+    if (v < 0x100000000ULL || v >= 0x8000000000ULL) return false;
+    if ((v & 0xfULL) != 0) return false;
+    return !in_image(img, v);
+}
+
+static void fmt_ptr(const Image &img, uint64_t va, char *out, size_t n) {
+    if (va == 0) snprintf(out, n, "null");
+    else if (in_image(img, va)) snprintf(out, n, "rva=0x%06x", (unsigned)(va - img.base));
+    else snprintf(out, n, "0x%llx", (unsigned long long)va);
+}
+
+static void fmt_rva(const Image &img, uint64_t va, char *out, size_t n) {
+    if (va == 0) snprintf(out, n, "null");
+    else if (in_image(img, va)) snprintf(out, n, "0x%06x", (unsigned)(va - img.base));
+    else snprintf(out, n, "0x%llx", (unsigned long long)va);
 }
 
 static void dump_words(uint64_t base, int words, const char *tag) {
@@ -76,14 +86,60 @@ static void dump_words(uint64_t base, int words, const char *tag) {
         rd64(base + (uint64_t)(i + 2) * 8, c);
         rd64(base + (uint64_t)(i + 3) * 8, d);
         RCL_LOGLN("   %s+0x%03x  %016llx %016llx %016llx %016llx", tag, i * 8,
-                  (unsigned long long)a, (unsigned long long)b, (unsigned long long)c, (unsigned long long)d);
+                  (unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
+                  (unsigned long long)d);
+    }
+}
+
+static void dump_vtable(const Image &img, uint64_t vptr, int slots, const char *tag) {
+    if (!vptr) {
+        RCL_LOGLN("[vt %s] vptr null", tag);
+        return;
+    }
+    char p[64];
+    fmt_ptr(img, vptr, p, sizeof p);
+    RCL_LOGLN("[vt %s] vptr=%s", tag, p);
+    for (int i = 0; i < slots; i++) {
+        uint64_t fn = 0;
+        char r[64];
+        if (!rd64(vptr + (uint64_t)i * 8, fn)) {
+            RCL_LOGLN("     [%2d] ?", i);
+            continue;
+        }
+        fmt_rva(img, fn, r, sizeof r);
+        RCL_LOGLN("     [%2d] off=0x%03x %s", i, i * 8, r);
+    }
+}
+
+static void dump_getters(const Image &img, uint64_t vptr, int first, int last, const char *tag) {
+    if (!vptr) return;
+    for (int i = first; i <= last; i++) {
+        uint64_t fn = 0;
+        if (!rd64(vptr + (uint64_t)i * 8, fn) || !in_image(img, fn)) continue;
+        uint32_t w = 0, nx = 0;
+        if (!rd32(fn, w)) continue;
+        if (!rd32(fn + 4, nx) || nx != 0xD65F03C0) continue;
+        if (((w >> 5) & 31) != 0 || (w & 31) != 0) continue;
+        const char *kind = nullptr;
+        uint32_t off = 0;
+        uint32_t m = w & 0xFFC00000;
+        if (m == 0xB9400000) { kind = "ldr w0"; off = ((w >> 10) & 0xFFF) * 4; }
+        else if (m == 0xF9400000) { kind = "ldr x0"; off = ((w >> 10) & 0xFFF) * 8; }
+        else if (m == 0x39400000) { kind = "ldrb w0"; off = ((w >> 10) & 0xFFF); }
+        else if (m == 0x79400000) { kind = "ldrh w0"; off = ((w >> 10) & 0xFFF) * 2; }
+        else if (m == 0xBD400000) { kind = "ldr s0"; off = ((w >> 10) & 0xFFF) * 4; }
+        if (!kind) continue;
+        RCL_LOGLN("   %s getter slot=0x%03x fn=0x%06x  %s [x0,#0x%x]", tag, i * 8,
+                  (unsigned)(fn - img.base), kind, off);
     }
 }
 
 static void dump_object(const Image &img, uint64_t o, int idx) {
     uint64_t vt = 0;
+    char p[64];
     rd64(o, vt);
-    RCL_LOGLN("  [%2d] 0x%llx vt=%s", idx, (unsigned long long)o, rva_of(img, vt));
+    fmt_ptr(img, vt, p, sizeof p);
+    RCL_LOGLN("  [%2d] 0x%llx vt=%s", idx, (unsigned long long)o, p);
     for (int i = 0; i + 3 < 12; i += 4) {
         uint64_t a = 0, b = 0, c = 0, d = 0;
         rd64(o + (uint64_t)i * 8, a);
@@ -91,7 +147,8 @@ static void dump_object(const Image &img, uint64_t o, int idx) {
         rd64(o + (uint64_t)(i + 2) * 8, c);
         rd64(o + (uint64_t)(i + 3) * 8, d);
         RCL_LOGLN("       +0x%02x %016llx %016llx %016llx %016llx", i * 8,
-                  (unsigned long long)a, (unsigned long long)b, (unsigned long long)c, (unsigned long long)d);
+                  (unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
+                  (unsigned long long)d);
     }
     uint32_t x = 0, y = 0, z = 0, own = 0, team = 0;
     uint8_t dead = 0;
@@ -101,55 +158,27 @@ static void dump_object(const Image &img, uint64_t o, int idx) {
     rd32(o + 0x3c, own);
     rd32(o + 0x40, team);
     rd8(o + 0xd0, dead);
-    RCL_LOGLN("       dec x=%d y=%d z=%d owner=%d team=%d dead=%u", (int)x, (int)y, (int)z, (int)own,
-              (int)team, (unsigned)dead);
+    RCL_LOGLN("       guess(x@0x30 y@0x34 z@0x38 owner@0x3c team@0x40 dead@0xd0) x=%d y=%d z=%d own=%d team=%d dead=%u",
+              (int)x, (int)y, (int)z, (int)own, (int)team, (unsigned)dead);
 }
 
-void live_dump(const Image &img, const Seeds &s, int snap) {
-    (void)s;
-    uint64_t mode = 0, ga = 0, gb = 0;
-    rd64(img.base + 0x1123e58ULL, mode);
-    rd64(img.base + 0x11237c8ULL, ga);
-    rd64(img.base + 0x1154f50ULL, gb);
-    RCL_LOGLN("");
-    RCL_LOGLN("[live #%d] globals mode=0x%llx a=0x%llx b=0x%llx", snap, (unsigned long long)mode,
-              (unsigned long long)ga, (unsigned long long)gb);
-    if (!mode) {
-        RCL_LOGLN("[live #%d] mode pointer null", snap);
-        return;
-    }
-
-    uint64_t vt = 0;
-    rd64(mode, vt);
-    RCL_LOGLN("[live #%d] mode 0x%llx vptr=%s", snap, (unsigned long long)mode, rva_of(img, vt));
-    dump_words(mode, 96, "mode");
-    dump_vtable(img, vt, 40, "mode");
-
-    static const uint64_t subs[3] = {0x28ULL, 0x58ULL, 0xf8ULL};
-    for (int k = 0; k < 3; k++) {
-        uint64_t sub = 0;
-        rd64(mode + subs[k], sub);
-        RCL_LOGLN("[live #%d] mode+0x%02llx -> 0x%llx", snap, (unsigned long long)subs[k],
-                  (unsigned long long)sub);
-        if (sub) dump_words(sub, 12, "sub");
-    }
-
-    uint64_t mgr = 0;
-    rd64(mode + 0x28ULL, mgr);
-    if (!mgr) {
-        RCL_LOGLN("[live #%d] manager null", snap);
-        return;
-    }
+static void dump_objects(const Image &img, uint64_t mgr, int objcap) {
     uint64_t arr = 0;
-    uint32_t cnt = 0, cap = 0;
-    rd64(mgr, arr);
-    rd32(mgr + 0xc, cnt);
-    rd32(mgr + 0x8, cap);
-    RCL_LOGLN("[live #%d] mgr 0x%llx array=0x%llx count=%u cap=%u", snap, (unsigned long long)mgr,
-              (unsigned long long)arr, cnt, cap);
+    uint32_t n = 0, cap = 0;
+    char p[64];
+    rd64(mgr + kMgrArrayOff, arr);
+    rd32(mgr + kMgrCountOff, n);
+    rd32(mgr + kMgrCapOff, cap);
+    fmt_ptr(img, arr, p, sizeof p);
+    RCL_LOGLN("[mgr] 0x%llx array=%s count=%u cap=%u", (unsigned long long)mgr, p, n, cap);
+    dump_words(mgr, 16, "mgr");
+    if (!arr) return;
 
-    uint32_t lim = cnt > 48u ? 48u : cnt;
-    uint64_t vts[12];
+    uint32_t lim = n;
+    if (lim > (uint32_t)objcap) lim = (uint32_t)objcap;
+    if (lim > 256u) lim = 256u;
+
+    uint64_t vts[8];
     int nvts = 0;
     for (uint32_t i = 0; i < lim; i++) {
         uint64_t o = 0;
@@ -160,39 +189,201 @@ void live_dump(const Image &img, const Seeds &s, int snap) {
         dump_object(img, o, (int)i);
         uint64_t v = 0;
         rd64(o, v);
+        if (!v) continue;
         int seen = 0;
         for (int q = 0; q < nvts; q++)
             if (vts[q] == v) seen = 1;
-        if (!seen && v && nvts < 12) vts[nvts++] = v;
+        if (!seen && nvts < 8) vts[nvts++] = v;
     }
-    for (int q = 0; q < nvts; q++) dump_vtable(img, vts[q], 20, "obj");
-    RCL_LOGLN("[live #%d] distinct object vptrs=%d of %u objects", snap, nvts, lim);
+    for (int q = 0; q < nvts; q++) {
+        dump_vtable(img, vts[q], 24, "obj");
+        dump_getters(img, vts[q], 12, 23, "obj");
+    }
+    RCL_LOGLN("[mgr] distinct object vptrs=%d of %u slots walked", nvts, lim);
+}
+
+static void dump_candidates(const Image &img, uint64_t cur, int words) {
+    RCL_LOGLN("[cand] fields of 0x%llx holding an (array,count) pair", (unsigned long long)cur);
+    for (int i = 0; i + 1 < words; i++) {
+        uint64_t p = 0;
+        rd64(cur + (uint64_t)i * 8, p);
+        if (!plausible_ptr(img, p)) continue;
+        uint64_t arr = 0, first = 0, fvt = 0;
+        uint32_t n = 0, cap = 0;
+        rd64(p + kMgrArrayOff, arr);
+        rd32(p + kMgrCountOff, n);
+        rd32(p + kMgrCapOff, cap);
+        if (!plausible_ptr(img, arr) && !in_image(img, arr)) continue;
+        if (n == 0 || n > 4096u || cap > 65535u) continue;
+        uint64_t vt = 0;
+        rd64(p, vt);
+        rd64(arr, first);
+        rd64(first, fvt);
+        char b1[64], b2[64], b3[64];
+        fmt_ptr(img, vt, b1, sizeof b1);
+        fmt_ptr(img, first, b2, sizeof b2);
+        fmt_ptr(img, fvt, b3, sizeof b3);
+        RCL_LOGLN("   cur+0x%03x -> 0x%llx w0=0x%llx arr=0x%llx n=%u cap=%u first=%s first_vt=%s",
+                  i * 8, (unsigned long long)p, (unsigned long long)vt, (unsigned long long)arr, n,
+                  cap, b2, b3);
+    }
+}
+
+static void dump_client(const Image &img, uint64_t cur, const char *tag, int objcap) {
+    uint64_t vt = 0;
+    char p[64];
+    rd64(cur, vt);
+    fmt_ptr(img, vt, p, sizeof p);
+    RCL_LOGLN("[%s] 0x%llx vptr=%s", tag, (unsigned long long)cur, p);
+    dump_words(cur, 64, tag);
+    dump_vtable(img, vt, 48, tag);
+    dump_getters(img, vt, 0, 47, tag);
+
+    uint64_t mgr = 0, cim = 0;
+    rd64(cur + kClientMgrOff, mgr);
+    rd64(cur + kClientInputOff, cim);
+    char m1[64], m2[64];
+    fmt_ptr(img, mgr, m1, sizeof m1);
+    fmt_ptr(img, cim, m2, sizeof m2);
+    RCL_LOGLN("[%s] +0x28 objectManager=%s   +0x58 clientInputManager=%s", tag, m1, m2);
+
+    if (mgr >= 0x100000000ULL && !in_image(img, mgr))
+        dump_objects(img, mgr, objcap);
+    else if (mgr)
+        RCL_LOGLN("[%s] +0x28 = 0x%llx: not a heap pointer, manager walk skipped", tag,
+                  (unsigned long long)mgr);
+    dump_candidates(img, cur, 64);
+
+    if (cim) {
+        uint64_t cv = 0;
+        rd64(cim, cv);
+        char c1[64];
+        fmt_ptr(img, cv, c1, sizeof c1);
+        RCL_LOGLN("[cim] 0x%llx vptr=%s", (unsigned long long)cim, c1);
+        dump_words(cim, 16, "cim");
+        dump_vtable(img, cv, 12, "cim");
+    }
+}
+
+void live_dump(const Image &img, const Seeds &s, int snap) {
+    (void)s;
+    uint64_t home = 0, ga = 0, gb = 0;
+    rd64(img.base + kHomeGlobal, home);
+    rd64(img.base + kAuxGlobalA, ga);
+    rd64(img.base + kAuxGlobalB, gb);
+
+    uint32_t state = 0;
+    uint64_t cur = 0;
+    if (home) {
+        rd32(home + kHomeStateOff, state);
+        rd64(home + kHomeCurrentOff, cur);
+    }
+
+    RCL_LOGLN("");
+    RCL_LOGLN("[live #%d] home=0x%llx state=%u current=0x%llx auxA=0x%llx auxB=0x%llx", snap,
+              (unsigned long long)home, state, (unsigned long long)cur, (unsigned long long)ga,
+              (unsigned long long)gb);
+    RCL_LOGLN("[chain] home=*(BASE+0x1123e58) state=home+0x50 current=home+0x48 mgr=current+0x28 inputMgr=current+0x58 arr=mgr+0x0 cap=mgr+0x8 count=mgr+0xc");
+    if (!home) {
+        RCL_LOGLN("[live #%d] home singleton null", snap);
+        return;
+    }
+
+    dump_words(home, 24, "home");
+    uint64_t hv = 0;
+    rd64(home, hv);
+    dump_vtable(img, hv, 32, "home");
+
+    for (int i = 3; i < 12; i++) {
+        uint64_t v = 0;
+        char p[64];
+        rd64(home + (uint64_t)i * 8, v);
+        fmt_ptr(img, v, p, sizeof p);
+        RCL_LOGLN("   home+0x%03x = %s", i * 8, p);
+    }
+
+    if (!cur) {
+        RCL_LOGLN("[live #%d] no current client for state %u", snap, state);
+        return;
+    }
+
+    int objcap = 48;
+    const char *e = getenv("RCL_OBJ_MAX");
+    if (e && *e) objcap = atoi(e);
+    if (objcap < 1) objcap = 1;
+    if (objcap > 256) objcap = 256;
+
+    dump_client(img, cur, "cur", objcap);
 }
 
 void live_session(const Image &img, const Seeds &s) {
-    int maxs = 8, ms = 3000;
-    const char *e = getenv("RCL_DUMP_MAX");
-    if (e && *e) maxs = atoi(e);
+    int ticks = 180, ms = 2000, maxsnap = 12, battle_every = 5;
+    const char *e = getenv("RCL_TICKS");
+    if (e && *e) ticks = atoi(e);
     e = getenv("RCL_DUMP_MS");
     if (e && *e) ms = atoi(e);
-    if (maxs < 1) maxs = 1;
-    if (maxs > 64) maxs = 64;
+    e = getenv("RCL_DUMP_MAX");
+    if (e && *e) maxsnap = atoi(e);
+    e = getenv("RCL_BATTLE_EVERY");
+    if (e && *e) battle_every = atoi(e);
+    if (ticks < 1) ticks = 1;
+    if (ticks > 4000) ticks = 4000;
     if (ms < 200) ms = 200;
+    if (ms > 60000) ms = 60000;
+    if (maxsnap < 1) maxsnap = 1;
+    if (maxsnap > 64) maxsnap = 64;
+    if (battle_every < 1) battle_every = 1;
+    if (battle_every > 1000) battle_every = 1000;
 
-    int got = 0, tries = 0;
-    while (got < maxs && tries < 240) {
-        uint64_t mode = 0;
-        rd64(img.base + 0x1123e58ULL, mode);
-        if (mode) {
-            live_dump(img, s, got);
-            got++;
-        } else {
-            RCL_LOGLN("[live] no battle yet (mode null), try %d", tries);
+    RCL_LOGLN("[live] window %d ticks x %d ms, max %d snapshots, battle snapshot every %d ticks",
+              ticks, ms, maxsnap, battle_every);
+
+    uint32_t prev_state = 0xFFFFFFFFu;
+    uint64_t prev_cur = 0, prev_mgr = 0;
+    uint32_t prev_n = 0xFFFFFFFFu;
+    int snaps = 0, since_battle = 1 << 30;
+
+    for (int t = 0; t < ticks && snaps < maxsnap; t++) {
+        uint64_t home = 0, cur = 0, mgr = 0;
+        uint32_t state = 0, n = 0;
+        rd64(img.base + kHomeGlobal, home);
+        if (home) {
+            rd32(home + kHomeStateOff, state);
+            rd64(home + kHomeCurrentOff, cur);
         }
-        tries++;
-        if (got < maxs) usleep((useconds_t)ms * 1000);
+        if (cur) {
+            rd64(cur + kClientMgrOff, mgr);
+            if (mgr) rd32(mgr + kMgrCountOff, n);
+        }
+
+        const bool changed = home && (state != prev_state || cur != prev_cur || mgr != prev_mgr ||
+                                      n != prev_n);
+        const bool battle = mgr != 0 && n != 0;
+        bool want = changed || snaps == 0;
+        if (battle && since_battle >= battle_every) want = true;
+
+        if (home && (changed || t % 10 == 0))
+            RCL_LOGLN("[tick %3d t=%6.1fs] home=0x%llx state=%u cur=0x%llx mgr=0x%llx objects=%u",
+                      t, (t * ms) / 1000.0, (unsigned long long)home, state,
+                      (unsigned long long)cur, (unsigned long long)mgr, n);
+        if (!home && t % 10 == 0)
+            RCL_LOGLN("[tick %3d t=%6.1fs] home singleton null", t, (t * ms) / 1000.0);
+
+        if (want) {
+            live_dump(img, s, snaps);
+            snaps++;
+            since_battle = 0;
+        }
+        since_battle++;
+
+        prev_state = state;
+        prev_cur = cur;
+        prev_mgr = mgr;
+        prev_n = n;
+
+        if (snaps < maxsnap) usleep((useconds_t)ms * 1000);
     }
-    RCL_LOGLN("[live] snapshots captured %d (attempts %d)", got, tries);
+    RCL_LOGLN("[live] snapshots captured %d of max %d", snaps, maxsnap);
 }
 
 }
