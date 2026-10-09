@@ -5,6 +5,8 @@
 #include "rcl_log.h"
 #include "rcl_names.h"
 #include "rcl_live.h"
+#include "rcl_deep.h"
+#include "rcl_macho.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -89,6 +91,34 @@ bool at(const Image &img, uint64_t va, void *dst, size_t n) {
     return img.read && img.read(img.ctx, va, dst, n);
 }
 
+MachInsight g_insight;
+FnStarts g_fnstarts;
+std::vector<SecRange> g_datacode;
+uint64_t g_insight_base = 0;
+bool g_insight_done = false;
+
+const MachInsight *g_mi = nullptr;
+const FnStarts *g_fs = nullptr;
+const std::vector<SecRange> *g_dic = nullptr;
+
+void ensure_insight(const Image &img) {
+    if (g_insight_done && g_insight_base == img.base) return;
+    g_insight_base = img.base;
+    g_insight_done = true;
+    g_insight = MachInsight();
+    g_fnstarts = FnStarts();
+    g_datacode.clear();
+    g_mi = nullptr;
+    g_fs = nullptr;
+    g_dic = nullptr;
+    if (!macho_insight(img, g_insight)) return;
+    fn_starts_build(img, g_insight, g_fnstarts);
+    g_datacode = read_data_in_code(img, g_insight);
+    g_mi = &g_insight;
+    g_fs = &g_fnstarts;
+    g_dic = &g_datacode;
+}
+
 int segments(const Image &img, Range *out, int cap) {
     Mh mh;
     int n = 0;
@@ -145,24 +175,30 @@ bool after_boundary(const Image &img, uint32_t rva) {
 
 bool slot_at(const Image &img, uint64_t raw, uint64_t tlo, uint64_t thi, uint32_t *rva,
              ScanStats *st) {
-    uint64_t va = raw & 0xFFFFFFFFFULL;
+    ensure_insight(img);
+    uint64_t va = g_mi ? macho_slot_value(img, *g_mi, raw, nullptr) : 0;
+    if (!va) va = raw & 0xFFFFFFFFFULL;
     uint32_t w = 0;
     if (va < tlo || va >= thi) return false;
     if (st) st->ptr_ok++;
     if (!at(img, va, &w, sizeof(w))) return false;
-    if (!entry(w) && !after_boundary(img, (uint32_t)(va - img.base))) {
+    const uint32_t r = (uint32_t)(va - img.base);
+    bool ok = entry(w) || after_boundary(img, r);
+    if (!ok && g_fs) ok = g_fs->is_start(r);
+    if (ok && g_dic && in_ranges(*g_dic, va)) ok = false;
+    if (!ok) {
         if (st) {
             st->entry_rej++;
             if (!st->sample_reason) {
                 st->sample_reason = 1;
                 st->sample_raw = (uint32_t)(raw & 0xFFFFFFFF);
-                st->sample_rva = (uint32_t)(va - img.base);
+                st->sample_rva = r;
             }
         }
         return false;
     }
     if (st) st->entry_ok++;
-    if (rva) *rva = (uint32_t)(va - img.base);
+    if (rva) *rva = r;
     return true;
 }
 
@@ -855,6 +891,7 @@ struct DeepSummary {
 };
 
 DeepSummary g_deep;
+bool g_deep_ready = false;
 
 std::map<uint32_t, std::string> g_table_family;
 std::map<uint32_t, const char *> g_table_src;
@@ -1673,7 +1710,10 @@ void write_unknown_named(const Image &img, const std::vector<StrEnt> &strs,
 void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTable> &tables,
                    const char *root) {
     mkdir(root, 0755);
-    const std::vector<uint32_t> starts = build_starts(img, L);
+    ensure_insight(img);
+    std::vector<uint32_t> starts;
+    if (g_fs && g_fs->v.size() >= 16) starts = g_fs->v;
+    else starts = build_starts(img, L);
     std::vector<uint32_t> lcs;
     const bool lcs_ok = lc_function_starts(img, L, lcs);
     std::vector<uint32_t> brs;
@@ -1682,8 +1722,13 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     alt.insert(alt.end(), brs.begin(), brs.end());
     std::sort(alt.begin(), alt.end());
     alt.erase(std::unique(alt.begin(), alt.end()), alt.end());
-    RCL_LOGLN("[deep] starts heuristic=%zu extra=%zu (lc_function_starts=%zu bl_targets=%zu)",
-              starts.size(), alt.size(), lcs_ok ? lcs.size() : 0, brs.size());
+    RCL_LOGLN("[deep] starts=%zu source=%s rejected=%u extra=%zu (lc_function_starts=%zu "
+              "bl_targets=%zu)",
+              starts.size(),
+              !g_fs ? "none"
+                    : g_fs->from_function_starts ? "LC_FUNCTION_STARTS"
+                                                 : g_fs->from_unwind ? "__unwind_info" : "boundary scan",
+              g_fs ? g_fs->rejected : 0, alt.size(), lcs_ok ? lcs.size() : 0, brs.size());
     const std::vector<StrEnt> strs = build_strings(img, L);
     SlotMap slots;
     std::vector<uint32_t> tabs;
@@ -1758,8 +1803,59 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     for (size_t i = 0; i < sw.size(); i++) g_deep.sandwiched += (uint32_t)sw[i].vts.size();
     RCL_LOGLN("[deep] starts=%zu strings=%zu slots=%zu str_fns=%u globals=%zu tables=%zu "
               "named=%zu method_index=%u seeded=%u families=%u registry=%zu sandwiched=%u",
-              starts.size(), strs.size(), slots.sorted.size(), str_fns, gh.size(), tables.size(),
-              g_table_class.size(), method_named, seeded, families, reg.size(), g_deep.sandwiched);
+               starts.size(), strs.size(), slots.sorted.size(), str_fns, gh.size(), tables.size(),
+               g_table_class.size(), method_named, seeded, families, reg.size(), g_deep.sandwiched);
+
+    if (g_mi && g_fs) {
+        DeepStats ds;
+        ds.fstarts_source = g_fs->from_function_starts ? 1 : (g_fs->from_unwind ? 2 : 3);
+        ds.fstarts = (uint32_t)g_fs->v.size();
+        ds.fstarts_rejected = g_fs->rejected;
+        ds.data_in_code = (uint32_t)g_datacode.size();
+        const char *uuid = g_mi->uuid;
+        deep_macho_report(img, *g_mi, *g_fs, g_datacode, root, ds);
+        deep_objc(img, *g_mi, root, ds);
+        deep_mangled(img, *g_mi, root, ds);
+        deep_fieldmap(img, *g_mi, *g_fs, root, ds);
+        deep_logic(root, ds);
+        deep_heap(img, *g_mi, *g_fs, root, ds);
+        std::vector<ClassTable> extra;
+        deep_indirect(img, *g_mi, *g_fs, extra, ds);
+        std::map<uint32_t, std::string> carried;
+        deep_cache_load(root, uuid, carried, ds);
+        std::map<uint32_t, std::string> order_out;
+        deep_order(img, *g_mi, tables, g_table_class, root, order_out, ds);
+        deep_fingerprints(img, *g_mi, *g_fs, tables, g_table_class, root, carried, ds);
+        CandMap cand;
+        for (std::map<uint32_t, std::string>::const_iterator it = order_out.begin();
+             it != order_out.end(); ++it)
+            if (!g_table_class.count(it->first)) cand[it->first] = std::make_pair(it->second, "order");
+        for (std::map<uint32_t, std::string>::const_iterator it = carried.begin();
+             it != carried.end(); ++it)
+            if (!g_table_class.count(it->first) && !cand.count(it->first))
+                cand[it->first] = std::make_pair(it->second, "fingerprint");
+        commit_names(cand);
+        if (!extra.empty()) {
+            char p[1024];
+            snprintf(p, sizeof p, "%s/_indirect.md", root);
+            FILE *f = fopen(p, "w");
+            if (f) {
+                fprintf(f, "# tables reached only through an indexed or offset load of a table base\n\n");
+                fprintf(f, "| table rva | slots | segment |\n|-----------|-------|---------|\n");
+                for (size_t i = 0; i < extra.size(); i++)
+                    fprintf(f, "| `%#x` | %u | %s |\n", extra[i].start, extra[i].slots,
+                            extra[i].seg.c_str());
+                fclose(f);
+            }
+        }
+        deep_cache_save(root, uuid, g_table_class);
+        write_deep_summary(*g_mi, root, ds);
+        RCL_LOGLN("[deep] extra: objc=%u mangled=%u loaders=%u indirect=%u heap_tables=%u order=%u "
+                  "fp_carried=%u cache=%u",
+                  ds.objc_classes, ds.mangled_found, ds.loaders, ds.indirect_added, ds.heap_tables,
+                  ds.order_named, ds.fp_named, ds.cache_names);
+    }
+    g_deep_ready = true;
 }
 
 }  // namespace
@@ -1792,7 +1888,8 @@ void dump_class_tree(const Image &img) {
 
     if (!full) {
         for (const ClassTable &c : t)
-            RCL_LOGLN("  vt=0x%06x slots=%3u named=%3u seg=%s", c.start, c.slots, c.named, c.seg);
+            RCL_LOGLN("  vt=0x%06x slots=%3u named=%3u seg=%s", c.start, c.slots, c.named,
+                      c.seg.c_str());
         return;
     }
 
@@ -1814,7 +1911,7 @@ void dump_class_tree(const Image &img) {
             votes++;
         }
         RCL_LOGLN("[class %3u] vt=0x%06x slots=%3u named=%3u votes=%3u seg=%s %s",
-                  index++, c.start, c.slots, c.named, votes, c.seg, label);
+                  index++, c.start, c.slots, c.named, votes, c.seg.c_str(), label);
         for (uint32_t s = 0; s < c.slots; s++) {
             uint64_t raw = 0;
             uint32_t sr = 0;
@@ -2034,7 +2131,7 @@ void write_class_docs(const Image &img) {
         if (t) {
             fprintf(f, "\n## Class Table\n\n**Table:** `%#x`  **Slots:** %u  "
                        "**Segment:** `%s`\n\n| slot | rva | address | method |\n"
-                       "|------|-----|---------|--------|\n", t->start, t->slots, t->seg);
+                       "|------|-----|---------|--------|\n", t->start, t->slots, t->seg.c_str());
             for (uint32_t s = 0; s < t->slots; s++) {
                 uint64_t raw = 0;
                 uint32_t sr = 0;
@@ -2063,7 +2160,7 @@ void write_class_docs(const Image &img) {
                    "No documented class claims this table.\n\n| slot | rva | address | method |\n"
                    "|------|-----|---------|--------|\n", t.start,
                 (gu == g_table_class.end()) ? "" : " - ", (gu == g_table_class.end()) ? "" : gu->second.c_str(),
-                t.start, t.slots, t.seg);
+                t.start, t.slots, t.seg.c_str());
         for (uint32_t s = 0; s < t.slots; s++) {
             uint64_t raw = 0;
             if (!img.read || !img.read(img.ctx, img.base + t.start + s * 8, &raw, sizeof(raw))) break;
@@ -2279,9 +2376,12 @@ void write_missing(const Image &img, const char *root) {
         if (strcmp(ref_name(c.start), "-") == 0) missing_tables++;
     }
     fprintf(f, "# what is missing from the class reference\n\n");
-    fprintf(f, "- deep scan: starts %u strings %u anchored functions %u globals %u tables named "
-               "from strings %u of %u\n", g_deep.starts, g_deep.strings, g_deep.anchored,
-            g_deep.globals, g_deep.named, g_deep.tables);
+    if (!g_deep_ready)
+        fprintf(f, "- deep scan: not run yet in this session\n");
+    else
+        fprintf(f, "- deep scan: starts %u strings %u anchored functions %u globals %u tables named "
+                   "from strings %u of %u\n", g_deep.starts, g_deep.strings, g_deep.anchored,
+                g_deep.globals, g_deep.named, g_deep.tables);
     uint32_t by_string = 0;
     for (std::map<uint32_t, std::string>::const_iterator it = g_table_class.begin();
          it != g_table_class.end(); ++it)

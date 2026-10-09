@@ -10,7 +10,7 @@ struct ClassTable {
     uint32_t start = 0;
     uint32_t slots = 0;
     uint32_t named = 0;
-    const char *seg = "";
+    std::string seg;
     const char *name = "";
 };
 
