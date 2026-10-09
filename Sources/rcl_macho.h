@@ -17,6 +17,11 @@ const uint32_t kLcBuildVersion = 0x32u;
 const uint32_t kLcDyldExportsTrie = 0x80000033u;
 const uint32_t kLcDyldChainedFixups = 0x80000034u;
 
+const uint32_t kUnwindPageRegular = 2u;
+const uint32_t kUnwindPageCompressed = 3u;
+const uint32_t kUnwindVersion = 1u;
+const uint32_t kUnwindOffsetMask = 0x00FFFFFFu;
+
 const uint16_t kPtrArm64e = 1;
 const uint16_t kPtr64 = 2;
 const uint16_t kPtr32 = 3;

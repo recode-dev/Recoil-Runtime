@@ -429,9 +429,9 @@ std::vector<uint32_t> read_unwind_starts(const Image &img, const MachInsight &mi
 
     uint32_t version = 0, index_count = 0, index_off = 0;
     if (!rd32(img, lo, version)) return out;
-    if ((version >> 24) != 1) return out;
-    if (!rd32(img, lo + 20, index_count)) return out;
-    if (!rd32(img, lo + 24, index_off)) return out;
+    if (version != kUnwindVersion) return out;
+    if (!rd32(img, lo + 24, index_count)) return out;
+    if (!rd32(img, lo + 20, index_off)) return out;
     if (!index_count || index_count > 65536) return out;
     if (!index_off || lo + index_off >= hi) return out;
 
@@ -442,32 +442,19 @@ std::vector<uint32_t> read_unwind_starts(const Image &img, const MachInsight &mi
         if (!rd32(img, ient, func_off)) break;
         if (!rd32(img, ient + 4, page_off)) break;
         if (!page_off) continue;
-        uint64_t page_base = lo + page_off;
-        if (page_base + 2 > hi) continue;
+        uint64_t page = lo + page_off;
+        if (page + 8 > hi) continue;
 
-        uint16_t first = 0;
-        if (!rd16(img, page_base, first)) continue;
-
-        if (first & 1u) {
-            total++;
-            uint64_t va = mi.text_vmaddr + mi.slide + (uint64_t)func_off;
-            if (va >= mi.text_lo && va < mi.text_hi) {
-                out.push_back((uint32_t)(va - img.base));
-                accepted++;
-            }
-            continue;
-        }
-
-        uint64_t sh = page_base + (uint64_t)first;
         uint32_t kind = 0;
         uint16_t entry_page_off = 0, entry_count = 0;
-        if (!rd32(img, sh, kind)) continue;
-        if (!rd16(img, sh + 4, entry_page_off)) continue;
-        if (!rd16(img, sh + 6, entry_count)) continue;
+        if (!rd32(img, page, kind)) continue;
+        if (!rd16(img, page + 4, entry_page_off)) continue;
+        if (!rd16(img, page + 6, entry_count)) continue;
         if (!entry_count || entry_count > 8192) continue;
 
-        uint64_t entries = sh + (uint64_t)entry_page_off;
-        if (kind == 2) {
+        uint64_t entries = page + (uint64_t)entry_page_off;
+        if (entries >= hi) continue;
+        if (kind == kUnwindPageRegular) {
             for (uint32_t e = 0; e < entry_count; e++) {
                 uint32_t foff = 0;
                 if (!rd32(img, entries + (uint64_t)e * 8, foff)) break;
@@ -478,16 +465,13 @@ std::vector<uint32_t> read_unwind_starts(const Image &img, const MachInsight &mi
                     accepted++;
                 }
             }
-        } else if (kind == 3) {
-            Cursor cur{&img, entries, (uint64_t)entry_count * 4u + 64u, false};
-            uint64_t addr = mi.text_vmaddr + (uint64_t)func_off;
+        } else if (kind == kUnwindPageCompressed) {
+            const uint64_t base = mi.text_vmaddr + mi.slide + (uint64_t)func_off;
             for (uint32_t e = 0; e < entry_count; e++) {
-                uint64_t delta = 0, enc = 0;
-                if (!uleb(cur, delta)) break;
-                if (!uleb(cur, enc)) break;
-                if (e) addr += delta;
+                uint32_t packed = 0;
+                if (!rd32(img, entries + (uint64_t)e * 4, packed)) break;
                 total++;
-                uint64_t va = addr + mi.slide;
+                uint64_t va = base + (uint64_t)(packed & kUnwindOffsetMask);
                 if (va >= mi.text_lo && va < mi.text_hi) {
                     out.push_back((uint32_t)(va - img.base));
                     accepted++;
