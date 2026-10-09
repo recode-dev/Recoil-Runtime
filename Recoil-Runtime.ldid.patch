@@ -1,0 +1,18 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 11e8882..0df4c66 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -16,7 +16,13 @@ jobs:
+         run: |
+           export THEOS="$RUNNER_TEMP/theos"
+           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
++          mkdir -p "$THEOS/bin"
++          curl -fsSL -o "$THEOS/bin/ldid" \
++            https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64
++          chmod +x "$THEOS/bin/ldid"
++          "$THEOS/bin/ldid" -v || true
+           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
++          echo "$THEOS/bin" >> "$GITHUB_PATH"
+ 
+       - name: Build
+         run: make -j4
