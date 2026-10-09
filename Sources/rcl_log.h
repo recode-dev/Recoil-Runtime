@@ -7,6 +7,7 @@ namespace rcl {
 
 void log_open(const char *dir);
 bool log_is_open();
+const char *log_dir();
 void log_close();
 void log_printf(const char *fmt, ...);
 

@@ -1,0 +1,214 @@
+diff --git a/Sources/rcl_classdump.cpp b/Sources/rcl_classdump.cpp
+index 4add1ac..32a53bd 100644
+--- a/Sources/rcl_classdump.cpp
++++ b/Sources/rcl_classdump.cpp
+@@ -2,8 +2,8 @@
+ #include "rcl_names.h"
+ #include "rcl_log.h"
+ 
+-#include <stdlib.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
+ 
+@@ -41,7 +41,7 @@ struct SegCmd {
+     uint32_t flags;
+ };
+ 
+-struct SegRange {
++struct Range {
+     char name[17];
+     uint64_t start;
+     uint64_t end;
+@@ -55,20 +55,20 @@ bool at(const Image &img, uint64_t va, void *dst, size_t n) {
+     return img.read && img.read(img.ctx, va, dst, n);
+ }
+ 
+-int segments(const Image &img, SegRange *out, int cap) {
++int segments(const Image &img, Range *out, int cap) {
+     Mh mh;
+     int n = 0;
+-    if (!at(img, img.base, &mh, sizeof(mh))) return 0;
+-    if (mh.magic != 0xFEEDFACFu) return 0;
++    if (!at(img, img.base, &mh, sizeof(mh))) return -1;
++    if (mh.magic != 0xFEEDFACFu) return -1;
+     uint64_t p = img.base + sizeof(Mh);
+     for (uint32_t c = 0; c < mh.ncmds && n < cap; c++) {
+         Lc lc;
+         if (!at(img, p, &lc, sizeof(lc))) break;
+-        if (lc.cmdsize < sizeof(Lc)) break;
++        if (lc.cmdsize < sizeof(Lc) || lc.cmdsize > 0x10000) break;
+         if (lc.cmd == kLcSegment64) {
+             SegCmd sg;
+             if (at(img, p, &sg, sizeof(sg))) {
+-                for (int i = 0; i < 16; i++) out[n].name[i] = sg.segname[i];
++                memcpy(out[n].name, sg.segname, 16);
+                 out[n].name[16] = 0;
+                 out[n].start = sg.vmaddr;
+                 out[n].end = sg.vmaddr + sg.vmsize;
+@@ -102,45 +102,71 @@ bool slot_at(const Image &img, uint64_t raw, uint64_t tlo, uint64_t thi, uint32_
+ const char *class_of(const char *name) {
+     static char buf[96];
+     const char *p = strstr(name, "::");
+-    if (!p) return name;
+-    size_t n = (size_t)(p - name);
++    size_t n = p ? (size_t)(p - name) : strlen(name);
+     if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+     memcpy(buf, name, n);
+     buf[n] = 0;
+     return buf;
+ }
+ 
+-}  // namespace
++struct Layout {
++    uint64_t code_lo = 0;
++    uint64_t code_hi = 0;
++    Range data[64];
++    int data_n = 0;
++    int hdr = 0;
++    int nsegs = 0;
++};
+ 
+-std::vector<ClassTable> scan_class_tables(const Image &img) {
+-    std::vector<ClassTable> out;
+-    SegRange segs[64];
+-    const int ns = segments(img, segs, 64);
+-    uint64_t tlo = 0, thi = 0;
+-    for (int i = 0; i < ns; i++)
++void layout(const Image &img, Layout &L) {
++    Range segs[64];
++    L.nsegs = segments(img, segs, 64);
++    L.hdr = L.nsegs > 0;
++    for (int i = 0; i < L.nsegs; i++) {
+         if (strncmp(segs[i].name, "__TEXT", 16) == 0) {
+-            tlo = segs[i].start;
+-            thi = segs[i].end;
++            L.code_lo = segs[i].start;
++            L.code_hi = segs[i].end;
++            continue;
+         }
+-    if (!tlo) return out;
++        if (strncmp(segs[i].name, "__LINKEDIT", 16) == 0) continue;
++        if (strncmp(segs[i].name, "__PAGEZERO", 16) == 0) continue;
++        if (L.data_n < 64) L.data[L.data_n++] = segs[i];
++    }
++    if (L.data_n == 0) {
++        const uint64_t end = img.base + (img.image_vmsize ? img.image_vmsize : 0x1200000);
++        Range r;
++        snprintf(r.name, sizeof(r.name), "%s", "image");
++        r.start = L.code_hi ? L.code_hi : img.base + 0x4000;
++        r.end = end;
++        L.data[L.data_n++] = r;
++    }
++    if (!L.code_lo) {
++        L.code_lo = img.base;
++        L.code_hi = img.base + (img.vmsize ? img.vmsize : 0xf74000);
++    }
++}
+ 
+-    for (int i = 0; i < ns; i++) {
+-        if (strncmp(segs[i].name, "__DATA_CONST", 16) != 0 && strncmp(segs[i].name, "__DATA", 16) != 0)
+-            continue;
+-        uint64_t va = segs[i].start;
+-        while (va + 8 <= segs[i].end) {
++}  // namespace
++
++std::vector<ClassTable> scan_class_tables(const Image &img) {
++    std::vector<ClassTable> out;
++    Layout L;
++    layout(img, L);
++    for (int i = 0; i < L.data_n; i++) {
++        uint64_t va = L.data[i].start;
++        while (va + 8 <= L.data[i].end) {
+             uint64_t raw = 0;
+             if (!at(img, va, &raw, sizeof(raw))) break;
+-            if (!slot_at(img, raw, tlo, thi, nullptr)) {
++            if (!slot_at(img, raw, L.code_lo, L.code_hi, nullptr)) {
+                 va += 8;
+                 continue;
+             }
+             uint32_t n = 0;
+             uint64_t p = va;
+-            while (p + 8 <= segs[i].end && n < kRunMax) {
++            while (p + 8 <= L.data[i].end && n < kRunMax) {
+                 uint64_t r2 = 0;
+                 if (!at(img, p, &r2, sizeof(r2))) break;
+-                if (!slot_at(img, r2, tlo, thi, nullptr)) break;
++                if (!slot_at(img, r2, L.code_lo, L.code_hi, nullptr)) break;
+                 n++;
+                 p += 8;
+             }
+@@ -148,14 +174,13 @@ std::vector<ClassTable> scan_class_tables(const Image &img) {
+                 ClassTable t;
+                 t.start = (uint32_t)(va - img.base);
+                 t.slots = n;
+-                t.seg = segs[i].name;
++                t.seg = L.data[i].name;
+                 for (uint32_t s = 0; s < n; s++) {
+                     uint64_t r3 = 0;
+                     uint32_t sr = 0;
+                     if (!at(img, img.base + t.start + s * 8, &r3, sizeof(r3))) break;
+-                    if (!slot_at(img, r3, tlo, thi, &sr)) continue;
+-                    const char *nm = name_for_rva(sr);
+-                    if (nm[0] != '-') t.named++;
++                    if (!slot_at(img, r3, L.code_lo, L.code_hi, &sr)) continue;
++                    if (name_for_rva(sr)[0] != '-') t.named++;
+                 }
+                 out.push_back(t);
+             }
+@@ -170,9 +195,19 @@ std::vector<ClassTable> scan_class_tables(const Image &img) {
+ void dump_class_tree(const Image &img) {
+     const char *mode = getenv("RCL_CLASSES");
+     if (mode && *mode == '0') return;
++
++    Layout L;
++    layout(img, L);
++    RCL_LOGLN("[classes] hdr=%s nsegs=%d code=%#llx..%#llx data_segs=%d image=%#llx+%#llx",
++              L.hdr ? "ok" : "FAIL", L.nsegs, (unsigned long long)L.code_lo,
++              (unsigned long long)L.code_hi, L.data_n, (unsigned long long)img.base,
++              (unsigned long long)img.image_vmsize);
++    for (int i = 0; i < L.data_n && i < 8; i++)
++        RCL_LOGLN("   seg %-16s %#llx..%#llx", L.data[i].name,
++                  (unsigned long long)L.data[i].start, (unsigned long long)L.data[i].end);
++
+     const std::vector<ClassTable> t = scan_class_tables(img);
+     const bool full = !mode || strcmp(mode, "summary") != 0;
+-
+     uint64_t slots = 0, named = 0;
+     for (const ClassTable &c : t) {
+         slots += c.slots;
+@@ -186,15 +221,6 @@ void dump_class_tree(const Image &img) {
+         return;
+     }
+ 
+-    SegRange segs[64];
+-    const int ns = segments(img, segs, 64);
+-    uint64_t tlo = 0, thi = 0;
+-    for (int i = 0; i < ns; i++)
+-        if (strncmp(segs[i].name, "__TEXT", 16) == 0) {
+-            tlo = segs[i].start;
+-            thi = segs[i].end;
+-        }
+-
+     uint32_t index = 0;
+     for (const ClassTable &c : t) {
+         char label[96];
+@@ -205,7 +231,7 @@ void dump_class_tree(const Image &img) {
+             uint64_t raw = 0;
+             uint32_t sr = 0;
+             if (!at(img, img.base + c.start + s * 8, &raw, sizeof(raw))) break;
+-            if (!slot_at(img, raw, tlo, thi, &sr)) continue;
++            if (!slot_at(img, raw, L.code_lo, L.code_hi, &sr)) continue;
+             const char *nm = name_for_rva(sr);
+             if (nm[0] == '-') continue;
+             if (label[0] == '-') snprintf(label, sizeof(label), "%s", class_of(nm));
+@@ -218,7 +244,7 @@ void dump_class_tree(const Image &img) {
+             uint64_t raw = 0;
+             uint32_t sr = 0;
+             if (!at(img, img.base + c.start + s * 8, &raw, sizeof(raw))) break;
+-            if (!slot_at(img, raw, tlo, thi, &sr)) {
++            if (!slot_at(img, raw, L.code_lo, L.code_hi, &sr)) {
+                 RCL_LOGLN("    +0x%03x  ----------  -", s * 8);
+                 continue;
+             }

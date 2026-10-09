@@ -1,6 +1,7 @@
 #include "rcl_report.h"
 #include "rcl_log.h"
 #include "rcl_classdump.h"
+#include "rcl_docgen.h"
 #include <stdlib.h>
 #include <map>
 #include <set>
@@ -105,6 +106,7 @@ void report_run(const Image &img, const Seeds &s) {
         RCL_LOGLN("");
     }
     dump_class_tree(img);
+    write_class_docs(img);
     RCL_LOGLN("");
     RCL_LOGLN("== end ==");
 }

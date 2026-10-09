@@ -10,6 +10,7 @@ namespace rcl {
 
 static int g_fd = -1;
 static char g_path[512];
+static char g_dir[512];
 
 void log_open(const char *dir) {
     if (g_fd >= 0) return;
@@ -19,10 +20,13 @@ void log_open(const char *dir) {
     localtime_r(&t, &tmv);
     snprintf(g_path, sizeof g_path, "%s/recoil-runtime-%04d%02d%02d-%02d%02d%02d.log", d,
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    snprintf(g_dir, sizeof g_dir, "%s", d);
     g_fd = open(g_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
 }
 
 bool log_is_open() { return g_fd >= 0; }
+
+const char *log_dir() { return g_dir; }
 
 void log_close() {
     if (g_fd >= 0) { close(g_fd); g_fd = -1; }
