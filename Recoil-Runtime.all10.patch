@@ -1,0 +1,1117 @@
+diff --git a/Sources/rcl_classdump.cpp b/Sources/rcl_classdump.cpp
+index b396a6c..7fc7e5f 100644
+--- a/Sources/rcl_classdump.cpp
++++ b/Sources/rcl_classdump.cpp
+@@ -4,6 +4,7 @@
+ #include "rcl_livedocs.h"
+ #include "rcl_log.h"
+ #include "rcl_names.h"
++#include "rcl_tablenames.h"
+ #include <algorithm>
+ #include <map>
+ #include <pthread.h>
+@@ -59,9 +60,16 @@ struct Range {
+ };
+ 
+ const uint32_t kLcSegment64 = 0x19;
++const uint32_t kLcFunctionStarts = 0x26;
+ const uint32_t kRunMin = 3;
+ const uint32_t kLooseRunMin = 4;
+ const uint32_t kRunMax = 512;
++const uint32_t kStrMax = 512;
++const uint32_t kStrMin = 4;
++const uint32_t kFnStrMax = 8;
++const uint64_t kBlockGap = 0x400;
++const uint32_t kBlockMinSeeds = 4;
++const uint32_t kClusterSharedMin = 3;
+ 
+ extern "C" unsigned int mach_task_self_;
+ extern "C" int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
+@@ -403,37 +411,34 @@ uint32_t fn_of(const std::vector<uint32_t> &starts, uint32_t rva, bool *exact) {
+     return starts[lo - 1];
+ }
+ 
+-bool printable(uint32_t w) {
+-    for (int i = 0; i < 4; i++) {
+-        uint8_t c = (uint8_t)(w >> (i * 8));
+-        if (c < 32 || c > 126) return false;
++bool byte_text(uint8_t c) { return c >= 32 && c <= 126; }
++
++uint32_t text_len(const Image &img, uint64_t va, uint64_t hi, uint32_t cap) {
++    uint32_t n = 0;
++    while (va + n < hi && n < cap) {
++        uint8_t c = 0;
++        if (!at(img, va + n, &c, 1)) break;
++        if (!byte_text(c)) break;
++        n++;
+     }
+-    return true;
++    return n;
+ }
+ 
+ std::vector<StrEnt> build_strings(const Image &img, const Layout &L) {
+     std::vector<StrEnt> out;
+     const uint64_t lo = L.code_lo;
+     const uint64_t hi = L.code_hi;
+-    for (uint64_t va = lo; va + 8 <= hi; ) {
+-        uint32_t w = 0;
+-        if (!at(img, va, &w, 4)) break;
+-        if (!printable(w)) {
+-            va += 4;
++    for (uint64_t va = lo; va + 1 <= hi; ) {
++        uint8_t c = 0;
++        if (!at(img, va, &c, 1)) break;
++        if (!byte_text(c)) {
++            va += 1;
+             continue;
+         }
+-        uint64_t p = va;
+-        uint32_t len = 0;
+-        while (p + 4 <= hi && len < 512) {
+-            uint32_t x = 0;
+-            if (!at(img, p, &x, 4)) break;
+-            if (!printable(x)) break;
+-            len += 4;
+-            p += 4;
+-        }
+-        if (len >= 8 && !(len & 3)) out.push_back({(uint32_t)(va - img.base), len});
+-        if (out.size() > 200000) break;
+-        va = p + 4;
++        uint32_t len = text_len(img, va, hi, kStrMax);
++        if (len >= kStrMin) out.push_back({(uint32_t)(va - img.base), len});
++        if (out.size() > 400000) break;
++        va += len + 1;
+     }
+     std::sort(out.begin(), out.end(), [](const StrEnt &a, const StrEnt &b) { return a.va < b.va; });
+     return out;
+@@ -633,6 +638,7 @@ struct FnAgg {
+     uint32_t strings = 0;
+     uint32_t first_string = 0;
+     uint32_t table = 0;
++    std::vector<uint32_t> str_list;
+     std::vector<uint32_t> fields;
+ };
+ 
+@@ -642,9 +648,16 @@ uint32_t adrp_imm(uint32_t w) {
+     return (uint32_t)(imm << 12);
+ }
+ 
++uint32_t fn_of_any(const std::vector<uint32_t> &starts, const std::vector<uint32_t> &alt,
++                    uint32_t rva) {
++    uint32_t fn = fn_of(starts, rva, nullptr);
++    if (!fn) fn = fn_of(alt, rva, nullptr);
++    return fn;
++}
++
+ void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &starts,
+-               const std::vector<StrEnt> &strs, const SlotMap &slots,
+-               std::map<uint32_t, FnAgg> &fns) {
++               const std::vector<uint32_t> &alt, const std::vector<StrEnt> &strs,
++               const SlotMap &slots, std::map<uint32_t, FnAgg> &fns) {
+     for (uint64_t va = L.code_lo; va + 16 <= L.code_hi; va += 4) {
+         uint32_t w0 = 0;
+         if (!at(img, va, &w0, 4)) break;
+@@ -657,7 +670,7 @@ void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &s
+                 bool word = (kind == 0xB9400000u || kind == 0xB9000000u);
+                 uint32_t off = ((w0 >> 10) & 0xFFFu) << (word ? 2 : 3);
+                 if (off >= 8 && off < 0x1000) {
+-                    uint32_t fn = fn_of(starts, rva, nullptr);
++                    uint32_t fn = fn_of_any(starts, alt, rva);
+                     if (fn && slots.has(fn)) {
+                         FnAgg &a = fns[fn];
+                         if (a.fields.size() < 48 &&
+@@ -680,10 +693,17 @@ void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &s
+             uint32_t target = (uint32_t)(page + ((wk >> 10) & 0xFFFu));
+             if (!find_str(strs, target)) continue;
+             uint32_t fn = fn_of(starts, rva, nullptr);
+-            if (!fn || !slots.has(fn)) break;
++            if (!fn || !slots.has(fn)) {
++                uint32_t altfn = fn_of(alt, rva, nullptr);
++                if (!altfn || !slots.has(altfn)) break;
++                fn = altfn;
++            }
+             FnAgg &a = fns[fn];
+             if (!a.first_string) a.first_string = target;
+             a.strings++;
++            if (a.str_list.size() < kFnStrMax &&
++                std::find(a.str_list.begin(), a.str_list.end(), target) == a.str_list.end())
++                a.str_list.push_back(target);
+             break;
+         }
+     }
+@@ -779,28 +799,89 @@ struct DeepSummary {
+     uint32_t named = 0;
+     uint32_t tables = 0;
+     uint32_t slots = 0;
++    uint32_t method_named = 0;
++    uint32_t seeded = 0;
++    uint32_t families = 0;
++    uint32_t registry = 0;
++    uint32_t sandwiched = 0;
+ };
+ 
+ DeepSummary g_deep;
+ 
++std::map<uint32_t, std::string> g_table_family;
++std::map<uint32_t, const char *> g_table_src;
++
++const char *name_of_table(uint32_t start) {
++    std::map<uint32_t, std::string>::iterator it = g_table_class.find(start);
++    if (it != g_table_class.end()) return it->second.c_str();
++    const char *n = doc_class_name(start);
++    return (n && strcmp(n, "-") != 0) ? n : nullptr;
++}
++
++bool class_from_text(const char *s, char *out, size_t cap) {
++    for (const char *p = s; *p; p++) {
++        if (*p < 'A' || *p > 'Z') continue;
++        if (p != s) {
++            char b = p[-1];
++            if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') ||
++                b == '_' || b == ':')
++                continue;
++        }
++        const char *q = p;
++        while ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9') ||
++               *q == '_')
++            q++;
++        if (q - p < 3 || q[0] != ':' || q[1] != ':') continue;
++        const char *r = q + 2;
++        if (!((*r >= 'A' && *r <= 'Z') || (*r >= 'a' && *r <= 'z') || *r == '~')) continue;
++        size_t n = (size_t)(q - p);
++        if (n >= cap) n = cap - 1;
++        memcpy(out, p, n);
++        out[n] = 0;
++        return true;
++    }
++    return false;
++}
++
++void slots_of(const Image &img, const ClassTable &t, std::vector<uint32_t> &out, uint32_t cap) {
++    out.clear();
++    for (uint32_t s = 0; s < t.slots && out.size() < cap; s++) {
++        uint64_t raw = 0;
++        if (!at(img, img.base + t.start + (uint64_t)s * 8, &raw, sizeof(raw))) break;
++        out.push_back((uint32_t)((raw & 0xFFFFFFFFFULL) - img.base));
++    }
++    std::sort(out.begin(), out.end());
++}
++
+ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
+                               const std::vector<ClassTable> &tables,
+                               const std::map<uint32_t, FnAgg> &fns) {
+     char buf[512];
++    char cbuf[128];
++    struct Cand {
++        std::string name;
++        const char *src;
++    };
++    std::map<uint32_t, Cand> cand;
+     for (size_t i = 0; i < tables.size(); i++) {
+         const ClassTable &t = tables[i];
+         std::map<std::string, uint32_t> votes;
++        std::map<std::string, uint32_t> own;
+         for (uint32_t s = 0; s < t.slots; s++) {
+             uint64_t raw = 0;
+             if (!at(img, img.base + t.start + (uint64_t)s * 8, &raw, sizeof(raw))) break;
+             uint32_t sr = (uint32_t)((raw & 0xFFFFFFFFFULL) - img.base);
+             std::map<uint32_t, FnAgg>::const_iterator it = fns.find(sr);
+-            if (it == fns.end() || !it->second.first_string) continue;
+-            const StrEnt *e = find_str(strs, it->second.first_string);
+-            if (!e || !read_str(img, *e, buf, sizeof buf)) continue;
+-            if (!class_specific_string(buf)) continue;
+-            const char *owner = ref_class_for_string(buf);
+-            if (owner) votes[owner]++;
++            if (it == fns.end() || it->second.str_list.empty()) continue;
++            for (size_t k = 0; k < it->second.str_list.size(); k++) {
++                const StrEnt *e = find_str(strs, it->second.str_list[k]);
++                if (!e || !read_str(img, *e, buf, sizeof buf)) continue;
++                if (class_specific_string(buf)) {
++                    const char *owner = ref_class_for_string(buf);
++                    if (owner) votes[owner] += 2;
++                }
++                if (class_from_text(buf, cbuf, sizeof cbuf)) own[cbuf] += 1;
++            }
+         }
+         uint32_t best = 0;
+         std::string bestn;
+@@ -809,8 +890,469 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
+                 best = it->second;
+                 bestn = it->first;
+             }
+-        if (best) g_table_class[t.start] = bestn;
++        const char *src = "string anchor";
++        if (!best) {
++            for (std::map<std::string, uint32_t>::iterator it = own.begin(); it != own.end(); ++it)
++                if (it->second > best) {
++                    best = it->second;
++                    bestn = it->first;
++                }
++            src = "class::method";
++        }
++        if (best) {
++            Cand c;
++            c.name = bestn;
++            c.src = src;
++            cand[t.start] = c;
++        }
++    }
++    std::map<std::string, uint32_t> used;
++    for (std::map<uint32_t, Cand>::iterator it = cand.begin(); it != cand.end(); ++it)
++        used[it->second.name]++;
++    for (std::map<uint32_t, Cand>::iterator it = cand.begin(); it != cand.end(); ++it) {
++        if (used[it->second.name] > 1) {
++            g_table_family[it->first] = it->second.name;
++            continue;
++        }
++        if (g_table_class.count(it->first)) continue;
++        g_table_class[it->first] = it->second.name;
++        g_table_src[it->first] = it->second.src;
++    }
++}
++
++void name_from_method_index(const Image &img, const std::vector<ClassTable> &tables,
++                            uint32_t *out_named, const char *root) {
++    std::map<uint32_t, const char *> m2c;
++    for (uint32_t c = 0; c < kDocClassCount; c++) {
++        const DocClass &d = kDocClasses[c];
++        for (uint16_t k = 0; k < d.count; k++) m2c[kDocMethods[d.first + k].rva] = kDocBlob + d.name;
++    }
++    std::map<uint32_t, uint32_t> occ;
++    std::vector<uint32_t> sv;
++    for (size_t i = 0; i < tables.size(); i++) {
++        slots_of(img, tables[i], sv, 256);
++        for (size_t k = 0; k < sv.size(); k++)
++            if (m2c.count(sv[k])) occ[sv[k]]++;
++    }
++    uint32_t named = 0;
++    char path[1024];
++    snprintf(path, sizeof path, "%s/_method_index.md", root);
++    FILE *f = fopen(path, "w");
++    if (f)
++        fprintf(f, "# tables named by a documented method address that sits in exactly one table\n\n"
++                   "| table rva | slots | hits | class |\n|-----------|-------|------|-------|\n");
++    for (size_t i = 0; i < tables.size(); i++) {
++        const ClassTable &t = tables[i];
++        slots_of(img, t, sv, 256);
++        std::map<std::string, uint32_t> votes;
++        for (size_t k = 0; k < sv.size(); k++) {
++            std::map<uint32_t, const char *>::iterator mi = m2c.find(sv[k]);
++            if (mi == m2c.end() || occ[sv[k]] != 1) continue;
++            votes[mi->second]++;
++        }
++        if (votes.empty()) continue;
++        std::string best;
++        uint32_t top = 0;
++        for (std::map<std::string, uint32_t>::iterator it = votes.begin(); it != votes.end(); ++it)
++            if (it->second > top) {
++                top = it->second;
++                best = it->first;
++            }
++        if (!top || g_table_class.count(t.start)) continue;
++        g_table_class[t.start] = best;
++        g_table_src[t.start] = "method-index";
++        named++;
++        if (f) fprintf(f, "| `%#x` | %u | %u | %s |\n", t.start, t.slots, top, best.c_str());
++    }
++    if (f) fclose(f);
++    if (out_named) *out_named = named;
++}
++
++struct Sandw {
++    const char *lo;
++    const char *hi;
++    std::vector<uint32_t> vts;
++};
++
++void sandwiches(const std::vector<ClassTable> &tables, std::vector<Sandw> &out,
++                uint32_t *out_blocks, uint32_t *out_ordered) {
++    std::vector<const ClassTable *> by;
++    by.reserve(tables.size());
++    for (size_t i = 0; i < tables.size(); i++) by.push_back(&tables[i]);
++    std::sort(by.begin(), by.end(),
++              [](const ClassTable *a, const ClassTable *b) { return a->start < b->start; });
++    size_t i = 0;
++    uint32_t blocks = 0, ordered = 0;
++    while (i < by.size()) {
++        size_t j = i + 1;
++        while (j < by.size() && by[j]->start - by[j - 1]->start <= kBlockGap) j++;
++        blocks++;
++        uint32_t seeds = 0, inc = 0;
++        const char *prev = nullptr;
++        for (size_t k = i; k < j; k++) {
++            const char *n = name_of_table(by[k]->start);
++            if (!n) continue;
++            seeds++;
++            if (prev && strcmp(prev, n) < 0) inc++;
++            prev = n;
++        }
++        if (seeds >= kBlockMinSeeds && inc * 4 >= (seeds - 1) * 3) {
++            ordered++;
++            const char *lo = nullptr;
++            Sandw cur;
++            cur.lo = nullptr;
++            cur.hi = nullptr;
++            for (size_t k = i; k < j; k++) {
++                const char *n = name_of_table(by[k]->start);
++                if (n) {
++                    if (cur.lo && !cur.vts.empty()) {
++                        cur.hi = n;
++                        out.push_back(cur);
++                    }
++                    lo = n;
++                    cur.lo = lo;
++                    cur.hi = nullptr;
++                    cur.vts.clear();
++                    continue;
++                }
++                if (cur.lo) cur.vts.push_back(by[k]->start);
++            }
++        }
++        i = j;
++    }
++    if (out_blocks) *out_blocks = blocks;
++    if (out_ordered) *out_ordered = ordered;
++}
++
++void write_order_hint(const std::vector<ClassTable> &tables, const char *root,
++                      const std::vector<Sandw> &sw) {
++    char path[1024];
++    snprintf(path, sizeof path, "%s/_order_hint.md", root);
++    FILE *f = fopen(path, "w");
++    if (!f) return;
++    fprintf(f, "# unnamed tables between two named ones inside an alphabetically ordered block\n\n"
++               "the linker sorts class tables by name, so the name of each row below is "
++               "alphabetically between `prev` and `next`\n\n");
++    fprintf(f, "| prev | next | table rva | slots |\n|------|------|-----------|-------|\n");
++    size_t total = 0;
++    for (size_t i = 0; i < sw.size(); i++)
++        for (size_t k = 0; k < sw[i].vts.size(); k++) {
++            uint32_t slots = 0;
++            for (size_t t = 0; t < tables.size(); t++)
++                if (tables[t].start == sw[i].vts[k]) slots = tables[t].slots;
++            fprintf(f, "| %s | %s | `%#x` | %u |\n", sw[i].lo, sw[i].hi, sw[i].vts[k], slots);
++            total++;
++        }
++    fprintf(f, "\n%zu tables carry an order constraint\n", total);
++    fclose(f);
++}
++
++void cluster_families(const Image &img, const std::vector<ClassTable> &tables, const char *root,
++                      uint32_t *out_named) {
++    std::map<uint32_t, std::vector<uint32_t>> sv;
++    std::vector<uint32_t> tmp;
++    std::vector<uint32_t> namedv;
++    for (size_t i = 0; i < tables.size(); i++) {
++        slots_of(img, tables[i], tmp, 256);
++        sv[tables[i].start] = tmp;
++        if (name_of_table(tables[i].start)) namedv.push_back(tables[i].start);
++    }
++    char path[1024];
++    snprintf(path, sizeof path, "%s/_clusters.md", root);
++    FILE *f = fopen(path, "w");
++    if (f)
++        fprintf(f, "# tables sharing half of their slots with a named table (same hierarchy)\n\n"
++                   "| table rva | slots | shared | named table | family |\n"
++                   "|-----------|-------|--------|-------------|--------|\n");
++    uint32_t hits = 0;
++    std::vector<uint32_t> inter;
++    for (std::map<uint32_t, std::vector<uint32_t>>::iterator it = sv.begin(); it != sv.end(); ++it) {
++        if (name_of_table(it->first) || it->second.size() < kClusterSharedMin) continue;
++        uint32_t best = 0;
++        const char *bestn = nullptr;
++        for (size_t k = 0; k < namedv.size(); k++) {
++            if (sv[namedv[k]].size() < kClusterSharedMin) continue;
++            inter.clear();
++            std::set_intersection(it->second.begin(), it->second.end(), sv[namedv[k]].begin(),
++                                  sv[namedv[k]].end(), std::back_inserter(inter));
++            if (inter.size() > best) {
++                best = (uint32_t)inter.size();
++                bestn = name_of_table(namedv[k]);
++            }
++        }
++        if (best >= kClusterSharedMin && best * 2 >= (uint32_t)it->second.size()) {
++            g_table_family[it->first] = bestn;
++            hits++;
++            if (f)
++                fprintf(f, "| `%#x` | %zu | %u | %s | ~%s |\n", it->first, it->second.size(), best,
++                        bestn, bestn);
++        }
++    }
++    if (f) fclose(f);
++    if (out_named) *out_named = hits;
++}
++
++struct RegPair {
++    uint32_t cell;
++    uint32_t vt;
++    char text[96];
++};
++
++void scan_registry(const Image &img, const Layout &L, const std::vector<ClassTable> &tables,
++                   std::vector<RegPair> &out) {
++    std::vector<uint32_t> ts;
++    for (size_t i = 0; i < tables.size(); i++) ts.push_back(tables[i].start);
++    std::sort(ts.begin(), ts.end());
++    for (int i = 0; i < L.data_n; i++) {
++        uint64_t va = L.data[i].start;
++        while (va + 8 <= L.data[i].end) {
++            uint64_t raw = 0;
++            if (!at(img, va, &raw, sizeof(raw))) break;
++            uint64_t p = raw & 0xFFFFFFFFFULL;
++            uint32_t rva = (uint32_t)(p - img.base);
++            if (p < img.base || !std::binary_search(ts.begin(), ts.end(), rva)) {
++                va += 8;
++                continue;
++            }
++            for (int d = -8; d <= 8; d++) {
++                uint64_t cell = va + (uint64_t)(d * 8);
++                if (cell < L.data[i].start || cell + 8 > L.data[i].end) continue;
++                uint64_t q = 0;
++                if (!at(img, cell, &q, sizeof(q))) continue;
++                uint64_t sp = q & 0xFFFFFFFFFULL;
++                if (sp < L.code_lo || sp >= L.code_hi) continue;
++                uint32_t len = text_len(img, sp, L.code_hi, 95);
++                if (len < 3) continue;
++                RegPair rp;
++                rp.cell = (uint32_t)(va - img.base);
++                rp.vt = rva;
++                if (!at(img, sp, rp.text, len)) continue;
++                rp.text[len] = 0;
++                out.push_back(rp);
++                break;
++            }
++            va += 8;
++        }
++    }
++}
++
++void write_registry(const std::vector<RegPair> &pairs, const char *root) {
++    char path[1024];
++    snprintf(path, sizeof path, "%s/_registry.md", root);
++    FILE *f = fopen(path, "w");
++    if (!f) return;
++    fprintf(f, "# cells that hold a class table next to a string (engine registries)\n\n"
++               "| cell rva | class table | class | string |\n|----------|-------------|-------|--------|\n");
++    for (size_t i = 0; i < pairs.size(); i++) {
++        const char *n = name_of_table(pairs[i].vt);
++        fprintf(f, "| `%#x` | `%#x` | %s | `%.70s` |\n", pairs[i].cell, pairs[i].vt,
++                n ? n : "?", pairs[i].text);
++    }
++    fclose(f);
++}
++
++extern "C" uint32_t _dyld_image_count(void);
++extern "C" const void *_dyld_get_image_header(uint32_t index);
++extern "C" intptr_t _dyld_get_image_vmaddr_slide(uint32_t index);
++
++struct SectionRef {
++    char seg[17];
++    char sect[17];
++    uint64_t addr;
++    uint64_t size;
++};
++
++int image_sections(const Image &img, uint64_t base, SectionRef *out, int cap) {
++    Mh mh;
++    if (!at(img, base, &mh, sizeof(mh)) || mh.magic != 0xFEEDFACFu) return 0;
++    int n = 0;
++    uint64_t p = base + sizeof(Mh);
++    for (uint32_t c = 0; c < mh.ncmds; c++) {
++        Lc lc;
++        if (!at(img, p, &lc, sizeof(lc))) break;
++        if (lc.cmdsize < sizeof(Lc) || lc.cmdsize > 0x10000) break;
++        if (lc.cmd == kLcSegment64) {
++            SegCmd sg;
++            if (at(img, p, &sg, sizeof(sg))) {
++                struct Sec {
++                    char seg[16];
++                    char sect[16];
++                    uint64_t addr;
++                    uint64_t size;
++                    uint32_t off;
++                    uint32_t align;
++                    uint32_t reloff;
++                    uint32_t nreloc;
++                    uint32_t flags;
++                    uint32_t r1;
++                    uint32_t r2;
++                    uint32_t r3;
++                };
++                uint64_t sp = p + sizeof(SegCmd);
++                for (uint32_t s = 0; s < sg.nsects && n < cap; s++) {
++                    Sec sc;
++                    if (!at(img, sp, &sc, sizeof(sc))) break;
++                    memcpy(out[n].seg, sc.seg, 16);
++                    out[n].seg[16] = 0;
++                    memcpy(out[n].sect, sc.sect, 16);
++                    out[n].sect[16] = 0;
++                    out[n].addr = sc.addr;
++                    out[n].size = sc.size;
++                    n++;
++                    sp += sizeof(sc);
++                }
++            }
++        }
++        p += lc.cmdsize;
++    }
++    return n;
++}
++
++void import_foreign_names(const Image &img, const char *root) {
++    char path[1024];
++    snprintf(path, sizeof path, "%s/_objc.md", root);
++    FILE *f = fopen(path, "w");
++    if (!f) return;
++    fprintf(f, "# ObjC and Swift names in every loaded image\n\n");
++    uint32_t images = _dyld_image_count();
++    uint32_t total = 0;
++    uint32_t ref = 0;
++    char buf[256];
++    for (uint32_t i = 0; i < images; i++) {
++        const void *h = _dyld_get_image_header(i);
++        if (!h) continue;
++        SectionRef sr[128];
++        int n = image_sections(img, (uint64_t)(uintptr_t)h, sr, 128);
++        for (int k = 0; k < n; k++) {
++            if (strncmp(sr[k].sect, "__objc_classname", 16) != 0) continue;
++            uint64_t p = sr[k].addr;
++            uint64_t end = sr[k].addr + sr[k].size;
++            while (p < end) {
++                uint32_t len = text_len(img, p, end, 255);
++                if (len >= 3 && at(img, p, buf, len)) {
++                    buf[len] = 0;
++                    total++;
++                    for (uint32_t c = 0; c < kDocClassCount; c++)
++                        if (strcmp(kDocBlob + kDocClasses[c].name, buf) == 0) {
++                            ref++;
++                            fprintf(f, "- `%s` also exists in the class reference\n", buf);
++                            break;
++                        }
++                }
++                p += len + 1;
++            }
++        }
++    }
++    fprintf(f, "\n%u ObjC/Swift class names, %u of them in the class reference\n", total, ref);
++    fclose(f);
++    RCL_LOGLN("[deep] foreign names: images=%u objc=%u in_reference=%u", images, total, ref);
++}
++
++void external_align(const char *root) {
++    char path[1024];
++    snprintf(path, sizeof path, "%s/_external.md", root);
++    FILE *f = fopen(path, "w");
++    if (!f) return;
++    snprintf(path, sizeof path, "%s/names.txt", root);
++    FILE *in = fopen(path, "r");
++    fprintf(f, "# external class list aligned to the memory order of the tables\n\n");
++    if (!in) {
++        fprintf(f, "no `names.txt` in `%s` - one class name per line enables this stage\n", root);
++        fclose(f);
++        return;
++    }
++    char line[256];
++    uint32_t n = 0;
++    while (fgets(line, sizeof(line), in)) {
++        size_t l = strlen(line);
++        while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
++        if (l) n++;
++    }
++    fclose(in);
++    fprintf(f, "%u names read\n", n);
++    fclose(f);
++}
++
++void apply_seeds(uint32_t *out) {
++    uint32_t n = 0;
++    for (uint32_t i = 0; i < kSeedNameCount; i++) {
++        uint32_t vt = kSeedNames[i].vt;
++        if (g_table_class.count(vt)) continue;
++        g_table_class[vt] = kSeedNames[i].name;
++        g_table_src[vt] = "seed";
++        n++;
++    }
++    if (out) *out = n;
++}
++
++void branch_starts(const Image &img, const Layout &L, std::vector<uint32_t> &out) {
++    const int64_t hi = (int64_t)(L.code_hi - img.base);
++    for (uint64_t va = L.code_lo; va + 4 <= L.code_hi; va += 4) {
++        uint32_t w = 0;
++        if (!at(img, va, &w, 4)) break;
++        if ((w & 0xFC000000u) != 0x94000000u) continue;
++        int32_t imm = (int32_t)(w & 0x03FFFFFFu);
++        if (imm & 0x02000000) imm -= 0x04000000;
++        int64_t t = (int64_t)(va - img.base) + (int64_t)imm * 4;
++        if (t < 0 || t >= hi) continue;
++        out.push_back((uint32_t)t);
++    }
++}
++
++bool lc_function_starts(const Image &img, const Layout &L, std::vector<uint32_t> &out) {
++    Mh mh;
++    if (!at(img, img.base, &mh, sizeof(mh)) || mh.magic != 0xFEEDFACFu) return false;
++    uint64_t le_off = 0, le_va = 0;
++    uint32_t dataoff = 0, datasize = 0;
++    uint64_t p = img.base + sizeof(Mh);
++    for (uint32_t c = 0; c < mh.ncmds; c++) {
++        Lc lc;
++        if (!at(img, p, &lc, sizeof(lc))) return false;
++        if (lc.cmdsize < sizeof(Lc) || lc.cmdsize > 0x10000) return false;
++        if (lc.cmd == kLcSegment64) {
++            SegCmd sg;
++            if (at(img, p, &sg, sizeof(sg)) && strncmp(sg.segname, "__LINKEDIT", 11) == 0) {
++                le_off = sg.fileoff;
++                le_va = sg.vmaddr;
++            }
++        } else if (lc.cmd == kLcFunctionStarts) {
++            struct FsCmd {
++                uint32_t cmd;
++                uint32_t cmdsize;
++                uint32_t dataoff;
++                uint32_t datasize;
++            } fs;
++            if (at(img, p, &fs, sizeof(fs))) {
++                dataoff = fs.dataoff;
++                datasize = fs.datasize;
++            }
++        }
++        p += lc.cmdsize;
++    }
++    if (!datasize || dataoff < le_off) return false;
++    uint64_t va = le_va + (dataoff - le_off) + L.slide;
++    uint64_t end = va + datasize;
++    uint32_t rva = 0;
++    while (va < end) {
++        uint8_t b = 0;
++        uint32_t shift = 0, delta = 0;
++        bool ok = false;
++        for (;;) {
++            if (!at(img, va, &b, 1)) return !out.empty();
++            va += 1;
++            delta |= (uint32_t)(b & 0x7Fu) << shift;
++            shift += 7;
++            if (!(b & 0x80u)) {
++                ok = true;
++                break;
++            }
++            if (shift > 28) break;
++        }
++        if (!ok || !delta) break;
++        rva += delta;
++        out.push_back(rva);
+     }
++    return !out.empty();
+ }
+ 
+ void write_table_names(const std::vector<ClassTable> &tables, const char *root) {
+@@ -821,21 +1363,29 @@ void write_table_names(const std::vector<ClassTable> &tables, const char *root)
+     fprintf(f, "# class table -> class name, resolved from the strings its functions reference\n\n");
+     fprintf(f, "| table rva | slots | class | source |\n|-----------|-------|-------|--------|\n");
+     uint32_t named = 0;
++    uint32_t from_strings = 0;
+     for (size_t i = 0; i < tables.size(); i++) {
+         const ClassTable &t = tables[i];
+         std::map<uint32_t, std::string>::iterator it = g_table_class.find(t.start);
+         const char *old = doc_class_name(t.start);
++        const bool has_ref = strcmp(old, "-") != 0;
++        std::map<uint32_t, const char *>::const_iterator si = g_table_src.find(t.start);
+         if (it == g_table_class.end()) {
+-            fprintf(f, "| `%#x` | %u | %s | reference |\n", t.start, t.slots,
+-                    (strcmp(old, "-") == 0) ? "?" : old);
++            fprintf(f, "| `%#x` | %u | %s | reference |\n", t.start, t.slots, has_ref ? old : "?");
+             continue;
+         }
+         named++;
+-        fprintf(f, "| `%#x` | %u | %s | %s |\n", t.start, t.slots, it->second.c_str(),
+-                (strcmp(old, "-") == 0) ? "string anchor" : "reference + string anchor");
++        if (si != g_table_src.end()) from_strings++;
++        fprintf(f, "| `%#x` | %u | %s | %s%s%s |\n", t.start, t.slots, it->second.c_str(),
++                si == g_table_src.end() ? "reference" : si->second, has_ref ? " + " : "",
++                has_ref ? old : "");
+     }
++    std::map<uint32_t, std::string>::const_iterator fi;
++    for (fi = g_table_family.begin(); fi != g_table_family.end(); ++fi)
++        fprintf(f, "| `%#x` | - | ~%s | family |\n", fi->first, fi->second.c_str());
+     fclose(f);
+-    RCL_LOGLN("[deep] tables named from strings: %u", named);
++    RCL_LOGLN("[deep] tables named: %u (from strings %u, from families %zu)", named, from_strings,
++              g_table_family.size());
+ }
+ 
+ void write_unknown_named(const Image &img, const std::vector<StrEnt> &strs,
+@@ -874,6 +1424,16 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+                    const char *root) {
+     mkdir(root, 0755);
+     const std::vector<uint32_t> starts = build_starts(img, L);
++    std::vector<uint32_t> lcs;
++    const bool lcs_ok = lc_function_starts(img, L, lcs);
++    std::vector<uint32_t> brs;
++    branch_starts(img, L, brs);
++    std::vector<uint32_t> alt = lcs;
++    alt.insert(alt.end(), brs.begin(), brs.end());
++    std::sort(alt.begin(), alt.end());
++    alt.erase(std::unique(alt.begin(), alt.end()), alt.end());
++    RCL_LOGLN("[deep] starts heuristic=%zu extra=%zu (lc_function_starts=%zu bl_targets=%zu)",
++              starts.size(), alt.size(), lcs_ok ? lcs.size() : 0, brs.size());
+     const std::vector<StrEnt> strs = build_strings(img, L);
+     SlotMap slots;
+     slots.sorted.reserve(32768);
+@@ -886,7 +1446,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+         }
+     finish_slot_map(slots);
+     std::map<uint32_t, FnAgg> fns;
+-    code_pass(img, L, starts, strs, slots, fns);
++    code_pass(img, L, starts, alt, strs, slots, fns);
+     std::vector<GlobalHit> gh;
+     scan_globals(img, L, tables, gh);
+     write_strings(img, strs, fns, root);
+@@ -894,22 +1454,47 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+     write_all_offsets(tables, slots, fns, gh, root);
+     build_unique_strings();
+     RCL_LOGLN("[deep] class-specific reference strings: %zu", g_unique_str.size());
++    uint32_t str_fns = 0;
++    for (std::map<uint32_t, FnAgg>::const_iterator it = fns.begin(); it != fns.end(); ++it)
++        if (it->second.first_string) str_fns++;
+     name_tables_from_strings(img, strs, tables, fns);
++    uint32_t method_named = 0;
++    name_from_method_index(img, tables, &method_named, root);
++    uint32_t seeded = 0;
++    apply_seeds(&seeded);
++    uint32_t families = 0;
++    cluster_families(img, tables, root, &families);
++    std::vector<Sandw> sw;
++    uint32_t blocks = 0, ordered = 0;
++    sandwiches(tables, sw, &blocks, &ordered);
++    write_order_hint(tables, root, sw);
++    RCL_LOGLN("[deep] order blocks=%u alphabetically ordered=%u", blocks, ordered);
++    std::vector<RegPair> reg;
++    scan_registry(img, L, tables, reg);
++    write_registry(reg, root);
++    external_align(root);
++    import_foreign_names(img, root);
+     write_table_names(tables, root);
+     write_unknown_named(img, strs, tables, fns, root);
+     write_globals(gh, img, root);
+     write_anchors_extra(tables, root);
+     g_deep.starts = (uint32_t)starts.size();
+     g_deep.strings = (uint32_t)strs.size();
+-    g_deep.anchored = (uint32_t)fns.size();
++    g_deep.anchored = str_fns;
+     g_deep.globals = (uint32_t)gh.size();
+     g_deep.named = (uint32_t)g_table_class.size();
+     g_deep.tables = (uint32_t)tables.size();
+     g_deep.slots = (uint32_t)slots.sorted.size();
+-    RCL_LOGLN("[deep] starts=%zu strings=%zu slots=%zu anchored_fns=%zu globals=%zu tables=%zu "
+-              "named_from_strings=%zu",
+-              starts.size(), strs.size(), slots.sorted.size(), fns.size(), gh.size(), tables.size(),
+-              g_table_class.size());
++    g_deep.method_named = method_named;
++    g_deep.seeded = seeded;
++    g_deep.families = families;
++    g_deep.registry = (uint32_t)reg.size();
++    g_deep.sandwiched = 0;
++    for (size_t i = 0; i < sw.size(); i++) g_deep.sandwiched += (uint32_t)sw[i].vts.size();
++    RCL_LOGLN("[deep] starts=%zu strings=%zu slots=%zu str_fns=%u globals=%zu tables=%zu "
++              "named=%zu method_index=%u seeded=%u families=%u registry=%zu sandwiched=%u",
++              starts.size(), strs.size(), slots.sorted.size(), str_fns, gh.size(), tables.size(),
++              g_table_class.size(), method_named, seeded, families, reg.size(), g_deep.sandwiched);
+ }
+ 
+ }  // namespace
+@@ -1220,10 +1805,13 @@ void write_class_docs(const Image &img) {
+         fprintf(dg, "- tables %zu (strict %u, loose %u, loose words %llu)  class files %u  "
+                     "table files %u\n", ix.tables.size(), st.tables_strict, st.tables_loose,
+                 (unsigned long long)st.loose_words, files, unknown);
+-        fprintf(dg, "- deep: starts %u strings %u anchored functions %u globals %u "
+-                    "tables named from strings %u of %u\n",
+-                g_deep.starts, g_deep.strings, g_deep.anchored, g_deep.globals, g_deep.named,
+-                g_deep.tables);
++        fprintf(dg, "- deep: starts %u strings %u functions with a string %u globals %u "
++                    "tables %u\n",
++                g_deep.starts, g_deep.strings, g_deep.anchored, g_deep.globals, g_deep.tables);
++        fprintf(dg, "- names: total %u of %u | method index %u | offline seed %u | families %u | "
++                    "order constrained %u | registry pairs %u\n",
++                g_deep.named, g_deep.tables, g_deep.method_named, g_deep.seeded, g_deep.families,
++                g_deep.sandwiched, g_deep.registry);
+         fclose(dg);
+     }
+ 
+diff --git a/Sources/rcl_tablenames.h b/Sources/rcl_tablenames.h
+new file mode 100644
+index 0000000..61e445a
+--- /dev/null
++++ b/Sources/rcl_tablenames.h
+@@ -0,0 +1,61 @@
++// generated by tools/tablenames.py - offline table rva -> class name map
++// sources: exact method-address index (rcl_docdata.h + classes_docs), 'Class::method' strings
++#pragma once
++
++#include <stdint.h>
++
++namespace rcl {
++
++struct SeedName {
++    uint32_t vt;
++    const char *name;
++};
++
++static const SeedName kSeedNames[] = {
++    { 0xf783a8, "ProfileDsp" },
++    { 0xf78bf0, "FrequencyDelayLineCPU_Async" },
++    { 0xf82868, "time_internal" },
++    { 0xf9ee10, "ChatStreamItem" },
++    { 0xfa75a8, "StorePromoShopItem" },
++    { 0xfa9d60, "BuyChallengeLivesPopup" },
++    { 0xfad7f0, "CompetitivePassPopup" },
++    { 0xfae0e8, "CompetitiveSeasonStartPopup" },
++    { 0xfae818, "DemonsOneSideEventMenuPopup" },
++    { 0xfaf5e8, "PurchaseSkinGroupOfferPopup" },
++    { 0xfb3460, "DemonsContestRewardSelectionPopup" },
++    { 0xfb4a58, "EnterAgePopup" },
++    { 0xfb4ee8, "EsportTournamentsPopup" },
++    { 0xfb6360, "NewRecordNotification" },
++    { 0xfbcb90, "MoviePlayerPopup" },
++    { 0xfbe210, "PlayerCountryPopup" },
++    { 0xfc18c0, "PurchaseSkinGroupOfferHighlightPopupHandler" },
++    { 0xfc1bb0, "PurchaseHeroLvlUpMaterialPopupHandler" },
++    { 0xfc1f10, "ClaimRankRewardPopupHandler" },
++    { 0xfccac8, "TeamJoinRequestPopup" },
++    { 0xfcf980, "DemonsCodexPopup" },
++    { 0xfd1a80, "ArchetypeItemsInfoPopup" },
++    { 0xfd3618, "RecordsPopup" },
++    { 0xfd5ee8, "SCIDManager" },
++    { 0xfd5fc8, "GameSCIDManager" },
++    { 0xfd6070, "GameSCIDManager" },
++    { 0xfd7250, "HomeScreen" },
++    { 0xfd72d0, "HomeScreen" },
++    { 0xfd8a48, "AllianceQuestsTrack" },
++    { 0xfdcf88, "QuestsPopup" },
++    { 0xfe2468, "ChatOptionsPopup" },
++    { 0xfe3f18, "ClubHubPopup" },
++    { 0xfe6bd8, "LogicSkinAnimSequenceData" },
++    { 0xfe6ec8, "SkinAnimSequencePopup" },
++    { 0xfe9d00, "BattleMode" },
++    { 0xfed3d8, "LogicClaimRankUpRewardCommand" },
++    { 0xff5248, "LogicCharacterServer" },
++    { 0xffd118, "BindGoogleServiceAccountMessage" },
++    { 0x10012c8, "TencentAntiAddictionInstructionExecutedMessage" },
++    { 0x10058e8, "NativeFont" },
++    { 0x100b410, "LogicJSONInReflector" },
++    { 0x10af918, "DSPTransceiver" },
++};
++
++static const uint32_t kSeedNameCount = 42;
++
++}  // namespace rcl
+diff --git a/tools/tablenames.py b/tools/tablenames.py
+new file mode 100644
+index 0000000..cca1b77
+--- /dev/null
++++ b/tools/tablenames.py
+@@ -0,0 +1,204 @@
++#!/usr/bin/env python3
++"""offline precompute for the recoil classdump: table rva -> class name.
++
++The device build has no C++ symbols and no RTTI for the game's own classes, so every
++name has to come from a string or from structure. Doing that on the device is a single
++pass with no way to look twice; doing it here costs nothing and lets the run apply a
++finished map. Sources, in priority order:
++
++  1. exact method-address index - a documented method address that sits in ONE table
++     only (an address shared by many tables is a base-class method and names nothing);
++  2. 'Class::method' said by the string itself - reference-free;
++  3. an optional _strings.md from a previous run, for (2) over real anchors.
++
++writes Sources/rcl_tablenames.h
++usage: python3 tools/tablenames.py [--strings _strings.md] [--check]
++"""
++import argparse
++import collections
++import os
++import re
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++DOCDATA = os.path.join(ROOT, "Sources", "rcl_docdata.h")
++OUT = os.path.join(ROOT, "Sources", "rcl_tablenames.h")
++
++
++def docs_root():
++    for cand in (os.path.join(ROOT, "classes_docs"),
++                 os.path.join(os.path.dirname(ROOT), "classes_docs")):
++        if os.path.isdir(cand):
++            return cand
++    return os.path.join(ROOT, "classes_docs")
++
++
++DOCS = docs_root()
++UNKNOWN = os.path.join(DOCS, "Unknown")
++
++CLASS_RE = re.compile(r"(?:^|[^A-Za-z0-9_:])([A-Z][A-Za-z0-9_]{2,})::([A-Za-z_~][A-Za-z0-9_]*)")
++TABLE_RE = re.compile(r"Class Table:\*\*\s*`(0x[0-9a-f]+)`\s*\*\*Slots:\*\*\s*(\d+)")
++SLOT_RE = re.compile(r"\| `\+0x[0-9a-f]+` \| `(0x[0-9a-f]+)` \|")
++METHOD_RE = re.compile(r"\|\s*\d+\s*\|\s*`[^`]+`\s*\|\s*`(0x[0-9a-f]+)`")
++ANCHOR_RE = re.compile(r"^\| `(0x[0-9a-f]+)` \| `(0x[0-9a-f]+)` \| .*? \| `(.*)` \|")
++
++
++def decode_c(s):
++    out = []
++    i = 0
++    while i < len(s):
++        c = s[i]
++        if c != "\\":
++            out.append(c)
++            i += 1
++            continue
++        i += 1
++        if i >= len(s):
++            break
++        e = s[i]
++        if e in "01234567":
++            j = i
++            while j < len(s) and j < i + 3 and s[j] in "01234567":
++                j += 1
++            out.append(chr(int(s[i:j], 8)))
++            i = j
++            continue
++        out.append({"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"'}.get(e, e))
++        i += 1
++    return "".join(out)
++
++
++def doc_methods():
++    src = open(DOCDATA, encoding="utf-8", errors="replace").read()
++    st = src.index("static const DocMethod kDocMethods[] =")
++    en = src.index("static const DocClass kDocClasses[]")
++    blob_src = src[src.index("static const char kDocBlob[] ="):en]
++    blob = "".join(decode_c(p) for p in re.findall(r'"((?:[^"\\]|\\.)*)"', blob_src))
++
++    def cstr(o):
++        e = blob.find("\0", o)
++        return blob[o:e if e >= 0 else len(blob)]
++
++    methods = [int(m.group(1), 0) for m in
++               re.finditer(r"^\s*\{\s*(0x[0-9a-fA-F]+|\d+),\s*\d+,\s*\d+,\s*\d+,\s*\d+\s*\},?\s*$",
++                           src[st:en], re.M)]
++    m2c = {}
++    for m in re.finditer(r"^\s*\{\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(0x[0-9a-fA-F]+|\d+),"
++                         r"\s*(\d+),\s*(\d+),\s*(\d+)\s*\},?\s*$", src[en:], re.M):
++        _, _, _, _, vt, _, first, count = (int(x, 0) for x in m.groups())
++        name = cstr(int(m.group(1)))
++        for k in range(first, first + count):
++            if k < len(methods):
++                m2c[methods[k]] = name
++        _ = vt
++    return m2c
++
++
++def table_slots():
++    tabs = {}
++    if not os.path.isdir(UNKNOWN):
++        return tabs
++    for f in os.listdir(UNKNOWN):
++        if not f.endswith(".md"):
++            continue
++        t = open(os.path.join(UNKNOWN, f), encoding="utf-8", errors="replace").read()
++        m = TABLE_RE.search(t)
++        if not m:
++            continue
++        tabs[int(m.group(1), 16)] = [int(s, 16) for s in SLOT_RE.findall(t)]
++    return tabs
++
++
++def documented_methods_by_class():
++    out = {}
++    for cat in os.listdir(DOCS):
++        d = os.path.join(DOCS, cat)
++        if cat in ("Unknown", "docs") or not os.path.isdir(d):
++            continue
++        for f in os.listdir(d):
++            if not f.endswith(".md"):
++                continue
++            txt = open(os.path.join(d, f), encoding="utf-8", errors="replace").read()
++            for a in METHOD_RE.findall(txt):
++                v = int(a, 16)
++                out.setdefault(v - 0x100000000 if v > 0x100000000 else v, f[:-3])
++    return out
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--strings", help="a _strings.md from an earlier run")
++    ap.add_argument("--check", action="store_true", help="report only, write nothing")
++    args = ap.parse_args()
++
++    m2c = doc_methods()
++    direct = documented_methods_by_class()
++    for rva, cls in direct.items():
++        m2c.setdefault(rva, cls)
++    tabs = table_slots()
++    if not tabs:
++        raise SystemExit("no table files under classes_docs/Unknown - run the dump first")
++
++    occ = collections.Counter()
++    for sv in tabs.values():
++        for s in set(sv):
++            if s in m2c:
++                occ[s] += 1
++
++    seed = {}
++    votes = collections.defaultdict(collections.Counter)
++    for tab, sv in tabs.items():
++        for s in set(sv):
++            if s in m2c and occ[s] == 1:
++                votes[tab][m2c[s]] += 1
++    exact = {}
++    for tab, c in votes.items():
++        name, n = c.most_common(1)[0]
++        exact[tab] = name
++        del n
++    seed.update(exact)
++    print("exact method-address match (address used by exactly one table): %d tables" % len(exact))
++
++    own = {}
++    if args.strings and os.path.exists(args.strings):
++        for line in open(args.strings, encoding="utf-8", errors="replace"):
++            m = ANCHOR_RE.match(line.rstrip())
++            if not m:
++                continue
++            tab, s = int(m.group(2), 16), m.group(3)
++            mm = CLASS_RE.search(s)
++            if mm:
++                own.setdefault(tab, collections.Counter())[mm.group(1)] += 1
++        own = {t: c.most_common(1)[0][0] for t, c in own.items()}
++        print("'Class::method' from %s: %d tables" % (args.strings, len(own)))
++    else:
++        print("'Class::method': skipped (no --strings)")
++
++    new = 0
++    for t, c in own.items():
++        old = seed.get(t)
++        if old is not None and old != c:
++            print("  keep %#x -> %s (string said %s)" % (t, old, c))
++            continue
++        if old is None:
++            new += 1
++        seed[t] = c
++    print("seed total: %d (%d from strings)" % (len(seed), new))
++
++    if args.check:
++        return
++    lines = ["// generated by tools/tablenames.py - offline table rva -> class name map",
++             "// sources: exact method-address index (rcl_docdata.h + classes_docs), "
++             "'Class::method' strings", "#pragma once", "", "#include <stdint.h>", "",
++             "namespace rcl {", "", "struct SeedName {", "    uint32_t vt;",
++             "    const char *name;", "};", "", "static const SeedName kSeedNames[] = {"]
++    for t in sorted(seed):
++        lines.append('    { %#x, "%s" },' % (t, seed[t]))
++    lines += ["};", "", "static const uint32_t kSeedNameCount = %d;" % len(seed), "",
++              "}  // namespace rcl", ""]
++    open(OUT, "w", encoding="utf-8").write("\n".join(lines))
++    print("wrote %s (%d entries)" % (OUT, len(seed)))
++
++
++if __name__ == "__main__":
++    main()
