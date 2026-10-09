@@ -1318,13 +1318,13 @@ void external_align(const char *root) {
 
 void apply_seeds(uint32_t *out) {
     CandMap cand;
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < kSeedNameCount; i++) {
-        uint32_t vt = kSeedNames[i].vt;
-        cand[vt] = std::make_pair(std::string(kSeedNames[i].name), "seed");
-        n++;
-    }
+    for (uint32_t i = 0; i < kSeedNameCount; i++)
+        cand[kSeedNames[i].vt] = std::make_pair(std::string(kSeedNames[i].name), "seed");
     commit_names(cand);
+    uint32_t n = 0;
+    for (std::map<uint32_t, const char *>::const_iterator it = g_table_src.begin();
+         it != g_table_src.end(); ++it)
+        if (strcmp(it->second, "seed") == 0) n++;
     if (out) *out = n;
 }
 
@@ -1527,7 +1527,7 @@ void tu_cluster(const Image &img, const std::vector<ClassTable> &tables, uint32_
     if (out) *out = hits;
 }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(RCL_HOST_TEST)
 extern "C" int mach_vm_region(unsigned int task, unsigned long long *address,
                               unsigned long long *size, int flavor, void *info,
                               unsigned int *count);

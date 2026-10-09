@@ -1,5 +1,5 @@
 diff --git a/Sources/rcl_classdump.cpp b/Sources/rcl_classdump.cpp
-index b396a6c..d60977d 100644
+index b396a6c..1d966d0 100644
 --- a/Sources/rcl_classdump.cpp
 +++ b/Sources/rcl_classdump.cpp
 @@ -4,8 +4,10 @@
@@ -325,7 +325,7 @@ index b396a6c..d60977d 100644
 +            src = "class::method";
 +        }
 +        if (best) cand[t.start] = std::make_pair(bestn, src);
-+    }
+     }
 +    commit_names(cand);
 +}
 +
@@ -679,7 +679,7 @@ index b396a6c..d60977d 100644
 +        size_t l = strlen(line);
 +        while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
 +        if (l) n++;
-     }
++    }
 +    fclose(in);
 +    fprintf(f, "%u names read\n", n);
 +    fclose(f);
@@ -687,13 +687,13 @@ index b396a6c..d60977d 100644
 +
 +void apply_seeds(uint32_t *out) {
 +    CandMap cand;
-+    uint32_t n = 0;
-+    for (uint32_t i = 0; i < kSeedNameCount; i++) {
-+        uint32_t vt = kSeedNames[i].vt;
-+        cand[vt] = std::make_pair(std::string(kSeedNames[i].name), "seed");
-+        n++;
-+    }
++    for (uint32_t i = 0; i < kSeedNameCount; i++)
++        cand[kSeedNames[i].vt] = std::make_pair(std::string(kSeedNames[i].name), "seed");
 +    commit_names(cand);
++    uint32_t n = 0;
++    for (std::map<uint32_t, const char *>::const_iterator it = g_table_src.begin();
++         it != g_table_src.end(); ++it)
++        if (strcmp(it->second, "seed") == 0) n++;
 +    if (out) *out = n;
 +}
 +
@@ -896,7 +896,7 @@ index b396a6c..d60977d 100644
 +    if (out) *out = hits;
 +}
 +
-+#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(RCL_HOST_TEST)
 +extern "C" int mach_vm_region(unsigned int task, unsigned long long *address,
 +                              unsigned long long *size, int flavor, void *info,
 +                              unsigned int *count);
