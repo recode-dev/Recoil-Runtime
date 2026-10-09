@@ -553,6 +553,30 @@ const char *ref_class_for_string(const char *s) {
     return nullptr;
 }
 
+const char *ref_class_for_signature(const char *s) {
+    static std::map<std::string, const char *> *idx = nullptr;
+    if (!idx) {
+        idx = new std::map<std::string, const char *>();
+        for (uint32_t c = 0; c < kDocClassCount; c++) {
+            const char *p = kDocBlob + kDocClasses[c].strings;
+            while (p && *p) {
+                const char *e = strchr(p, '\x1f');
+                const size_t n = e ? (size_t)(e - p) : strlen(p);
+                if (n) {
+                    const std::string k(p, n);
+                    if (!idx->count(k)) (*idx)[k] = kDocBlob + kDocClasses[c].name;
+                }
+                if (!e) break;
+                p = e + 1;
+            }
+        }
+        RCL_LOGLN("[names] signature index: %zu strings over %u classes", idx->size(),
+                  kDocClassCount);
+    }
+    std::map<std::string, const char *>::const_iterator it = idx->find(s);
+    return it == idx->end() ? nullptr : it->second;
+}
+
 const char *doc_class_name(uint32_t vt) {
     for (uint32_t i = 0; i < kDocClassCount; i++)
         if (kDocClasses[i].vt == vt) return kDocBlob + kDocClasses[i].name;
@@ -895,12 +919,8 @@ void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &s
                 }
             }
             if (!find_str(strs, target)) continue;
-            uint32_t fn = fn_of(starts, rva, nullptr);
-            if (!fn || !slots.has(fn)) {
-                uint32_t altfn = fn_of(alt, rva, nullptr);
-                if (!altfn || !slots.has(altfn)) break;
-                fn = altfn;
-            }
+            const uint32_t fn = fn_of_any(starts, alt, rva);
+            if (!fn) break;
             FnAgg &a = fns[fn];
             if (!a.first_string) a.first_string = target;
             a.strings++;
@@ -1100,21 +1120,32 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
     for (size_t i = 0; i < tables.size(); i++) {
         const ClassTable &t = tables[i];
         std::map<std::string, uint32_t> votes;
+        std::map<std::string, uint32_t> votes1;
         std::map<std::string, uint32_t> own;
         for (uint32_t s = 0; s < t.slots; s++) {
             uint64_t raw = 0;
             if (!at(img, img.base + t.start + (uint64_t)s * 8, &raw, sizeof(raw))) break;
             uint32_t sr = (uint32_t)((raw & 0xFFFFFFFFFULL) - img.base);
             std::map<uint32_t, FnAgg>::const_iterator it = fns.find(sr);
-            if (it == fns.end() || it->second.str_list.empty()) continue;
+            if (it == fns.end() || (it->second.str_list.empty() && it->second.calls.empty()))
+                continue;
             for (size_t k = 0; k < it->second.str_list.size(); k++) {
                 const StrEnt *e = find_str(strs, it->second.str_list[k]);
                 if (!e || !read_str(img, *e, buf, sizeof buf)) continue;
-                if (class_specific_string(buf)) {
-                    const char *owner = ref_class_for_string(buf);
-                    if (owner) votes[owner] += 2;
+                const bool cs = class_specific_string(buf);
+                const char *owner = ref_class_for_signature(buf);
+                if (owner) votes[owner] += cs ? 2 : 1;
+                if (cs && class_from_text(buf, cbuf, sizeof cbuf)) own[cbuf] += 1;
+            }
+            for (size_t c = 0; c < it->second.calls.size(); c++) {
+                std::map<uint32_t, FnAgg>::const_iterator ci = fns.find(it->second.calls[c]);
+                if (ci == fns.end()) continue;
+                for (size_t k = 0; k < ci->second.str_list.size(); k++) {
+                    const StrEnt *e2 = find_str(strs, ci->second.str_list[k]);
+                    if (!e2 || !read_str(img, *e2, buf, sizeof buf)) continue;
+                    const char *o2 = ref_class_for_signature(buf);
+                    if (o2) votes1[o2] += 1;
                 }
-                if (class_from_text(buf, cbuf, sizeof cbuf)) own[cbuf] += 1;
             }
         }
         uint32_t best = 0;
@@ -1125,6 +1156,21 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
                 bestn = it->first;
             }
         const char *src = "string anchor";
+        if (!best) {
+            uint32_t best1 = 0;
+            std::string bestn1;
+            for (std::map<std::string, uint32_t>::iterator it = votes1.begin(); it != votes1.end();
+                 ++it)
+                if (it->second > best1) {
+                    best1 = it->second;
+                    bestn1 = it->first;
+                }
+            if (best1 >= 2) {
+                best = best1;
+                bestn = bestn1;
+                src = "called from";
+            }
+        }
         if (!best) {
             for (std::map<std::string, uint32_t>::iterator it = own.begin(); it != own.end(); ++it)
                 if (it->second > best) {
