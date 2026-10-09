@@ -1101,6 +1101,72 @@ void deep_accessors(const Image &img, const MachInsight &mi, const FnStarts &fs,
               st.accessors_owned);
 }
 
+void deep_functions(const Image &img, const MachInsight &mi, const FnStarts &fs,
+                    const std::vector<ClassTable> &tables, const char *root, DeepStats &st) {
+    const TextBuf &tb = text_buf_get(img, mi);
+    if (!tb.ok || fs.v.empty()) return;
+
+    std::map<uint32_t, std::string> tab_cls;
+    for (size_t i = 0; i < tables.size(); i++) {
+        const char *n = deep_ref_class(tables[i].start);
+        if (n && n[0]) tab_cls[tables[i].start] = n;
+    }
+
+    st.func_total = (uint32_t)fs.v.size();
+
+    char path[1024];
+    snprintf(path, sizeof path, "%s/_functions.tsv", root);
+    FILE *f = fopen(path, "w");
+    if (f) fprintf(f, "rva\tsize\tkind\tdetail\tstrings\tcalls\twhole\n");
+
+    for (size_t i = 0; i < fs.v.size(); i++) {
+        const uint32_t rva = fs.v[i];
+        const uint32_t size = fs.size_of(rva);
+        if (!size || size > 0x10000u) continue;
+        const uint32_t insns = size / 4;
+        const char *kind = "code";
+        std::string detail;
+        uint32_t nstr = 0;
+        uint32_t ncalls = 0;
+
+        for (uint32_t k = 0; k < insns && k < 48u; k++) {
+            const uint64_t va = tb.lo + (uint64_t)rva + (uint64_t)k * 4;
+            const uint32_t w = tb_word(tb, va);
+            if ((w & 0xFC000000u) == 0x94000000u) {
+                ncalls++;
+                continue;
+            }
+            uint64_t page = 0;
+            uint32_t rd = 0;
+            if (!adrp_calc(w, va, page, rd)) continue;
+            uint64_t full = 0;
+            if (!add_same(tb_word(tb, va + 4), rd, page, full)) continue;
+            const uint32_t trva = (uint32_t)(full - img.base);
+            std::map<uint32_t, std::string>::const_iterator it = tab_cls.find(trva);
+            if (it != tab_cls.end()) {
+                const uint32_t w3 = tb_word(tb, va + 8);
+                if ((w3 & 0xFFC00000u) == 0xF9000000u && ((w3 >> 5) & 0x1Fu) == 0u &&
+                    (w3 & 0x1Fu) == rd && ((w3 >> 10) & 0xFFFu) == 0u) {
+                    kind = "ctor";
+                    detail = it->second;
+                    st.func_ctor++;
+                }
+                continue;
+            }
+            if (nstr < 3u) {
+                std::string s;
+                if (d_cstr(img, full, s) && s.size() >= 3u && s.size() <= 120u) nstr++;
+            }
+        }
+        if (f) {
+            fprintf(f, "%#x\t%u\t%s\t%s\t%u\t%u\t%d\n", rva, size, kind,
+                    detail.empty() ? "-" : detail.c_str(), nstr, ncalls, fs.is_start(rva) ? 1 : 0);
+        }
+    }
+    if (f) fclose(f);
+    RCL_LOGLN("[deep] functions: total=%u ctor=%u", st.func_total, st.func_ctor);
+}
+
 void deep_indirect(const Image &img, const MachInsight &mi, const FnStarts &fs,
                    std::vector<ClassTable> &extra, DeepStats &st) {
     const TextBuf &tb = text_buf_get(img, mi);
