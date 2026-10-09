@@ -24,9 +24,10 @@ static const char *kSelfName = "RecoilRuntime";
 
 static bool live_read(void *ctx, uint64_t va, void *dst, size_t n) {
     const Image *im = (const Image *)ctx;
+    const uint64_t span = im->image_vmsize ? im->image_vmsize : im->vmsize;
     if (va < im->base) return false;
     uint64_t off = va - im->base;
-    if (off + n > im->vmsize) return false;
+    if (off + n > span) return false;
     memcpy(dst, (const void *)(uintptr_t)va, n);
     return true;
 }
