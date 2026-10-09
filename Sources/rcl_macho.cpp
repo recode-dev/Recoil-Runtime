@@ -17,7 +17,6 @@ bool rd8(const Image &img, uint64_t va, uint8_t &out) { return rd(img, va, &out,
 
 bool rd16(const Image &img, uint64_t va, uint16_t &out) { return rd(img, va, &out, 2); }
 bool rd32(const Image &img, uint64_t va, uint32_t &out) { return rd(img, va, &out, 4); }
-bool rd64(const Image &img, uint64_t va, uint64_t &out) { return rd(img, va, &out, 8); }
 
 struct Cursor {
     const Image *img;
