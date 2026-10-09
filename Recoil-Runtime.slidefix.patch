@@ -1,0 +1,78 @@
+diff --git a/Sources/rcl_classdump.cpp b/Sources/rcl_classdump.cpp
+index 0c5e548..81d7532 100644
+--- a/Sources/rcl_classdump.cpp
++++ b/Sources/rcl_classdump.cpp
+@@ -146,6 +146,7 @@ const char *class_of(const char *name) {
+ struct Layout {
+     uint32_t magic = 0;
+     uint32_t ncmds = 0;
++    uint64_t slide = 0;
+     uint64_t code_lo = 0;
+     uint64_t code_hi = 0;
+     Range data[64];
+@@ -163,22 +164,27 @@ void layout(const Image &img, Layout &L) {
+         L.magic = mh.magic;
+         L.ncmds = mh.ncmds;
+     }
++    for (int i = 0; i < L.nsegs; i++)
++        if (strncmp(segs[i].name, "__TEXT", 16) == 0 && L.slide == 0 && img.base >= segs[i].start)
++            L.slide = img.base - segs[i].start;
+     for (int i = 0; i < L.nsegs; i++) {
+-        if (strncmp(segs[i].name, "__TEXT", 16) == 0) {
+-            L.code_lo = segs[i].start;
+-            L.code_hi = segs[i].end;
++        Range r = segs[i];
++        r.start += L.slide;
++        r.end += L.slide;
++        if (strncmp(r.name, "__TEXT", 16) == 0) {
++            L.code_lo = r.start;
++            L.code_hi = r.end;
+             continue;
+         }
+-        if (strncmp(segs[i].name, "__LINKEDIT", 16) == 0) continue;
+-        if (strncmp(segs[i].name, "__PAGEZERO", 16) == 0) continue;
+-        if (L.data_n < 64) L.data[L.data_n++] = segs[i];
++        if (strncmp(r.name, "__LINKEDIT", 16) == 0) continue;
++        if (strncmp(r.name, "__PAGEZERO", 16) == 0) continue;
++        if (L.data_n < 64) L.data[L.data_n++] = r;
+     }
+     if (L.data_n == 0) {
+-        const uint64_t end = img.base + (img.image_vmsize ? img.image_vmsize : 0x1200000);
+         Range r;
+         snprintf(r.name, sizeof(r.name), "%s", "image");
+-        r.start = L.code_hi ? L.code_hi : img.base + 0x4000;
+-        r.end = end;
++        r.start = L.code_hi ? L.code_hi : img.base + 0xf74000;
++        r.end = img.base + (img.image_vmsize ? img.image_vmsize : 0x1200000);
+         L.data[L.data_n++] = r;
+     }
+     if (!L.code_lo) {
+@@ -240,6 +246,7 @@ std::vector<ClassTable> scan_class_tables(const Image &img, ScanStats *st) {
+         st->hdr_ok = L.hdr;
+         st->magic = L.magic;
+         st->ncmds = L.ncmds;
++        st->slide = L.slide;
+         st->segs.clear();
+         for (int i = 0; i < L.data_n; i++) {
+             SegInfo si;
+@@ -613,6 +620,8 @@ void write_class_docs(const Image &img) {
+         fprintf(dg, "- base `%#llx`  text_vmsize `%#llx`  image_vmsize `%#llx`\n",
+                 (unsigned long long)img.base, (unsigned long long)img.vmsize,
+                 (unsigned long long)img.image_vmsize);
++        fprintf(dg, "- slide `%#llx` (load commands hold static addresses; base - __TEXT vmaddr)\n",
++                (unsigned long long)st.slide);
+         fprintf(dg, "- header %s  magic `%#x`  ncmds %u  data segments %u\n",
+                 st.hdr_ok ? "parsed" : "FAIL", st.magic, st.ncmds, (unsigned)st.segs.size());
+         for (const SegInfo &si : st.segs)
+diff --git a/Sources/rcl_classdump.h b/Sources/rcl_classdump.h
+index a75b881..7db52b8 100644
+--- a/Sources/rcl_classdump.h
++++ b/Sources/rcl_classdump.h
+@@ -24,6 +24,7 @@ struct ScanStats {
+     int hdr_ok = 0;
+     uint32_t magic = 0;
+     uint32_t ncmds = 0;
++    uint64_t slide = 0;
+     uint64_t words = 0;
+     uint64_t ptr_ok = 0;
+     uint64_t entry_ok = 0;

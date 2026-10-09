@@ -24,6 +24,7 @@ struct ScanStats {
     int hdr_ok = 0;
     uint32_t magic = 0;
     uint32_t ncmds = 0;
+    uint64_t slide = 0;
     uint64_t words = 0;
     uint64_t ptr_ok = 0;
     uint64_t entry_ok = 0;
