@@ -347,6 +347,402 @@ void live_boot(const Image &img) {
 
 }  // namespace
 
+const char *ref_name(uint32_t vt);
+
+namespace {
+
+struct StrEnt {
+    uint32_t va;
+    uint32_t len;
+};
+
+std::vector<uint32_t> build_starts(const Image &img, const Layout &L) {
+    std::vector<uint32_t> out;
+    uint32_t prev = 0;
+    for (uint64_t va = L.code_lo; va + 4 <= L.code_hi; va += 4) {
+        uint32_t w = 0;
+        if (!at(img, va, &w, 4)) break;
+        if (prev == 0xD65F03C0u || (prev & 0xFC000000u) == 0x14000000u || prev == 0xD503201Fu)
+            if (entry(w)) out.push_back((uint32_t)(va - img.base));
+        prev = w;
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+uint32_t fn_of(const std::vector<uint32_t> &starts, uint32_t rva, bool *exact) {
+    uint32_t lo = 0, hi = (uint32_t)starts.size();
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (starts[mid] <= rva) lo = mid + 1;
+        else hi = mid;
+    }
+    if (!lo) {
+        if (exact) *exact = false;
+        return 0;
+    }
+    if (exact) *exact = (starts[lo - 1] == rva);
+    return starts[lo - 1];
+}
+
+bool printable(uint32_t w) {
+    for (int i = 0; i < 4; i++) {
+        uint8_t c = (uint8_t)(w >> (i * 8));
+        if (c < 32 || c > 126) return false;
+    }
+    return true;
+}
+
+std::vector<StrEnt> build_strings(const Image &img, const Layout &L) {
+    std::vector<StrEnt> out;
+    const uint64_t lo = L.code_lo;
+    const uint64_t hi = L.code_hi;
+    for (uint64_t va = lo; va + 8 <= hi; ) {
+        uint32_t w = 0;
+        if (!at(img, va, &w, 4)) break;
+        if (!printable(w)) {
+            va += 4;
+            continue;
+        }
+        uint64_t p = va;
+        uint32_t len = 0;
+        while (p + 4 <= hi && len < 512) {
+            uint32_t x = 0;
+            if (!at(img, p, &x, 4)) break;
+            if (!printable(x)) break;
+            len += 4;
+            p += 4;
+        }
+        if (len >= 8 && !(len & 3)) out.push_back({(uint32_t)(va - img.base), len});
+        if (out.size() > 200000) break;
+        va = p + 4;
+    }
+    std::sort(out.begin(), out.end(), [](const StrEnt &a, const StrEnt &b) { return a.va < b.va; });
+    return out;
+}
+
+const StrEnt *find_str(const std::vector<StrEnt> &s, uint32_t va) {
+    uint32_t lo = 0, hi = (uint32_t)s.size();
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (s[mid].va == va) return &s[mid];
+        if (s[mid].va < va) lo = mid + 1;
+        else hi = mid;
+    }
+    return nullptr;
+}
+
+bool read_str(const Image &img, const StrEnt &e, char *dst, size_t cap) {
+    size_t n = e.len < cap - 1 ? e.len : cap - 1;
+    if (!at(img, img.base + e.va, dst, n)) return false;
+    dst[n] = 0;
+    return true;
+}
+
+const char *ref_class_for_string(const char *s) {
+    for (uint32_t c = 0; c < kDocClassCount; c++) {
+        const char *p = kDocBlob + kDocClasses[c].strings;
+        while (p && *p) {
+            const char *e = strchr(p, '\x1f');
+            size_t n = e ? (size_t)(e - p) : strlen(p);
+            if (n == strlen(s) && strncmp(p, s, n) == 0) return kDocBlob + kDocClasses[c].name;
+            if (!e) break;
+            p = e + 1;
+        }
+    }
+    return nullptr;
+}
+
+void class_label(uint32_t vt, char *dst, size_t cap) {
+    const char *n = ref_name(vt);
+    if (n && *n && strcmp(n, "-") != 0) {
+        snprintf(dst, cap, "%s", n);
+        return;
+    }
+    snprintf(dst, cap, "vt_%06x", vt);
+}
+
+struct GlobalHit {
+    uint32_t cell;
+    uint32_t vt;
+    uint32_t object;
+};
+
+void scan_globals(const Image &img, const Layout &L, const std::vector<ClassTable> &tables,
+                  std::vector<GlobalHit> &out) {
+    std::vector<uint32_t> tsorted;
+    tsorted.reserve(tables.size());
+    for (size_t i = 0; i < tables.size(); i++) tsorted.push_back(tables[i].start);
+    std::sort(tsorted.begin(), tsorted.end());
+    for (int i = 0; i < L.data_n; i++) {
+        for (uint64_t va = L.data[i].start; va + 8 <= L.data[i].end; va += 8) {
+            uint64_t obj = 0;
+            if (!at(img, va, &obj, 8)) break;
+            uint64_t r = obj - img.base;
+            if (obj < img.base || r >= (img.image_vmsize ? img.image_vmsize : 0x1200000)) continue;
+            if (r < L.data[i].start - img.base || r >= L.data[i].end - img.base) continue;
+            uint64_t v = 0;
+            if (!at(img, obj, &v, 8)) continue;
+            uint32_t vt = (uint32_t)((v & 0xFFFFFFFFFULL) - img.base);
+            if (vt == 0) continue;
+            bool is_table = std::binary_search(tsorted.begin(), tsorted.end(), vt);
+            if (!is_table) continue;
+            out.push_back({(uint32_t)(va - img.base), vt, (uint32_t)r});
+        }
+    }
+}
+
+void write_globals(const std::vector<GlobalHit> &hits, const char *root) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/_globals.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# globals holding objects of a known class (singletons, managers, VTABLE holders)\n\n");
+    fprintf(f, "| cell rva | object rva | class table | class | name guess |\n");
+    fprintf(f, "|----------|-----------|-------------|-------|------------|\n");
+    for (const GlobalHit &h : hits) {
+        char cl[128];
+        class_label(h.vt, cl, sizeof cl);
+        const char *g = "-";
+        if (strstr(cl, "BattleScreen")) g = "StageInstanceGlobalPtr-like";
+        else if (strstr(cl, "MessageManager")) g = "MessageManager_instance";
+        else if (strstr(cl, "AllianceManager")) g = "AllianceManager_instance";
+        else if (strstr(cl, "LogicDataTables")) g = "LogicDataTables_tableArray";
+        else if (strstr(cl, "FramerateManager")) g = "FramerateManager_targetFps";
+        else if (strstr(cl, "Screen")) g = "Screen_*Global";
+        fprintf(f, "| `%#x` | `%#x` | `%#x` | %s | %s |\n", h.cell, h.object, h.vt, cl, g);
+    }
+    fclose(f);
+}
+
+void write_anchors_extra(const std::vector<ClassTable> &tables, const char *root) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/_vtables.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# class tables of this image (vtables): class -> table rva\n\n");
+    fprintf(f, "| class | table rva | slots |\n|-------|-----------|-------|\n");
+    for (uint32_t c = 0; c < kDocClassCount; c++) {
+        uint32_t vt = kDocClasses[c].vt;
+        if (!vt) continue;
+        uint32_t slots = 0;
+        for (const ClassTable &t : tables)
+            if (t.start == vt) slots = t.slots;
+        fprintf(f, "| %s | `%#x` | %u |\n", kDocBlob + kDocClasses[c].name, vt, slots);
+    }
+    fclose(f);
+}
+
+}  // namespace
+
+namespace {
+
+struct SlotMap {
+    std::vector<uint32_t> sorted;
+    std::vector<uint32_t> table_of;
+
+    bool has(uint32_t rva) const { return std::binary_search(sorted.begin(), sorted.end(), rva); }
+
+    uint32_t table_for(uint32_t rva) const {
+        uint32_t lo = 0, hi = (uint32_t)sorted.size();
+        while (lo < hi) {
+            uint32_t mid = (lo + hi) / 2;
+            if (sorted[mid] == rva) return table_of[mid];
+            if (sorted[mid] < rva) lo = mid + 1;
+            else hi = mid;
+        }
+        return 0;
+    }
+};
+
+void add_slot(SlotMap &m, uint32_t rva, uint32_t table) {
+    m.sorted.push_back(rva);
+    m.table_of.push_back(table);
+}
+
+void finish_slot_map(SlotMap &m) {
+    std::vector<std::pair<uint32_t, uint32_t>> v;
+    v.reserve(m.sorted.size());
+    for (size_t i = 0; i < m.sorted.size(); i++) v.push_back({m.sorted[i], m.table_of[i]});
+    std::sort(v.begin(), v.end());
+    m.sorted.clear();
+    m.table_of.clear();
+    for (size_t i = 0; i < v.size(); i++) {
+        m.sorted.push_back(v[i].first);
+        m.table_of.push_back(v[i].second);
+    }
+}
+
+struct FnAgg {
+    uint32_t strings = 0;
+    uint32_t first_string = 0;
+    uint32_t table = 0;
+    std::vector<uint32_t> fields;
+};
+
+uint32_t adrp_imm(uint32_t w) {
+    int imm = (int)(((w >> 5) & 0x7FFFFu) << 2 | ((w >> 29) & 3u));
+    if (imm & 0x100000) imm -= 0x200000;
+    return (uint32_t)(imm << 12);
+}
+
+void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &starts,
+               const std::vector<StrEnt> &strs, const SlotMap &slots,
+               std::map<uint32_t, FnAgg> &fns) {
+    for (uint64_t va = L.code_lo; va + 16 <= L.code_hi; va += 4) {
+        uint32_t w0 = 0;
+        if (!at(img, va, &w0, 4)) break;
+        uint32_t rva = (uint32_t)(va - img.base);
+        if ((w0 & 0x9F000000u) != 0x90000000u) {
+            uint32_t kind = w0 & 0xFFC00000u;
+            if ((kind == 0xB9400000u || kind == 0xB9000000u || kind == 0xF9400000u ||
+                 kind == 0xF9000000u) &&
+                ((w0 >> 5) & 31u) == 31u) {
+                bool word = (kind == 0xB9400000u || kind == 0xB9000000u);
+                uint32_t off = ((w0 >> 10) & 0xFFFu) << (word ? 2 : 3);
+                if (off >= 8 && off < 0x1000) {
+                    uint32_t fn = fn_of(starts, rva, nullptr);
+                    if (fn && slots.has(fn)) {
+                        FnAgg &a = fns[fn];
+                        if (a.fields.size() < 48 &&
+                            std::find(a.fields.begin(), a.fields.end(), off) == a.fields.end())
+                            a.fields.push_back(off);
+                    }
+                }
+            }
+            continue;
+        }
+        uint32_t rd = w0 & 31u;
+        uint64_t page = (uint64_t)(rva & ~0xFFFu) + adrp_imm(w0);
+        for (int k = 1; k <= 3; k++) {
+            uint32_t wk = 0;
+            if (!at(img, va + (uint64_t)k * 4, &wk, 4)) break;
+            bool isadd = (wk & 0x7F800000u) == 0x11000000u && ((wk >> 29) & 3u) == 0 &&
+                         ((wk >> 5) & 31u) == rd;
+            bool isldr = (wk & 0xFFC00000u) == 0xF9400000u && ((wk >> 5) & 31u) == rd;
+            if (!isadd && !isldr) continue;
+            uint32_t target = (uint32_t)(page + ((wk >> 10) & 0xFFFu));
+            if (!find_str(strs, target)) continue;
+            uint32_t fn = fn_of(starts, rva, nullptr);
+            if (!fn || !slots.has(fn)) break;
+            FnAgg &a = fns[fn];
+            if (!a.first_string) a.first_string = target;
+            a.strings++;
+            break;
+        }
+    }
+    for (auto &kv : fns) kv.second.table = slots.table_for(kv.first);
+}
+
+void write_strings(const Image &img, const std::vector<StrEnt> &strs,
+                   const std::map<uint32_t, FnAgg> &fns, const char *root) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/_strings.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# string anchors: which function references which string (their scanner's data_ref)\n\n"
+               "| function rva | class table | class | string | reference class with that string |\n"
+               "|--------------|-------------|-------|--------|----------------------------------|\n");
+    char buf[512];
+    int rows = 0;
+    for (const auto &kv : fns) {
+        if (!kv.second.strings || !kv.second.first_string) continue;
+        const StrEnt *e = find_str(strs, kv.second.first_string);
+        if (!e || !read_str(img, *e, buf, sizeof buf)) continue;
+        char cl[128];
+        const char *n = ref_name(kv.second.table);
+        snprintf(cl, sizeof cl, "%s", (n && strcmp(n, "-") != 0) ? n : "-");
+        const char *owner = ref_class_for_string(buf);
+        fprintf(f, "| `%#x` | `%#x` | %s | `%.80s` | %s |\n", kv.first, kv.second.table, cl, buf,
+                owner ? owner : "-");
+        if (++rows > 6000) break;
+    }
+    fclose(f);
+}
+
+void write_fields(const std::map<uint32_t, FnAgg> &fns, const char *root) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/_fields.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# candidate field offsets per class (ldr/str [x,#imm] inside the class's functions)\n");
+    std::map<std::string, std::map<uint32_t, uint32_t>> per;
+    for (const auto &kv : fns) {
+        if (!kv.second.table) continue;
+        const char *n = ref_name(kv.second.table);
+        std::string lb = (n && strcmp(n, "-") != 0) ? n : "unnamed";
+        for (size_t i = 0; i < kv.second.fields.size(); i++) per[lb][kv.second.fields[i]]++;
+    }
+    for (const auto &c : per) {
+        fprintf(f, "\n## %s\n\n| offset | hits |\n|--------|------|\n", c.first.c_str());
+        std::vector<std::pair<uint32_t, uint32_t>> v(c.second.begin(), c.second.end());
+        std::sort(v.begin(), v.end(),
+                  [](const std::pair<uint32_t, uint32_t> &a, const std::pair<uint32_t, uint32_t> &b) {
+                      return a.second > b.second;
+                  });
+        for (size_t i = 0; i < v.size(); i++) fprintf(f, "| `%#x` | %u |\n", v[i].first, v[i].second);
+    }
+    fclose(f);
+}
+
+void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slots,
+                       const std::map<uint32_t, FnAgg> &fns, const std::vector<GlobalHit> &gh,
+                       const char *root) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/_all_offsets.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# every offset this build can find, in one file\n\n");
+    fprintf(f, "documented classes %u | class tables %zu | table slots %zu | globals holding known "
+               "objects %zu | functions with a string anchor %zu\n\n",
+            kDocClassCount, tables.size(), slots.sorted.size(), gh.size(), fns.size());
+    fprintf(f, "| class | table (vt) | slots | slots named by string | field candidates |\n");
+    fprintf(f, "|-------|-----------|-------|----------------------|------------------|\n");
+    for (size_t i = 0; i < tables.size(); i++) {
+        const ClassTable &t = tables[i];
+        const char *n = ref_name(t.start);
+        std::string lb = (n && strcmp(n, "-") != 0) ? n : ("vt_" + std::to_string(t.start));
+        uint32_t named = 0, flds = 0;
+        for (const auto &kv : fns)
+            if (kv.second.table == t.start) {
+                if (kv.second.strings) named++;
+                flds += (uint32_t)kv.second.fields.size();
+            }
+        fprintf(f, "| %s | `%#x` | %u | %u | %u |\n", lb.c_str(), t.start, t.slots, named, flds);
+    }
+    fclose(f);
+}
+
+void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTable> &tables,
+                   const char *root) {
+    mkdir(root, 0755);
+    const std::vector<uint32_t> starts = build_starts(img, L);
+    const std::vector<StrEnt> strs = build_strings(img, L);
+    SlotMap slots;
+    slots.sorted.reserve(32768);
+    slots.table_of.reserve(32768);
+    for (size_t i = 0; i < tables.size(); i++)
+        for (uint32_t s = 0; s < tables[i].slots; s++) {
+            uint64_t raw = 0;
+            if (!at(img, img.base + tables[i].start + (uint64_t)s * 8, &raw, 8)) break;
+            add_slot(slots, (uint32_t)((raw & 0xFFFFFFFFFULL) - img.base), tables[i].start);
+        }
+    finish_slot_map(slots);
+    std::map<uint32_t, FnAgg> fns;
+    code_pass(img, L, starts, strs, slots, fns);
+    std::vector<GlobalHit> gh;
+    scan_globals(img, L, tables, gh);
+    write_strings(img, strs, fns, root);
+    write_fields(fns, root);
+    write_all_offsets(tables, slots, fns, gh, root);
+    write_globals(gh, root);
+    write_anchors_extra(tables, root);
+    RCL_LOGLN("[deep] starts=%zu strings=%zu slots=%zu anchored_fns=%zu globals=%zu tables=%zu",
+              starts.size(), strs.size(), slots.sorted.size(), fns.size(), gh.size(), tables.size());
+}
+
+}  // namespace
+
 void dump_class_tree(const Image &img) {
     live_boot(img);
     const char *mode = getenv("RCL_CLASSES");
@@ -407,6 +803,7 @@ void dump_class_tree(const Image &img) {
             RCL_LOGLN("    +0x%03x  0x%06x  %s", s * 8, sr, name_for_rva(sr));
         }
     }
+    run_deep_scan(img, L, t, dump_root());
     RCL_LOGLN("[classes] end tables=%zu slots=%llu named_slots=%llu", t.size(),
               (unsigned long long)slots, (unsigned long long)named);
 }
