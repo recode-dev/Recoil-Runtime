@@ -653,6 +653,8 @@ uint32_t adrp_imm(uint32_t w) {
 std::set<uint32_t> g_table_ref;
 std::set<uint32_t> g_ctor_table;
 std::map<uint32_t, uint32_t> g_table_inst;
+std::set<uint32_t> g_table_merged;
+bool g_live_ran = false;
 
 uint32_t fn_of_any(const std::vector<uint32_t> &starts, const std::vector<uint32_t> &alt,
                     uint32_t rva) {
@@ -1430,21 +1432,39 @@ void expand_calls(std::map<uint32_t, FnAgg> &fns) {
     }
 }
 
-uint32_t merge_runs(const std::vector<ClassTable> &tables) {
+bool all_slots_are_starts(const Image &img, const ClassTable &t, const std::vector<uint32_t> &starts,
+                          std::vector<uint32_t> &sv) {
+    slots_of(img, t, sv, 256);
+    for (size_t k = 0; k < sv.size(); k++) {
+        bool exact = false;
+        fn_of(starts, sv[k], &exact);
+        if (!exact) return false;
+    }
+    return true;
+}
+
+uint32_t merge_runs(const Image &img, const std::vector<ClassTable> &tables,
+                    const std::vector<uint32_t> &starts, uint32_t *out_cand) {
     std::vector<const ClassTable *> by;
     by.reserve(tables.size());
     for (size_t i = 0; i < tables.size(); i++) by.push_back(&tables[i]);
     std::sort(by.begin(), by.end(),
               [](const ClassTable *a, const ClassTable *b) { return a->start < b->start; });
-    uint32_t n = 0;
+    uint32_t cand = 0, applied = 0;
+    std::vector<uint32_t> sv;
     for (size_t i = 1; i < by.size(); i++) {
         const uint64_t end = by[i - 1]->start + (uint64_t)by[i - 1]->slots * 8;
         if (by[i]->start < end) continue;
         if (by[i]->start - end > 0x20) continue;
         if (by[i - 1]->slots + by[i]->slots > 256) continue;
-        n++;
+        cand++;
+        if (!all_slots_are_starts(img, *by[i - 1], starts, sv)) continue;
+        if (!all_slots_are_starts(img, *by[i], starts, sv)) continue;
+        applied++;
+        g_table_merged.insert(by[i]->start);
     }
-    return n;
+    if (out_cand) *out_cand = cand;
+    return applied;
 }
 
 uint32_t dup_tables(const Image &img, const std::vector<ClassTable> &tables) {
@@ -1452,6 +1472,7 @@ uint32_t dup_tables(const Image &img, const std::vector<ClassTable> &tables) {
     std::vector<uint32_t> sv;
     uint32_t dup = 0;
     for (size_t i = 0; i < tables.size(); i++) {
+        if (g_table_merged.count(tables[i].start)) continue;
         slots_of(img, tables[i], sv, 64);
         std::string key((const char *)sv.data(), sv.size() * sizeof(uint32_t));
         if (seen.count(key)) dup++;
@@ -1543,13 +1564,14 @@ void live_census(const Image &img, const std::vector<uint32_t> &tabs) {
         size = 0;
         cnt = 9;
     }
+    g_live_ran = true;
 }
 #else
 void live_census(const Image &, const std::vector<uint32_t> &) {}
 #endif
 
 void write_confidence(const std::vector<ClassTable> &tables, const char *root, uint32_t merged,
-                      uint32_t dup) {
+                      uint32_t cand, uint32_t dup) {
     char path[1024];
     snprintf(path, sizeof path, "%s/_confidence.md", root);
     FILE *f = fopen(path, "w");
@@ -1572,14 +1594,16 @@ void write_confidence(const std::vector<ClassTable> &tables, const char *root, u
         if (r && c) both++;
         const char *nm = name_of_table(t.start);
         if (r || c || n)
-            fprintf(f, "| `%#x` | %u | %s | %s | %s | %u |\n", t.start, t.slots, nm ? nm : "?",
-                    r ? "yes" : "-", c ? "yes" : "-", n);
+            fprintf(f, "| `%#x` | %u | %s | %s | %s | %s |%s\n", t.start, t.slots, nm ? nm : "?",
+                    r ? "yes" : "-", c ? "yes" : "-",
+                    g_live_ran ? (n ? "instances" : "-") : "not measured",
+                    g_table_merged.count(t.start) ? " merged" : "");
     }
-    fprintf(f, "\n%u tables, referenced %u, ctor installed %u, live instances %u, "
-               "referenced+ctor %u\n",
-            (uint32_t)tables.size(), ref, ctor, live, both);
-    fprintf(f, "adjacent runs separable into one table: %u\n", merged);
-    fprintf(f, "tables whose slot vector repeats an earlier table: %u\n", dup);
+    fprintf(f, "\n%u tables, referenced %u, ctor installed %u, referenced+ctor %u\n",
+            (uint32_t)tables.size(), ref, ctor, both);
+    fprintf(f, "live instances %s\n", g_live_ran ? "measured above" : "NOT MEASURED here");
+    fprintf(f, "runs merged into the previous table: %u of %u candidates\n", merged, cand);
+    fprintf(f, "after merging, tables whose slot vector repeats an earlier table: %u\n", dup);
     fclose(f);
     RCL_LOGLN("[deep] confidence: ref=%u ctor=%u live=%u merged=%u dup=%u", ref, ctor, live, merged,
               dup);
@@ -1688,11 +1712,12 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     write_all_offsets(tables, slots, fns, gh, root);
     data_refs(img, L, tabs);
     expand_calls(fns);
-    const uint32_t merged = merge_runs(tables);
+    uint32_t merge_cand = 0;
+    const uint32_t merged = merge_runs(img, tables, starts, &merge_cand);
     const uint32_t dup = dup_tables(img, tables);
     live_census(img, tabs);
-    RCL_LOGLN("[deep] refs=%zu ctor_installs=%zu live_tables=%zu merged=%u dup=%u", g_table_ref.size(),
-              g_ctor_table.size(), g_table_inst.size(), merged, dup);
+    RCL_LOGLN("[deep] refs=%zu ctor_installs=%zu live_tables=%zu merged=%u of %u dup=%u",
+              g_table_ref.size(), g_ctor_table.size(), g_table_inst.size(), merged, merge_cand, dup);
     build_unique_strings();
     RCL_LOGLN("[deep] class-specific reference strings: %zu", g_unique_str.size());
     uint32_t str_fns = 0;
@@ -1715,7 +1740,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     std::vector<RegPair> reg;
     scan_registry(img, L, tables, reg);
     write_registry(reg, root);
-    write_confidence(tables, root, merged, dup);
+    write_confidence(tables, root, merged, merge_cand, dup);
     external_align(root);
     import_foreign_names(img, root);
     write_table_names(tables, root);

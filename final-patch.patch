@@ -1,5 +1,5 @@
 diff --git a/Sources/rcl_classdump.cpp b/Sources/rcl_classdump.cpp
-index b396a6c..6dc9038 100644
+index b396a6c..d60977d 100644
 --- a/Sources/rcl_classdump.cpp
 +++ b/Sources/rcl_classdump.cpp
 @@ -4,8 +4,10 @@
@@ -96,13 +96,15 @@ index b396a6c..6dc9038 100644
      std::vector<uint32_t> fields;
  };
  
-@@ -642,13 +650,40 @@ uint32_t adrp_imm(uint32_t w) {
+@@ -642,13 +650,42 @@ uint32_t adrp_imm(uint32_t w) {
      return (uint32_t)(imm << 12);
  }
  
 +std::set<uint32_t> g_table_ref;
 +std::set<uint32_t> g_ctor_table;
 +std::map<uint32_t, uint32_t> g_table_inst;
++std::set<uint32_t> g_table_merged;
++bool g_live_ran = false;
 +
 +uint32_t fn_of_any(const std::vector<uint32_t> &starts, const std::vector<uint32_t> &alt,
 +                    uint32_t rva) {
@@ -138,7 +140,7 @@ index b396a6c..6dc9038 100644
          if ((w0 & 0x9F000000u) != 0x90000000u) {
              uint32_t kind = w0 & 0xFFC00000u;
              if ((kind == 0xB9400000u || kind == 0xB9000000u || kind == 0xF9400000u ||
-@@ -657,7 +692,7 @@ void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &s
+@@ -657,7 +694,7 @@ void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &s
                  bool word = (kind == 0xB9400000u || kind == 0xB9000000u);
                  uint32_t off = ((w0 >> 10) & 0xFFFu) << (word ? 2 : 3);
                  if (off >= 8 && off < 0x1000) {
@@ -147,7 +149,7 @@ index b396a6c..6dc9038 100644
                      if (fn && slots.has(fn)) {
                          FnAgg &a = fns[fn];
                          if (a.fields.size() < 48 &&
-@@ -678,12 +713,31 @@ void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &s
+@@ -678,12 +715,31 @@ void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &s
              bool isldr = (wk & 0xFFC00000u) == 0xF9400000u && ((wk >> 5) & 31u) == rd;
              if (!isadd && !isldr) continue;
              uint32_t target = (uint32_t)(page + ((wk >> 10) & 0xFFFu));
@@ -180,7 +182,7 @@ index b396a6c..6dc9038 100644
              break;
          }
      }
-@@ -749,9 +803,12 @@ void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slo
+@@ -749,9 +805,12 @@ void write_all_offsets(const std::vector<ClassTable> &tables, const SlotMap &slo
      FILE *f = fopen(path, "w");
      if (!f) return;
      fprintf(f, "# every offset this build can find, in one file\n\n");
@@ -195,7 +197,7 @@ index b396a6c..6dc9038 100644
      fprintf(f, "| class | table (vt) | slots | slots named by string | field candidates |\n");
      fprintf(f, "|-------|-----------|-------|----------------------|------------------|\n");
      for (size_t i = 0; i < tables.size(); i++) {
-@@ -779,28 +836,106 @@ struct DeepSummary {
+@@ -779,28 +838,106 @@ struct DeepSummary {
      uint32_t named = 0;
      uint32_t tables = 0;
      uint32_t slots = 0;
@@ -308,7 +310,7 @@ index b396a6c..6dc9038 100644
          }
          uint32_t best = 0;
          std::string bestn;
-@@ -809,8 +944,645 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
+@@ -809,8 +946,667 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
                  best = it->second;
                  bestn = it->first;
              }
@@ -677,7 +679,7 @@ index b396a6c..6dc9038 100644
 +        size_t l = strlen(line);
 +        while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
 +        if (l) n++;
-+    }
+     }
 +    fclose(in);
 +    fprintf(f, "%u names read\n", n);
 +    fclose(f);
@@ -761,7 +763,7 @@ index b396a6c..6dc9038 100644
 +        if (!ok || !delta) break;
 +        rva += delta;
 +        out.push_back(rva);
-     }
++    }
 +    return !out.empty();
 +}
 +
@@ -799,21 +801,39 @@ index b396a6c..6dc9038 100644
 +    }
 +}
 +
-+uint32_t merge_runs(const std::vector<ClassTable> &tables) {
++bool all_slots_are_starts(const Image &img, const ClassTable &t, const std::vector<uint32_t> &starts,
++                          std::vector<uint32_t> &sv) {
++    slots_of(img, t, sv, 256);
++    for (size_t k = 0; k < sv.size(); k++) {
++        bool exact = false;
++        fn_of(starts, sv[k], &exact);
++        if (!exact) return false;
++    }
++    return true;
++}
++
++uint32_t merge_runs(const Image &img, const std::vector<ClassTable> &tables,
++                    const std::vector<uint32_t> &starts, uint32_t *out_cand) {
 +    std::vector<const ClassTable *> by;
 +    by.reserve(tables.size());
 +    for (size_t i = 0; i < tables.size(); i++) by.push_back(&tables[i]);
 +    std::sort(by.begin(), by.end(),
 +              [](const ClassTable *a, const ClassTable *b) { return a->start < b->start; });
-+    uint32_t n = 0;
++    uint32_t cand = 0, applied = 0;
++    std::vector<uint32_t> sv;
 +    for (size_t i = 1; i < by.size(); i++) {
 +        const uint64_t end = by[i - 1]->start + (uint64_t)by[i - 1]->slots * 8;
 +        if (by[i]->start < end) continue;
 +        if (by[i]->start - end > 0x20) continue;
 +        if (by[i - 1]->slots + by[i]->slots > 256) continue;
-+        n++;
++        cand++;
++        if (!all_slots_are_starts(img, *by[i - 1], starts, sv)) continue;
++        if (!all_slots_are_starts(img, *by[i], starts, sv)) continue;
++        applied++;
++        g_table_merged.insert(by[i]->start);
 +    }
-+    return n;
++    if (out_cand) *out_cand = cand;
++    return applied;
 +}
 +
 +uint32_t dup_tables(const Image &img, const std::vector<ClassTable> &tables) {
@@ -821,6 +841,7 @@ index b396a6c..6dc9038 100644
 +    std::vector<uint32_t> sv;
 +    uint32_t dup = 0;
 +    for (size_t i = 0; i < tables.size(); i++) {
++        if (g_table_merged.count(tables[i].start)) continue;
 +        slots_of(img, tables[i], sv, 64);
 +        std::string key((const char *)sv.data(), sv.size() * sizeof(uint32_t));
 +        if (seen.count(key)) dup++;
@@ -912,13 +933,14 @@ index b396a6c..6dc9038 100644
 +        size = 0;
 +        cnt = 9;
 +    }
++    g_live_ran = true;
 +}
 +#else
 +void live_census(const Image &, const std::vector<uint32_t> &) {}
 +#endif
 +
 +void write_confidence(const std::vector<ClassTable> &tables, const char *root, uint32_t merged,
-+                      uint32_t dup) {
++                      uint32_t cand, uint32_t dup) {
 +    char path[1024];
 +    snprintf(path, sizeof path, "%s/_confidence.md", root);
 +    FILE *f = fopen(path, "w");
@@ -941,21 +963,23 @@ index b396a6c..6dc9038 100644
 +        if (r && c) both++;
 +        const char *nm = name_of_table(t.start);
 +        if (r || c || n)
-+            fprintf(f, "| `%#x` | %u | %s | %s | %s | %u |\n", t.start, t.slots, nm ? nm : "?",
-+                    r ? "yes" : "-", c ? "yes" : "-", n);
++            fprintf(f, "| `%#x` | %u | %s | %s | %s | %s |%s\n", t.start, t.slots, nm ? nm : "?",
++                    r ? "yes" : "-", c ? "yes" : "-",
++                    g_live_ran ? (n ? "instances" : "-") : "not measured",
++                    g_table_merged.count(t.start) ? " merged" : "");
 +    }
-+    fprintf(f, "\n%u tables, referenced %u, ctor installed %u, live instances %u, "
-+               "referenced+ctor %u\n",
-+            (uint32_t)tables.size(), ref, ctor, live, both);
-+    fprintf(f, "adjacent runs separable into one table: %u\n", merged);
-+    fprintf(f, "tables whose slot vector repeats an earlier table: %u\n", dup);
++    fprintf(f, "\n%u tables, referenced %u, ctor installed %u, referenced+ctor %u\n",
++            (uint32_t)tables.size(), ref, ctor, both);
++    fprintf(f, "live instances %s\n", g_live_ran ? "measured above" : "NOT MEASURED here");
++    fprintf(f, "runs merged into the previous table: %u of %u candidates\n", merged, cand);
++    fprintf(f, "after merging, tables whose slot vector repeats an earlier table: %u\n", dup);
 +    fclose(f);
 +    RCL_LOGLN("[deep] confidence: ref=%u ctor=%u live=%u merged=%u dup=%u", ref, ctor, live, merged,
 +              dup);
  }
  
  void write_table_names(const std::vector<ClassTable> &tables, const char *root) {
-@@ -821,21 +1593,29 @@ void write_table_names(const std::vector<ClassTable> &tables, const char *root)
+@@ -821,21 +1617,29 @@ void write_table_names(const std::vector<ClassTable> &tables, const char *root)
      fprintf(f, "# class table -> class name, resolved from the strings its functions reference\n\n");
      fprintf(f, "| table rva | slots | class | source |\n|-----------|-------|-------|--------|\n");
      uint32_t named = 0;
@@ -990,7 +1014,7 @@ index b396a6c..6dc9038 100644
  }
  
  void write_unknown_named(const Image &img, const std::vector<StrEnt> &strs,
-@@ -874,8 +1654,22 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+@@ -874,8 +1678,22 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
                     const char *root) {
      mkdir(root, 0755);
      const std::vector<uint32_t> starts = build_starts(img, L);
@@ -1013,7 +1037,7 @@ index b396a6c..6dc9038 100644
      slots.sorted.reserve(32768);
      slots.table_of.reserve(32768);
      for (size_t i = 0; i < tables.size(); i++)
-@@ -886,30 +1680,66 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
+@@ -886,30 +1704,67 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
          }
      finish_slot_map(slots);
      std::map<uint32_t, FnAgg> fns;
@@ -1026,11 +1050,12 @@ index b396a6c..6dc9038 100644
      write_all_offsets(tables, slots, fns, gh, root);
 +    data_refs(img, L, tabs);
 +    expand_calls(fns);
-+    const uint32_t merged = merge_runs(tables);
++    uint32_t merge_cand = 0;
++    const uint32_t merged = merge_runs(img, tables, starts, &merge_cand);
 +    const uint32_t dup = dup_tables(img, tables);
 +    live_census(img, tabs);
-+    RCL_LOGLN("[deep] refs=%zu ctor_installs=%zu live_tables=%zu merged=%u dup=%u", g_table_ref.size(),
-+              g_ctor_table.size(), g_table_inst.size(), merged, dup);
++    RCL_LOGLN("[deep] refs=%zu ctor_installs=%zu live_tables=%zu merged=%u of %u dup=%u",
++              g_table_ref.size(), g_ctor_table.size(), g_table_inst.size(), merged, merge_cand, dup);
      build_unique_strings();
      RCL_LOGLN("[deep] class-specific reference strings: %zu", g_unique_str.size());
 +    uint32_t str_fns = 0;
@@ -1053,7 +1078,7 @@ index b396a6c..6dc9038 100644
 +    std::vector<RegPair> reg;
 +    scan_registry(img, L, tables, reg);
 +    write_registry(reg, root);
-+    write_confidence(tables, root, merged, dup);
++    write_confidence(tables, root, merged, merge_cand, dup);
 +    external_align(root);
 +    import_foreign_names(img, root);
      write_table_names(tables, root);
@@ -1086,7 +1111,7 @@ index b396a6c..6dc9038 100644
  }
  
  }  // namespace
-@@ -1220,10 +2050,13 @@ void write_class_docs(const Image &img) {
+@@ -1220,10 +2075,13 @@ void write_class_docs(const Image &img) {
          fprintf(dg, "- tables %zu (strict %u, loose %u, loose words %llu)  class files %u  "
                      "table files %u\n", ix.tables.size(), st.tables_strict, st.tables_loose,
                  (unsigned long long)st.loose_words, files, unknown);
