@@ -7,6 +7,7 @@
 #include "rcl_tablenames.h"
 #include <algorithm>
 #include <map>
+#include <set>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -639,6 +640,7 @@ struct FnAgg {
     uint32_t first_string = 0;
     uint32_t table = 0;
     std::vector<uint32_t> str_list;
+    std::vector<uint32_t> calls;
     std::vector<uint32_t> fields;
 };
 
@@ -647,6 +649,10 @@ uint32_t adrp_imm(uint32_t w) {
     if (imm & 0x100000) imm -= 0x200000;
     return (uint32_t)(imm << 12);
 }
+
+std::set<uint32_t> g_table_ref;
+std::set<uint32_t> g_ctor_table;
+std::map<uint32_t, uint32_t> g_table_inst;
 
 uint32_t fn_of_any(const std::vector<uint32_t> &starts, const std::vector<uint32_t> &alt,
                     uint32_t rva) {
@@ -657,11 +663,27 @@ uint32_t fn_of_any(const std::vector<uint32_t> &starts, const std::vector<uint32
 
 void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &starts,
                const std::vector<uint32_t> &alt, const std::vector<StrEnt> &strs,
-               const SlotMap &slots, std::map<uint32_t, FnAgg> &fns) {
+               const SlotMap &slots, const std::vector<uint32_t> &tabs,
+               std::map<uint32_t, FnAgg> &fns) {
     for (uint64_t va = L.code_lo; va + 16 <= L.code_hi; va += 4) {
         uint32_t w0 = 0;
         if (!at(img, va, &w0, 4)) break;
         uint32_t rva = (uint32_t)(va - img.base);
+        if ((w0 & 0xFC000000u) == 0x94000000u) {
+            int32_t bimm = (int32_t)(w0 & 0x03FFFFFFu);
+            if (bimm & 0x02000000) bimm -= 0x04000000;
+            int64_t bt = (int64_t)rva + (int64_t)bimm * 4;
+            if (bt >= 0 && bt < (int64_t)(L.code_hi - img.base)) {
+                uint32_t cf = fn_of_any(starts, alt, rva);
+                if (cf && slots.has(cf)) {
+                    FnAgg &ca = fns[cf];
+                    if (ca.calls.size() < 8 &&
+                        std::find(ca.calls.begin(), ca.calls.end(), (uint32_t)bt) == ca.calls.end())
+                        ca.calls.push_back((uint32_t)bt);
+                }
+            }
+            continue;
+        }
         if ((w0 & 0x9F000000u) != 0x90000000u) {
             uint32_t kind = w0 & 0xFFC00000u;
             if ((kind == 0xB9400000u || kind == 0xB9000000u || kind == 0xF9400000u ||
@@ -691,6 +713,18 @@ void code_pass(const Image &img, const Layout &L, const std::vector<uint32_t> &s
             bool isldr = (wk & 0xFFC00000u) == 0xF9400000u && ((wk >> 5) & 31u) == rd;
             if (!isadd && !isldr) continue;
             uint32_t target = (uint32_t)(page + ((wk >> 10) & 0xFFFu));
+            if (std::binary_search(tabs.begin(), tabs.end(), target)) {
+                g_table_ref.insert(target);
+                if (isadd) {
+                    for (int q = 1; q <= 3 && k + q <= 3; q++) {
+                        uint32_t ws = 0;
+                        if (!at(img, va + (uint64_t)(k + q) * 4, &ws, 4)) break;
+                        if ((ws & 0xFFC00000u) != 0xF9000000u) continue;
+                        if (((ws >> 10) & 0xFFFu) == 0) g_ctor_table.insert(target);
+                        break;
+                    }
+                }
+            }
             if (!find_str(strs, target)) continue;
             uint32_t fn = fn_of(starts, rva, nullptr);
             if (!fn || !slots.has(fn)) {
@@ -807,12 +841,14 @@ struct DeepSummary {
     uint32_t families = 0;
     uint32_t registry = 0;
     uint32_t sandwiched = 0;
+    uint32_t tu_clustered = 0;
 };
 
 DeepSummary g_deep;
 
 std::map<uint32_t, std::string> g_table_family;
 std::map<uint32_t, const char *> g_table_src;
+
 
 typedef std::map<uint32_t, std::pair<std::string, const char *>> CandMap;
 
@@ -1358,6 +1394,192 @@ bool lc_function_starts(const Image &img, const Layout &L, std::vector<uint32_t>
     return !out.empty();
 }
 
+
+void data_refs(const Image &img, const Layout &L, const std::vector<uint32_t> &tabs) {
+    for (int i = 0; i < L.data_n; i++) {
+        for (uint64_t va = L.data[i].start; va + 8 <= L.data[i].end; va += 8) {
+            uint64_t raw = 0;
+            if (!at(img, va, &raw, sizeof(raw))) break;
+            uint32_t r = (uint32_t)((raw & 0xFFFFFFFFFULL) - img.base);
+            if (std::binary_search(tabs.begin(), tabs.end(), r)) g_table_ref.insert(r);
+        }
+    }
+}
+
+void expand_calls(std::map<uint32_t, FnAgg> &fns) {
+    std::map<uint32_t, std::vector<uint32_t>> add;
+    for (std::map<uint32_t, FnAgg>::iterator it = fns.begin(); it != fns.end(); ++it) {
+        for (size_t c = 0; c < it->second.calls.size(); c++) {
+            std::map<uint32_t, FnAgg>::const_iterator ci = fns.find(it->second.calls[c]);
+            if (ci == fns.end()) continue;
+            for (size_t k = 0; k < ci->second.str_list.size(); k++) {
+                uint32_t v = ci->second.str_list[k];
+                if (std::find(it->second.str_list.begin(), it->second.str_list.end(), v) !=
+                    it->second.str_list.end())
+                    continue;
+                add[it->first].push_back(v);
+            }
+        }
+    }
+    for (std::map<uint32_t, std::vector<uint32_t>>::iterator it = add.begin(); it != add.end(); ++it) {
+        FnAgg &a = fns[it->first];
+        for (size_t k = 0; k < it->second.size() && a.str_list.size() < 24; k++)
+            a.str_list.push_back(it->second[k]);
+    }
+}
+
+uint32_t merge_runs(const std::vector<ClassTable> &tables) {
+    std::vector<const ClassTable *> by;
+    by.reserve(tables.size());
+    for (size_t i = 0; i < tables.size(); i++) by.push_back(&tables[i]);
+    std::sort(by.begin(), by.end(),
+              [](const ClassTable *a, const ClassTable *b) { return a->start < b->start; });
+    uint32_t n = 0;
+    for (size_t i = 1; i < by.size(); i++)
+        if (by[i - 1]->start + (uint64_t)by[i - 1]->slots * 8 == by[i]->start &&
+            by[i - 1]->slots < 8 && by[i]->slots < 8)
+            n++;
+    return n;
+}
+
+uint32_t dup_tables(const Image &img, const std::vector<ClassTable> &tables) {
+    std::map<std::string, uint32_t> seen;
+    std::vector<uint32_t> sv;
+    uint32_t dup = 0;
+    for (size_t i = 0; i < tables.size(); i++) {
+        slots_of(img, tables[i], sv, 64);
+        std::string key((const char *)sv.data(), sv.size() * sizeof(uint32_t));
+        if (seen.count(key)) dup++;
+        else seen[key] = tables[i].start;
+    }
+    return dup;
+}
+
+void tu_cluster(const Image &img, const std::vector<ClassTable> &tables, uint32_t *out) {
+    std::map<uint32_t, std::vector<uint32_t>> sv;
+    std::vector<uint32_t> tmp;
+    std::vector<uint32_t> seeds;
+    for (size_t i = 0; i < tables.size(); i++) {
+        slots_of(img, tables[i], tmp, 64);
+        sv[tables[i].start] = tmp;
+        if (tables[i].start == 0) continue;
+    }
+    std::map<uint32_t, const char *> known;
+    for (std::map<uint32_t, std::string>::iterator it = g_table_family.begin(); it != g_table_family.end(); ++it)
+        known[it->first] = it->second.c_str();
+    for (std::map<uint32_t, std::string>::iterator it = g_table_class.begin(); it != g_table_class.end(); ++it)
+        known[it->first] = it->second.c_str();
+    for (std::map<uint32_t, const char *>::iterator it = known.begin(); it != known.end(); ++it)
+        seeds.push_back(it->first);
+    uint32_t hits = 0;
+    for (std::map<uint32_t, std::vector<uint32_t>>::iterator it = sv.begin(); it != sv.end(); ++it) {
+        if (known.count(it->first) || it->second.empty()) continue;
+        uint32_t best = 0xFFFFFFFFu;
+        const char *bestn = nullptr;
+        for (size_t k = 0; k < seeds.size(); k++) {
+            const std::vector<uint32_t> &o = sv[seeds[k]];
+            if (o.empty()) continue;
+            size_t a = 0, b = 0;
+            uint32_t d = 0xFFFFFFFFu, n = 0;
+            while (a < it->second.size() && b < o.size() && n < 3) {
+                uint32_t x = it->second[a] > o[b] ? it->second[a] - o[b] : o[b] - it->second[a];
+                if (x < d) d = x;
+                if (it->second[a] < o[b]) a++;
+                else b++;
+                n++;
+            }
+            if (d < best) {
+                best = d;
+                bestn = known[seeds[k]];
+            }
+        }
+        if (bestn && best < 0x800) {
+            g_table_family[it->first] = bestn;
+            hits++;
+        }
+    }
+    if (out) *out = hits;
+}
+
+#if defined(__APPLE__)
+extern "C" int mach_vm_region(unsigned int task, unsigned long long *address,
+                              unsigned long long *size, int flavor, void *info,
+                              unsigned int *count);
+struct VmRegion64 {
+    unsigned long long protection;
+    unsigned long long max_protection;
+    unsigned int inheritance;
+    unsigned int shared;
+    unsigned int reserved;
+    unsigned int offset;
+    unsigned int behavior;
+    unsigned int user_wired_count;
+};
+void live_census(const Image &img, const std::vector<uint32_t> &tabs) {
+    if (tabs.empty()) return;
+    unsigned long long addr = 0, size = 0;
+    VmRegion64 info;
+    unsigned int cnt = 9;
+    int guard = 0;
+    while (guard < 6000 && mach_vm_region(mach_task_self_, &addr, &size, 9, &info, &cnt) == 0) {
+        if (size >= 0x1000 && size <= 0x4000000ULL && info.protection == 3) {
+            for (unsigned long long a = addr; a + 8 <= addr + size; a += 8) {
+                uint64_t w = 0;
+                unsigned long long got = 0;
+                if (mach_vm_read_overwrite(mach_task_self_, a, 8, (unsigned long long)&w, &got) != 0)
+                    break;
+                uint32_t r = (uint32_t)((w & 0xFFFFFFFFFULL) - img.base);
+                if (r < 0x1200000u && std::binary_search(tabs.begin(), tabs.end(), r))
+                    g_table_inst[r]++;
+            }
+        }
+        guard++;
+        addr += size ? size : 0x1000;
+        size = 0;
+        cnt = 9;
+    }
+}
+#else
+void live_census(const Image &, const std::vector<uint32_t> &) {}
+#endif
+
+void write_confidence(const std::vector<ClassTable> &tables, const char *root, uint32_t merged,
+                      uint32_t dup) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/_confidence.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# which tables are real classes, in three independent tests\n\n"
+               "a table is a class when the image references it, a constructor installs it, "
+               "or a live object carries it\n\n");
+    fprintf(f, "| table rva | slots | class | referenced | ctor | instances |\n"
+               "|-----------|-------|-------|------------|------|-----------|\n");
+    uint32_t ref = 0, ctor = 0, live = 0, both = 0;
+    for (size_t i = 0; i < tables.size(); i++) {
+        const ClassTable &t = tables[i];
+        const bool r = g_table_ref.count(t.start) != 0;
+        const bool c = g_ctor_table.count(t.start) != 0;
+        std::map<uint32_t, uint32_t>::const_iterator ii = g_table_inst.find(t.start);
+        const uint32_t n = ii == g_table_inst.end() ? 0 : ii->second;
+        if (r) ref++;
+        if (c) ctor++;
+        if (n) live++;
+        if (r && c) both++;
+        const char *nm = name_of_table(t.start);
+        if (r || c || n)
+            fprintf(f, "| `%#x` | %u | %s | %s | %s | %u |\n", t.start, t.slots, nm ? nm : "?",
+                    r ? "yes" : "-", c ? "yes" : "-", n);
+    }
+    fprintf(f, "\n%u tables, referenced %u, ctor installed %u, live instances %u, "
+               "referenced+ctor %u\n",
+            (uint32_t)tables.size(), ref, ctor, live, both);
+    fprintf(f, "adjacent runs separable into one table: %u\n", merged);
+    fprintf(f, "tables whose slot vector repeats an earlier table: %u\n", dup);
+    fclose(f);
+    RCL_LOGLN("[deep] confidence: ref=%u ctor=%u live=%u merged=%u dup=%u", ref, ctor, live, merged,
+              dup);
+}
+
 void write_table_names(const std::vector<ClassTable> &tables, const char *root) {
     char path[1024];
     snprintf(path, sizeof path, "%s/_table_names.md", root);
@@ -1439,6 +1661,10 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
               starts.size(), alt.size(), lcs_ok ? lcs.size() : 0, brs.size());
     const std::vector<StrEnt> strs = build_strings(img, L);
     SlotMap slots;
+    std::vector<uint32_t> tabs;
+    for (size_t i = 0; i < tables.size(); i++) tabs.push_back(tables[i].start);
+    std::sort(tabs.begin(), tabs.end());
+    tabs.erase(std::unique(tabs.begin(), tabs.end()), tabs.end());
     slots.sorted.reserve(32768);
     slots.table_of.reserve(32768);
     for (size_t i = 0; i < tables.size(); i++)
@@ -1449,12 +1675,19 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
         }
     finish_slot_map(slots);
     std::map<uint32_t, FnAgg> fns;
-    code_pass(img, L, starts, alt, strs, slots, fns);
+    code_pass(img, L, starts, alt, strs, slots, tabs, fns);
     std::vector<GlobalHit> gh;
     scan_globals(img, L, tables, gh);
     write_strings(img, strs, fns, root);
     write_fields(fns, root);
     write_all_offsets(tables, slots, fns, gh, root);
+    data_refs(img, L, tabs);
+    expand_calls(fns);
+    const uint32_t merged = merge_runs(tables);
+    const uint32_t dup = dup_tables(img, tables);
+    live_census(img, tabs);
+    RCL_LOGLN("[deep] refs=%zu ctor_installs=%zu live_tables=%zu merged=%u dup=%u", g_table_ref.size(),
+              g_ctor_table.size(), g_table_inst.size(), merged, dup);
     build_unique_strings();
     RCL_LOGLN("[deep] class-specific reference strings: %zu", g_unique_str.size());
     uint32_t str_fns = 0;
@@ -1467,6 +1700,8 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     apply_seeds(&seeded);
     uint32_t families = 0;
     cluster_families(img, tables, root, &families);
+    uint32_t tu = 0;
+    tu_cluster(img, tables, &tu);
     std::vector<Sandw> sw;
     uint32_t blocks = 0, ordered = 0;
     sandwiches(tables, sw, &blocks, &ordered);
@@ -1475,6 +1710,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     std::vector<RegPair> reg;
     scan_registry(img, L, tables, reg);
     write_registry(reg, root);
+    write_confidence(tables, root, merged, dup);
     external_align(root);
     import_foreign_names(img, root);
     write_table_names(tables, root);
@@ -1492,6 +1728,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     g_deep.seeded = seeded;
     g_deep.families = families;
     g_deep.registry = (uint32_t)reg.size();
+    g_deep.tu_clustered = tu;
     g_deep.sandwiched = 0;
     for (size_t i = 0; i < sw.size(); i++) g_deep.sandwiched += (uint32_t)sw[i].vts.size();
     RCL_LOGLN("[deep] starts=%zu strings=%zu slots=%zu str_fns=%u globals=%zu tables=%zu "
@@ -1812,9 +2049,9 @@ void write_class_docs(const Image &img) {
                     "tables %u\n",
                 g_deep.starts, g_deep.strings, g_deep.anchored, g_deep.globals, g_deep.tables);
         fprintf(dg, "- names: total %u of %u | method index %u | offline seed %u | families %u | "
-                    "order constrained %u | registry pairs %u\n",
+                    "order constrained %u | registry pairs %u | tu clustered %u\n",
                 g_deep.named, g_deep.tables, g_deep.method_named, g_deep.seeded, g_deep.families,
-                g_deep.sandwiched, g_deep.registry);
+                g_deep.sandwiched, g_deep.registry, g_deep.tu_clustered);
         fclose(dg);
     }
 
