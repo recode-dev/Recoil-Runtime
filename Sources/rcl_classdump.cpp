@@ -2944,6 +2944,12 @@ void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
 
 } // namespace
 
+const char *rcl_table_label(uint32_t rva)
+{
+    const char *n = name_of_table(rva);
+    return (n && *n) ? n : nullptr;
+}
+
 void dump_class_tree(const Image &img)
 {
     live_boot(img);

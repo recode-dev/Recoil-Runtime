@@ -11,6 +11,7 @@
 #include "rcl_names_live.h"
 
 #include <dirent.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1110,6 +1111,8 @@ uint64_t g_bc_open_players = 0;
 uint32_t g_bc_open_count = 0;
 uint32_t g_bc_peak_count = 0;
 uint64_t g_bc_battle_polls = 0;
+uint64_t g_bc_polls = 0;
+uint32_t g_bc_budget_nodes = 0;
 std::map<uint64_t, uint32_t> g_bc_vt;
 std::map<uint64_t, char> g_bc_slot;
 std::map<uint64_t, uint64_t> g_bc_sample;
@@ -1279,6 +1282,10 @@ void bc_open_file(void)
     fflush(g_bc_f);
 }
 
+static uint32_t bc_walk_depth_max(void);
+static uint32_t bc_walk_nodes(void);
+static useconds_t bc_poll_us(void);
+
 void bc_open(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr)
 {
     bc_open_file();
@@ -1298,11 +1305,18 @@ void bc_open(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr)
     g_bc_battle_polls = 0;
     fprintf(g_bc_f, "# battle capture (Recoil-Runtime)\n");
     {
-        char msg[160];
-        snprintf(msg, sizeof msg, "Бой начался\nstate=%u count=%u\nscene=0x%llx\nplayers=0x%llx",
-                 g_bc_state, g_bc_pcount, (unsigned long long)g_bc_scene,
-                 (unsigned long long)g_bc_players);
-        alert_show("Recoil", msg);
+        char msg[320];
+        snprintf(msg, sizeof msg,
+                 "Бой начался\n"
+                 "state   %u\n"
+                 "игроки  %u\n"
+                 "scene   0x%llx\n"
+                 "players 0x%llx\n"
+                 "сбор    каждый poll (%u мс)\n"
+                 "обход   глубина %u, до %u узлов",
+                 state, g_bc_pcount, (unsigned long long)cur, (unsigned long long)g_bc_players,
+                 (unsigned)(bc_poll_us() / 1000), bc_walk_depth_max(), bc_walk_nodes());
+        alert_show("Recoil — бой", msg);
     }
     fprintf(g_bc_f, "image_base=0x%llx vmsize=0x%llx state=%u cur=0x%llx mgr=0x%llx\n",
             (unsigned long long)img.base,
@@ -1400,7 +1414,18 @@ static const char *bc_class_label(const Image &img, uint64_t vt, char *buf, size
         slots[n] = (uint32_t)(w - img.base);
     }
     uint32_t src = 0;
-    return nl_label((uint32_t)(vt - img.base), slots, n, buf, cap, &src);
+    const uint32_t rva = (uint32_t)(vt - img.base);
+    nl_label(rva, slots, n, buf, cap, &src);
+    if (src == NL_STRINGS || src == NL_ASSET || src == NL_METHOD_NAMES || src == NL_NONE)
+    {
+        const char *tbl = rcl_table_label(rva);
+        if (tbl && *tbl)
+        {
+            snprintf(buf, cap, "%s", tbl);
+            return buf;
+        }
+    }
+    return buf;
 }
 
 static void bc_class_order(std::vector<std::pair<uint32_t, uint64_t>> &out)
@@ -1683,23 +1708,76 @@ struct BcNode
     int depth;
 };
 
+static long bc_env(const char *name, long def, long lo, long hi)
+{
+    const char *e = getenv(name);
+    long v = (e && *e) ? atol(e) : def;
+    if (v < lo)
+        v = lo;
+    if (v > hi)
+        v = hi;
+    return v;
+}
+
+static uint32_t bc_walk_nodes(void)
+{
+    static uint32_t v = 0;
+    if (!v)
+        v = (uint32_t)bc_env("RCL_WALK_MAX", 12000, 64, 200000);
+    return v;
+}
+
+static uint32_t bc_walk_depth_max(void)
+{
+    static uint32_t v = 0;
+    if (!v)
+        v = (uint32_t)bc_env("RCL_WALK_DEPTH", 7, 1, 24);
+    return v;
+}
+
+static uint32_t bc_objects_scan(void)
+{
+    static uint32_t v = 0;
+    if (!v)
+        v = (uint32_t)bc_env("RCL_OBJ_SCAN", 8192, 16, 65536);
+    return v;
+}
+
+static uint32_t bc_players_max(void)
+{
+    static uint32_t v = 0;
+    if (!v)
+        v = (uint32_t)bc_env("RCL_PLAYERS", 64, 1, 256);
+    return v;
+}
+
+static useconds_t bc_poll_us(void)
+{
+    static long v = -1;
+    if (v < 0)
+        v = bc_env("RCL_POLL_MS", 50, 1, 1000) * 1000;
+    return (useconds_t)v;
+}
+
+#define kBcQueueMax 65536
+#define kBcTrackMax 8192
+
 static void bc_walk(const Image &img, uint64_t root, int maxDepth, int maxNodes)
 {
-    static BcNode q[8192];
+    static BcNode q[kBcQueueMax];
+    static std::set<uint64_t> seen;
     int n = 0;
     uint32_t walked = 0;
     if (!root)
         return;
+    seen.clear();
     auto push = [&](uint64_t a, uint32_t pc, uint32_t off, int d)
     {
         if (!bc_heap_ptr(img, a))
             return;
-        for (int i = 0; i < n; i++)
-        {
-            if (q[i].addr == a)
-                return;
-        }
-        if (n >= maxNodes || n >= 8192)
+        if (!seen.insert(a).second)
+            return;
+        if (n >= maxNodes || n >= kBcQueueMax)
             return;
         q[n].addr = a;
         q[n].pcls = pc;
@@ -1804,17 +1882,23 @@ static void bc_scan_globals(const Image &img)
     }
 }
 
-static void bc_collect(const Image &img, uint64_t cur, uint64_t mgr)
+static void bc_collect(const Image &img, uint64_t cur, uint64_t mgr, uint64_t arr, uint64_t players,
+                       int nodes)
 {
     if (!g_bc_roots)
     {
         g_bc_roots = true;
         bc_scan_globals(img);
     }
+    const int depth = (int)bc_walk_depth_max();
     if (cur)
-        bc_walk(img, cur, 6, 2048);
-    else if (mgr)
-        bc_walk(img, mgr, 6, 2048);
+        bc_walk(img, cur, depth, nodes);
+    if (mgr)
+        bc_walk(img, mgr, depth, nodes);
+    if (arr)
+        bc_walk(img, arr, depth, nodes);
+    if (players)
+        bc_walk(img, players, depth, nodes);
 }
 
 static uint32_t kind_lookup(const std::map<uint32_t, uint32_t> &m, uint32_t id)
@@ -2034,6 +2118,145 @@ static const char *bc_type_name(const char *label)
     if (bc_class_named(label))
         return "name";
     return bc_class_known(label) ? "string" : "vt";
+}
+
+struct BcClassRow
+{
+    uint32_t id;
+    uint32_t methods;
+    uint32_t named;
+    uint32_t fields;
+    uint32_t refs;
+    uint32_t arrays;
+    uint32_t globals;
+    uint32_t code;
+};
+
+static bool bc_row_better(const BcClassRow &a, const BcClassRow &b)
+{
+    if (a.named != b.named)
+        return a.named > b.named;
+    if (a.methods != b.methods)
+        return a.methods > b.methods;
+    if (a.fields != b.fields)
+        return a.fields > b.fields;
+    return a.id < b.id;
+}
+
+static void bc_write_classes(const Image &img, const char *root,
+                             const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                             const std::map<uint32_t, uint32_t> &kind_of,
+                             const std::map<uint32_t, std::string> &lbl)
+{
+    std::vector<BcClassRow> rows;
+    char path[1200];
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        BcClassRow r;
+        r.id = cls[c].first;
+        r.methods = 0;
+        r.named = 0;
+        r.fields = 0;
+        r.refs = 0;
+        r.arrays = 0;
+        r.globals = 0;
+        r.code = 0;
+        char cdir[900];
+        bc_class_dir(cdir, sizeof cdir, root, kind_lookup(kind_of, r.id),
+                     lbl.find(r.id)->second.c_str());
+        snprintf(path, sizeof path, "%s/offsets.tsv.md", cdir);
+        FILE *in = fopen(path, "r");
+        if (in)
+        {
+            char line[4096];
+            while (fgets(line, sizeof line, in))
+            {
+                if (line[0] == '#' || strncmp(line, "kind\t", 5) == 0)
+                    continue;
+                const std::vector<std::string> f = bc_split_tabs(line);
+                if (f.empty())
+                    continue;
+                if (f[0] == "method")
+                {
+                    r.methods++;
+                    if (bc_field(f, 7)[0])
+                        r.named++;
+                }
+                else if (f[0] == "field")
+                    r.fields++;
+                else if (f[0] == "ref")
+                    r.refs++;
+                else if (f[0] == "container")
+                    r.arrays++;
+                else if (f[0] == "global")
+                    r.globals++;
+                else if (f[0] == "access")
+                    r.code++;
+            }
+            fclose(in);
+        }
+        rows.push_back(r);
+    }
+    std::sort(rows.begin(), rows.end(), bc_row_better);
+
+    snprintf(path, sizeof path, "%s/CLASSES.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    uint32_t namedRows = 0;
+    uint32_t stringRows = 0;
+    uint32_t vtRows = 0;
+    uint32_t totalMethods = 0;
+    uint32_t totalNamed = 0;
+    size_t classesWithNamed = 0;
+    for (size_t i = 0; i < rows.size(); i++)
+    {
+        const std::string &lb = lbl.find(rows[i].id)->second;
+        const char *t = bc_type_name(lb.c_str());
+        if (strcmp(t, "name") == 0)
+            namedRows++;
+        else if (strcmp(t, "string") == 0)
+            stringRows++;
+        else
+            vtRows++;
+        totalMethods += rows[i].methods;
+        totalNamed += rows[i].named;
+        if (rows[i].named)
+            classesWithNamed++;
+    }
+    fprintf(f, "# every class of the battle dump, most readable first\n\n");
+    fprintf(f, "- entries `%zu`: `%u` named classes, `%u` string hits, `%u` unnamed vtables\n",
+            rows.size(), namedRows, stringRows, vtRows);
+    fprintf(f, "- method slots `%u`, of them named from the reference bundle `%u` in `%zu` "
+               "classes\n",
+            totalMethods, totalNamed, classesWithNamed);
+    fprintf(f, "- `named` counts the slots whose rva the reference bundle knows, so a class with "
+               "`named > 0` is the one to read first\n");
+    fprintf(f, "- a `string` row is a word that only pointed at a string (asset path, text id, "
+               "hash, host), not a class name\n");
+    fprintf(f, "- order: `named` desc, then slots, then fields; everything else is in "
+               "`BattleDumpAll.md`\n\n");
+    fprintf(f, "| class | type | kind | vtable rva | slots | named | fields | refs | arrays | "
+               "globals | code | search key | folder |\n");
+    fprintf(f, "|-------|------|------|-----------:|------:|------:|-------:|-----:|-------:|"
+               "--------:|-----:|------------|--------|\n");
+    for (size_t i = 0; i < rows.size(); i++)
+    {
+        const uint32_t id = rows[i].id;
+        const std::string &lb = lbl.find(id)->second;
+        const uint32_t kd = kind_lookup(kind_of, id);
+        char cdir[900];
+        bc_class_dir(cdir, sizeof cdir, root, kd, lb.c_str());
+        fprintf(f,
+                "| %s | %s | `%s` | `0x%llx` | %u | %u | %u | %u | %u | %u | %u | `%s` | "
+                "`%s` |\n",
+                lb.c_str(), bc_type_name(lb.c_str()), nl_kind_name(kd),
+                (unsigned long long)(bc_vt_of(id) ? bc_vt_of(id) - img.base : 0),
+                rows[i].methods, rows[i].named, rows[i].fields, rows[i].refs, rows[i].arrays,
+                rows[i].globals, rows[i].code, bc_search_key(lb.c_str()), cdir);
+    }
+    fclose(f);
+    RCL_LOGLN("[battle] class list written to %s", path);
 }
 
 static void bc_write_all(const Image &img, const char *root,
@@ -2523,6 +2746,7 @@ static void bc_write_offsets(const Image &img)
     }
     fclose(f);
     bc_write_all(img, root, cls, kind_of, lbl);
+    bc_write_classes(img, root, cls, kind_of, lbl);
     RCL_LOGLN("[battle] battle dump: %zu classes (%u known) in %s", cls.size(), known, root);
 }
 
@@ -2540,10 +2764,27 @@ void bc_close(void)
     }
     if (g_bc_classes > 0)
         bc_write_offsets(g_bc_img);
-    fprintf(g_bc_f, "# battle end poll=%llu classes=%u objects=%u fields=%u accessors=%u\n",
-            (unsigned long long)g_bc_tick, g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors);
-
+    fprintf(g_bc_f,
+            "# battle end poll=%llu classes=%u objects=%u fields=%u accessors=%u battle_polls=%llu "
+            "peak_players=%u polls=%llu\n",
+            (unsigned long long)g_bc_tick, g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors,
+            (unsigned long long)g_bc_battle_polls, g_bc_peak_count, (unsigned long long)g_bc_polls);
     fflush(g_bc_f);
+    {
+        char msg[320];
+        snprintf(msg, sizeof msg,
+                 "Дамп готов\n"
+                 "классов   %u\n"
+                 "объектов  %u\n"
+                 "полей     %u\n"
+                 "ссылок    %u\n"
+                 "в бою     %llu poll\n"
+                 "пик игроков %u\n"
+                 "файлы     Documents/BattleDump",
+                 g_bc_classes, g_bc_objects, g_bc_fields, (uint32_t)g_bc_access.size(),
+                 (unsigned long long)g_bc_battle_polls, g_bc_peak_count);
+        alert_show("Recoil — отчёт", msg);
+    }
     g_bc_active = false;
 }
 
@@ -2556,8 +2797,8 @@ struct BcPos
     int valid;
 };
 
-BcPos g_bc_prev[160];
-static uint64_t g_bc_pw[24][64];
+BcPos g_bc_prev[kBcTrackMax];
+static uint64_t g_bc_pw[256][64];
 
 int bc_container(uint64_t base, uint64_t *arrOut, uint32_t *countOut, uint32_t *capOut)
 {
@@ -2587,7 +2828,7 @@ int bc_container(uint64_t base, uint64_t *arrOut, uint32_t *countOut, uint32_t *
 
 void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint64_t arr, uint32_t n)
 {
-    BcPos next[160];
+    BcPos next[kBcTrackMax];
     uint32_t nextN = 0;
     uint32_t i = 0;
     uint32_t j = 0;
@@ -2605,8 +2846,11 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     bc_open_file();
     if (!g_bc_f)
         return;
+    uint32_t scanMax = bc_objects_scan();
+    if (n < scanMax)
+        scanMax = n;
     {
-        for (i = 0; i < n && i < 128; i++)
+        for (i = 0; i < n && i < scanMax; i++)
         {
             uint64_t obj = 0;
             uint64_t vt = 0;
@@ -2632,7 +2876,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
                 clsN++;
             }
         }
-        for (i = 0; i < n && i < 128; i++)
+        for (i = 0; i < n && i < scanMax; i++)
         {
             uint64_t obj = 0;
             uint64_t vt = 0;
@@ -2691,7 +2935,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             coordObjs++;
             if (instHere > maxInst)
                 maxInst = instHere;
-            if (nextN < 160)
+            if (nextN < kBcTrackMax)
             {
                 next[nextN].obj = obj;
                 next[nextN].off = off;
@@ -2719,7 +2963,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     if (players)
     {
         uint32_t e = 0;
-        for (e = 0; e < pCount && e < 24; e++)
+        for (e = 0; e < pCount && e < bc_players_max(); e++)
         {
             uint64_t obj = 0;
             uint64_t words[64];
@@ -2745,7 +2989,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     g_bc_state = state;
     g_bc_scene = cur;
     g_bc_last_n = n;
-    if ((g_bc_tick % 10) == 0)
+    if (inBattle || g_bc_active || (g_bc_tick % 10) == 0)
     {
         fprintf(g_bc_f,
                 "poll %llu state=%u scene=0x%llx players=0x%llx count=%u moved=%u n=%u coord=%u "
@@ -2781,16 +3025,32 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     if (!g_bc_active)
         return;
     g_bc_tick++;
-    if (inBattle && (g_bc_tick == 1 || (g_bc_tick % 120) == 0))
+    g_bc_polls++;
+    if (inBattle)
     {
+        const uint32_t before = g_bc_classes;
+        const uint32_t budget = g_bc_budget_nodes ? g_bc_budget_nodes : bc_walk_nodes();
+        struct timespec t0;
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        bc_collect(img, cur, mgr, arr, players, (int)budget);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const uint64_t walk_us = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000ull +
+                                 (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000ull;
+        if (walk_us > 20000ull && budget > 2048u)
+            g_bc_budget_nodes = budget / 2u;
+        else if (walk_us < 6000ull && budget < bc_walk_nodes())
+        {
+            const uint32_t up = budget + budget / 4u;
+            g_bc_budget_nodes = (up > bc_walk_nodes()) ? bc_walk_nodes() : up;
+        }
         fprintf(g_bc_f,
                 "# collect tick=%llu state=%u scene=0x%llx players=0x%llx count=%u "
-                "classes_before=%u\n",
-                (unsigned long long)g_bc_tick, state,
-                (unsigned long long)(cur ? (cur - img.base) : 0),
-                (unsigned long long)(players ? (players - img.base) : 0), pCount, g_bc_classes);
+                "objects=%u classes=%u new=%u nodes=%u walk_us=%llu\n",
+                (unsigned long long)g_bc_tick, state, (unsigned long long)(cur - img.base),
+                (unsigned long long)(players ? (players - img.base) : 0), pCount, n,
+                g_bc_classes, g_bc_classes - before, budget, (unsigned long long)walk_us);
         fflush(g_bc_f);
-        bc_collect(img, cur, mgr);
     }
     if (!g_bc_code && g_bc_tick >= 30)
     {
@@ -2887,7 +3147,7 @@ void battle_capture_autostart(const Image &img)
                     gsm = 0;
                 }
                 bc_poll(g_bc_img, state, scene, client, arr, n);
-                usleep(100000);
+                usleep(bc_poll_us());
             }
         })
         .detach();
