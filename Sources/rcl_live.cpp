@@ -10,6 +10,7 @@
 #include "rcl_names.h"
 #include "rcl_names_live.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1854,6 +1855,249 @@ static void bc_mkdir_p(const char *path)
     mkdir(buf, 0755);
 }
 
+static bool bc_class_is_string(const char *label)
+{
+    if (!label || !*label)
+        return true;
+    if (strncmp(label, "vt_", 3) == 0 || strncmp(label, "TID_", 4) == 0 ||
+        strncmp(label, "0x", 2) == 0 || label[0] == '%' || strncmp(label, "__", 2) == 0)
+        return true;
+    if (strchr(label, '.') || strchr(label, '#') || strchr(label, ':') || strchr(label, ' ') ||
+        strchr(label, '\t'))
+        return true;
+    const size_t n = strlen(label);
+    uint32_t digits = 0;
+    uint32_t hex = 0;
+    for (const char *p = label; *p; p++)
+    {
+        if (*p >= '0' && *p <= '9')
+            digits++;
+        else if ((*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))
+            hex++;
+    }
+    if (n && digits == n)
+        return true;
+    return n >= 32 && hex + digits == n;
+}
+
+static const char *bc_search_key(const char *label)
+{
+    const char *key = label;
+    for (const char *p = label; *p; p++)
+        if (*p == '/' || *p == '#')
+            key = p + 1;
+    return key;
+}
+
+static std::vector<std::string> bc_split_tabs(const char *line)
+{
+    std::vector<std::string> f;
+    const char *p = line;
+    for (;;)
+    {
+        const char *t = strchr(p, '\t');
+        const char *e = t ? t : p + strlen(p);
+        std::string s(p, (size_t)(e - p));
+        while (!s.empty() && (s[s.size() - 1] == '\n' || s[s.size() - 1] == '\r'))
+            s.erase(s.size() - 1);
+        f.push_back(s);
+        if (!t)
+            break;
+        p = t + 1;
+    }
+    return f;
+}
+
+static const char *bc_field(const std::vector<std::string> &f, size_t i)
+{
+    return (i < f.size()) ? f[i].c_str() : "";
+}
+
+static void bc_str_at(uint64_t va, char *out, size_t cap)
+{
+    size_t i = 0;
+    out[0] = 0;
+    for (; va && i + 1 < cap; i++)
+    {
+        char c = 0;
+        if (!bc_read(va + i, &c, 1) || !c)
+            break;
+        const unsigned char u = (unsigned char)c;
+        if (u < 32 || u > 126)
+        {
+            out[0] = 0;
+            return;
+        }
+        out[i] = c;
+    }
+    out[i] = 0;
+    if (i < 4)
+        out[0] = 0;
+}
+
+static void bc_all_copy(FILE *out, const char *path)
+{
+    FILE *in = fopen(path, "r");
+    if (!in)
+        return;
+    char line[2048];
+    bool started = false;
+    while (fgets(line, sizeof line, in))
+    {
+        if (strncmp(line, "# Battle offsets", 16) == 0 || strncmp(line, "- image base", 12) == 0 ||
+            strncmp(line, "- state ", 8) == 0 || strncmp(line, "- folder ", 9) == 0 ||
+            strncmp(line, "- class id ", 11) == 0 || strncmp(line, "- search key ", 13) == 0 ||
+            strncmp(line, "## class ", 9) == 0)
+            continue;
+        if (!started && line[0] == '\n')
+            continue;
+        started = true;
+        fputs(line, out);
+    }
+    fclose(in);
+}
+
+static void bc_all_rows(FILE *out, const char *path)
+{
+    FILE *in = fopen(path, "r");
+    if (!in)
+        return;
+    char line[4096];
+    while (fgets(line, sizeof line, in))
+    {
+        if (line[0] == '#' || strncmp(line, "kind\t", 5) == 0 || line[0] == '\n')
+            continue;
+        const std::vector<std::string> f = bc_split_tabs(line);
+        if (f.empty())
+            continue;
+        const std::string &t = f[0];
+        const char *kind = bc_field(f, 2);
+        if (t == "class")
+            fprintf(out, "| %s | vtable |  | `%s` | fp | `%s` | `%s` | `%s` |\n", kind,
+                    bc_field(f, 7), bc_field(f, 6), bc_field(f, 7), bc_field(f, 2));
+        else if (t == "method")
+            fprintf(out, "| %s | method | %s |  |  |  | `%s` | %s |\n", kind, bc_field(f, 3),
+                    bc_field(f, 6), bc_field(f, 7));
+        else if (t == "field")
+            fprintf(out, "| %s | field |  | `%s` | %s | `%s` |  | %s |\n", kind, bc_field(f, 4),
+                    bc_field(f, 5), bc_field(f, 6), bc_field(f, 8));
+        else if (t == "access")
+            fprintf(out, "| %s | code ref |  |  |  |  | `%s` |  |\n", kind, bc_field(f, 7));
+        else if (t == "ref")
+            fprintf(out, "| %s | member ref | %s | `%s` | %s |  |  | %s |\n", kind, bc_field(f, 3),
+                    bc_field(f, 4), bc_field(f, 5), bc_field(f, 8));
+        else if (t == "container")
+            fprintf(out, "| %s | array | %s | `%s` | %s | %s | `%s` | %s |\n", kind, bc_field(f, 3),
+                    bc_field(f, 4), bc_field(f, 5), bc_field(f, 6), bc_field(f, 7), bc_field(f, 8));
+        else if (t == "global")
+            fprintf(out, "| %s | global cell |  |  | %s |  | `%s` |  |\n", kind, bc_field(f, 5),
+                    bc_field(f, 7));
+    }
+    fclose(in);
+}
+
+static bool bc_class_named(const char *label)
+{
+    return bc_class_known(label) && !bc_class_is_string(label);
+}
+
+static void bc_write_all(const Image &img, const char *root,
+                         const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                         const std::map<uint32_t, uint32_t> &kind_of,
+                         const std::map<uint32_t, std::string> &lbl)
+{
+    char path[1200];
+    snprintf(path, sizeof path, "%s/BattleDumpAll.md", root);
+    FILE *out = fopen(path, "w");
+    if (!out)
+        return;
+
+    uint32_t names = 0;
+    uint32_t strings = 0;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        if (bc_class_named(lbl.find(cls[c].first)->second.c_str()))
+            names++;
+        else if (bc_class_known(lbl.find(cls[c].first)->second.c_str()))
+            strings++;
+    }
+
+    fprintf(out, "# BattleDump all\n\n");
+    fprintf(out, "Everything the battle dump wrote, in one file: every class and every row.\n\n");
+    fprintf(out, "- image base `0x%llx`, vmsize `0x%llx`, state `%u`, scene `0x%llx`, "
+                "players `0x%llx`, count `%u`, polls `%llu`\n",
+            (unsigned long long)img.base,
+            (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize), g_bc_state,
+            (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players, g_bc_pcount,
+            (unsigned long long)g_bc_tick);
+    fprintf(out,
+            "- classes `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
+            "member refs `%u`, arrays `%u`, globals `%u`\n",
+            g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors, (uint32_t)g_bc_access.size(),
+            (uint32_t)g_bc_ref.size(), (uint32_t)g_bc_arr.size(), (uint32_t)g_bc_cell.size());
+    fprintf(out, "- entries `%zu`: `%u` named classes, `%u` strings that are not classes, "
+                 "`%zu` unnamed vtables\n\n",
+            cls.size(), names, strings, cls.size() - names - strings);
+    fprintf(out, "## how to read this\n\n");
+    fprintf(out, "- `type` is `name` for an entry the discovery named as a class, `string` when "
+                 "the word only pointed at a string (asset path, text id, hash, host), `vt` when "
+                 "nothing named it.\n");
+    fprintf(out, "- `vtable` rows give the class table rva and its first function pointer; "
+                 "`method` rows are the slots of that table.\n");
+    fprintf(out, "- `field` rows are offsets seen being read/written on live objects, `member ref` "
+                 "and `array` rows are offsets holding a pointer to / an array of another class.\n");
+    fprintf(out, "- `code ref` rows are code addresses that touch the class, `global cell` rows "
+                 "are data cells holding one of its objects.\n");
+    fprintf(out, "- search by the last path component of a label (the `search key`) - a plain "
+                 "`LogicBattleModeClient` or `getX` grep works here.\n\n");
+
+    fprintf(out, "## every row\n\n");
+    fprintf(out, "| class | type | slot | off | hint | value | rva | name |\n");
+    fprintf(out, "|-------|------|-----:|-----|------|-------|-----|------|\n");
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        char cdir[900];
+        bc_class_dir(cdir, sizeof cdir, root, kind_lookup(kind_of, cls[c].first),
+                     lbl.find(cls[c].first)->second.c_str());
+        snprintf(path, sizeof path, "%s/offsets.tsv.md", cdir);
+        bc_all_rows(out, path);
+    }
+
+    fprintf(out, "\n## index\n\n");
+    fprintf(out, "| class id | kind | state | type | folder | label |\n");
+    fprintf(out, "|---------:|------|-------|------|--------|-------|\n");
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t id = cls[c].first;
+        const std::string &lb = lbl.find(id)->second;
+        const uint32_t kd = kind_lookup(kind_of, id);
+        char cdir[900];
+        bc_class_dir(cdir, sizeof cdir, root, kd, lb.c_str());
+        fprintf(out, "| %u | `%s` | %s | %s | `%s` | %s |\n", id, nl_kind_name(kd),
+                bc_class_known(lb.c_str()) ? "known" : "unknown",
+                bc_class_named(lb.c_str()) ? "name"
+                                          : (bc_class_known(lb.c_str()) ? "string" : "vt"),
+                cdir, lb.c_str());
+    }
+
+    fprintf(out, "\n## classes\n\n");
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t id = cls[c].first;
+        const std::string &lb = lbl.find(id)->second;
+        const uint32_t kd = kind_lookup(kind_of, id);
+        char cdir[900];
+        bc_class_dir(cdir, sizeof cdir, root, kd, lb.c_str());
+        fprintf(out, "### %u. %s\n\n", id, lb.c_str());
+        snprintf(path, sizeof path, "%s/offsets.md", cdir);
+        bc_all_copy(out, path);
+        fprintf(out, "\n");
+    }
+
+    fclose(out);
+    RCL_LOGLN("[battle] all-in-one written to %s", path);
+}
+
 static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
                           const std::vector<std::pair<uint32_t, uint64_t>> &cls,
                           const std::map<uint32_t, uint32_t> &kind_of,
@@ -1902,9 +2146,13 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
                     continue;
                 const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
                 std::map<uint64_t, uint64_t>::iterator sm = g_bc_sample.find(it->first);
-                fprintf(f, "field\t%u\t%s\t\t0x%x\t%s\t0x%llx\t\t\n", id, label, off,
-                        bc_kind_name(it->second),
-                        (unsigned long long)(sm != g_bc_sample.end() ? sm->second : 0));
+                const uint64_t sv = (sm != g_bc_sample.end() ? sm->second : 0);
+                char st[200];
+                st[0] = 0;
+                if (it->second == 6)
+                    bc_str_at(sv, st, sizeof st);
+                fprintf(f, "field\t%u\t%s\t\t0x%x\t%s\t0x%llx\t\t%s\n", id, label, off,
+                        bc_kind_name(it->second), (unsigned long long)sv, st);
             }
             for (size_t a = 0; a < g_bc_access.size(); a++)
             {
@@ -1965,8 +2213,13 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
                     "- state `%u`, scene `0x%llx`, players `0x%llx`, count `%u`, polls `%llu`\n",
                     g_bc_state, (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players,
                     g_bc_pcount, (unsigned long long)g_bc_tick);
-            fprintf(f, "- folder `%s`, %s\n\n", nl_kind_name(kd),
+            fprintf(f, "- folder `%s`, %s\n", nl_kind_name(kd),
                     bc_class_known(label) ? "known" : "unknown");
+            fprintf(f, "- class id `%u`, vtable rva `0x%llx`, label `%s`, type `%s`\n", id,
+                    (unsigned long long)(vt - img.base), label,
+                    bc_class_is_string(label) ? "string" : "name");
+            fprintf(f, "- search key `%s` (the part after the last `/` or `#`)\n\n",
+                    bc_search_key(label));
             fprintf(f, "## class %u: %s\n\n", id, label);
             fprintf(f, "- vtable `+0x%llx` (0x%llx), fp `0x%llx`\n\n",
                     (unsigned long long)(vt - img.base), (unsigned long long)vt,
@@ -1998,9 +2251,16 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
                 std::map<uint64_t, uint64_t>::iterator sm = g_bc_sample.find(it->first);
                 const uint64_t val = (sm != g_bc_sample.end() ? sm->second : 0);
                 char t8[9];
+                char ps[200];
+                ps[0] = 0;
                 const bool istext = (it->second == 6 && bc_text8(val, t8));
+                if (it->second == 6 && !istext)
+                    bc_str_at(val, ps, sizeof ps);
                 if (istext)
                     fprintf(f, "| `0x%x` | text | `%s` |\n", off, t8);
+                else if (ps[0])
+                    fprintf(f, "| `0x%x` | text | `%s` (ptr `0x%llx`) |\n", off, ps,
+                            (unsigned long long)val);
                 else
                     fprintf(f, "| `0x%x` | %s | `0x%llx` |\n", off, bc_kind_name(it->second),
                             (unsigned long long)val);
@@ -2212,18 +2472,25 @@ static void bc_write_offsets(const Image &img)
                 per_split[kd][1], per_kind[kd]);
     fprintf(f, "| **total** | **%u** | **%u** | **%zu** |\n\n", known,
             (uint32_t)cls.size() - known, cls.size());
-    fprintf(f, "| class id | kind | state | folder | label |\n|---------:|------|-------|--------|"
-               "-------|\n");
+    fprintf(f, "`type` is `name` for an entry named as a class, `string` when the word only "
+               "pointed at a string, `vt` when nothing named it.  The whole dump is also in "
+               "`BattleDumpAll.md`.\n\n");
+    fprintf(f, "| class id | kind | state | type | search key | folder | label |\n");
+    fprintf(f, "|---------:|------|-------|------|------------|--------|-------|\n");
     for (size_t c = 0; c < cls.size(); c++)
     {
         const uint32_t id = cls[c].first;
         const std::string &lb = lbl.find(id)->second;
         char cdir[900];
         bc_class_dir(cdir, sizeof cdir, root, kind_of[id], lb.c_str());
-        fprintf(f, "| %u | `%s` | %s | `%s` | %s |\n", id, nl_kind_name(kind_of[id]),
-                bc_class_known(lb.c_str()) ? "known" : "unknown", cdir, lb.c_str());
+        fprintf(f, "| %u | `%s` | %s | %s | `%s` | `%s` | %s |\n", id, nl_kind_name(kind_of[id]),
+                bc_class_known(lb.c_str()) ? "known" : "unknown",
+                bc_class_named(lb.c_str()) ? "name"
+                                           : (bc_class_known(lb.c_str()) ? "string" : "vt"),
+                bc_search_key(lb.c_str()), cdir, lb.c_str());
     }
     fclose(f);
+    bc_write_all(img, root, cls, kind_of, lbl);
     RCL_LOGLN("[battle] battle dump: %zu classes (%u known) in %s", cls.size(), known, root);
 }
 
