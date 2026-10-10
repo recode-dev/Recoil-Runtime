@@ -22,7 +22,9 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach/vm_map.h>
+#include <mach/vm_region.h>
 
 extern "C" int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
                                       unsigned long long size, unsigned long long out,
@@ -2448,12 +2450,6 @@ static void bc_rm_tree(const char *path)
     rmdir(path);
 }
 
-#if defined(__APPLE__)
-extern "C" int mach_vm_region(unsigned int task, unsigned long long *address,
-                              unsigned long long *size, int flavor, void *info,
-                              unsigned int *count, unsigned int *object_name);
-#endif
-
 static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std::string> &lbl)
 {
 #if defined(__APPLE__)
@@ -2471,21 +2467,27 @@ static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std
         fprintf(f, "- no known class table yet\n");
         return;
     }
-    uint64_t addr = img.base;
+    mach_vm_address_t addr = img.base;
+    mach_vm_size_t size = 0;
     uint64_t scanned = 0;
     const uint64_t cap = 384ull * 1024ull * 1024ull;
     std::map<uint32_t, uint32_t> inst;
     std::map<uint32_t, uint64_t> first;
     std::map<uint32_t, uint64_t> gap;
     std::map<uint32_t, uint64_t> prevaddr;
-    unsigned int info[8];
-    unsigned int cnt = 8;
-    unsigned int obj = 0;
-    uint64_t size = 0;
-    while (scanned < cap && mach_vm_region(mach_task_self_, &addr, &size, 9, info, &cnt, &obj) == 0)
+    uint32_t regions = 0;
+    for (;;)
     {
-        const unsigned int prot = info[1];
-        const bool writable = (prot & 1u) == 0 && (prot & 2u) == 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t objname = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self_, &addr, &size, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&info, &cnt, &objname) != KERN_SUCCESS)
+            break;
+        if (!size)
+            break;
+        regions++;
+        const bool writable = (info.protection & VM_PROT_WRITE) != 0;
         if (writable && size >= 16)
         {
             for (uint64_t o = addr; o + 8 <= addr + size; o += 8)
@@ -2505,17 +2507,17 @@ static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std
                 std::map<uint32_t, uint64_t>::iterator pv = prevaddr.find(it->second);
                 if (pv != prevaddr.end() && o > pv->second)
                 {
-                    const uint64_t d = o - pv->second;
-                    if (d >= 16 && (gap.find(it->second) == gap.end() || d < gap[it->second]))
-                        gap[it->second] = d;
+                    const uint64_t d2 = o - pv->second;
+                    if (d2 >= 16 && (gap.find(it->second) == gap.end() || d2 < gap[it->second]))
+                        gap[it->second] = d2;
                 }
                 prevaddr[it->second] = o;
             }
         }
         addr += size;
     }
-    fprintf(f, "- heap pass scanned `%llu` bytes of writable memory, `%zu` classes held\n\n",
-            (unsigned long long)scanned, inst.size());
+    fprintf(f, "- heap pass walked `%u` regions, scanned `%llu` bytes, `%zu` classes held\n\n",
+            regions, (unsigned long long)scanned, inst.size());
     std::vector<std::pair<uint32_t, uint32_t>> order(inst.begin(), inst.end());
     std::sort(order.begin(), order.end(),
               [](const std::pair<uint32_t, uint32_t> &a, const std::pair<uint32_t, uint32_t> &b)
