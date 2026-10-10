@@ -166,7 +166,7 @@ static void open_log_anywhere() {
 
     for (int i = 0; i < n; i++) {
         log_open(cands[i]);
-        battle_capture_autostart(img);
+        battle_capture_open();
         if (log_is_open()) { RCL_LOGLN("[log] %s", cands[i]); return; }
     }
 }
@@ -178,6 +178,7 @@ static bool g_live_started = false;
 static void *live_worker(void *) {
     g_live_started = true;
     for (;;) {
+        battle_capture_autostart(g_live_img);
         live_session(g_live_img, g_live_seeds);
         sleep(5);
     }
@@ -203,6 +204,7 @@ static void run_pass(const Image &img, const std::string &why, int pass) {
     if (pass > 0) return;
     if (g_live_started) return;
     if ((int)env_u64("RCL_RESCAN_SEC", 20) <= 0) {
+        battle_capture_autostart(img);
         live_session(img, s);
         return;
     }
@@ -235,7 +237,8 @@ static void *waiter(void *) {
                     RCL_LOGLN("[scan %zu/%zu] %s", k + 1, all.size(), all[k].name.c_str());
                     report_run(all[k].img, Seeds::discover(all[k].img));
                 }
-                live_session(all[0].img, Seeds::discover(all[0].img));
+                battle_capture_autostart(all[0].img);
+        live_session(all[0].img, Seeds::discover(all[0].img));
                 log_close();
                 return nullptr;
             }
