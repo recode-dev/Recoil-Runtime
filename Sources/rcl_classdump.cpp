@@ -2103,6 +2103,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
         deep_fieldmap(img, *g_mi, *g_fs, root, ds);
         deep_accessors(img, *g_mi, *g_fs, tables, root, ds);
         deep_functions(img, *g_mi, *g_fs, tables, root, ds);
+        deep_export(img, *g_mi, *g_fs, tables, root, ds);
         deep_globals(img, *g_mi, *g_fs, tables, root, ds);
         deep_logic(root, ds);
         deep_heap(img, *g_mi, *g_fs, root, ds);

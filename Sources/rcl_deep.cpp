@@ -1242,6 +1242,118 @@ void deep_functions(const Image &img, const MachInsight &mi, const FnStarts &fs,
               st.func_ctor, st.func_dtor, st.func_singletons);
 }
 
+void deep_export(const Image &img, const MachInsight &mi, const FnStarts &fs,
+                 const std::vector<ClassTable> &tables, const char *root, DeepStats &st) {
+    const TextBuf &tb = text_buf_get(img, mi);
+    if (!tb.ok) return;
+
+    std::map<uint32_t, uint32_t> fsize;
+    for (size_t i = 0; i < fs.v.size(); i++) fsize[fs.v[i]] = fs.size_of(fs.v[i]);
+
+    std::map<uint32_t, std::string> props;
+    char path[1024];
+
+    snprintf(path, sizeof path, "%s/_funcprops.tsv", root);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "rva\tsize\tfields\n");
+        for (size_t i = 0; i < fs.v.size(); i++) {
+            const uint32_t rva = fs.v[i];
+            const uint32_t size = fsize[rva];
+            if (!size || size > 0x40000u) continue;
+            const uint32_t insns = size / 4u;
+            std::string acc;
+            for (uint32_t k = 0; k < insns && k < 512u; k++) {
+                const uint64_t va = tb.lo + (uint64_t)rva + (uint64_t)k * 4u;
+                const uint32_t w = tb_word(tb, va);
+                if (((w >> 5) & 0x1Fu) != 0u) continue;
+                const uint32_t m = w & 0xFFC00000u;
+                const uint32_t rt = w & 0x1Fu;
+                uint32_t off = 0;
+                uint8_t wd = 0;
+                uint8_t kind = 0;
+                if (m == 0xF9400000u && rt == 0) { off = ((w >> 10) & 0xFFFu) * 8u; wd = 8; kind = 0; }
+                else if (m == 0xB9400000u && rt == 0) { off = ((w >> 10) & 0xFFFu) * 4u; wd = 4; kind = 0; }
+                else if (m == 0x39400000u && rt == 0) { off = (w >> 10) & 0xFFFu; wd = 1; kind = 0; }
+                else if (m == 0x79400000u && rt == 0) { off = ((w >> 10) & 0xFFFu) * 2u; wd = 2; kind = 0; }
+                else if (m == 0xB9800000u && rt == 0) { off = ((w >> 10) & 0xFFFu) * 4u; wd = 4; kind = 0; }
+                else if (m == 0xBD400000u && rt == 0) { off = ((w >> 10) & 0xFFFu) * 4u; wd = 4; kind = 2; }
+                else if (m == 0xFD400000u && rt == 0) { off = ((w >> 10) & 0xFFFu) * 8u; wd = 8; kind = 2; }
+                else if (m == 0xF9000000u) { off = ((w >> 10) & 0xFFFu) * 8u; wd = 8; kind = 1; }
+                else if (m == 0xB9000000u) { off = ((w >> 10) & 0xFFFu) * 4u; wd = 4; kind = 1; }
+                else if (m == 0x39000000u) { off = (w >> 10) & 0xFFFu; wd = 1; kind = 1; }
+                else if (m == 0x79000000u) { off = ((w >> 10) & 0xFFFu) * 2u; wd = 2; kind = 1; }
+                else if (m == 0xBD000000u) { off = ((w >> 10) & 0xFFFu) * 4u; wd = 4; kind = 3; }
+                else if (m == 0xFD000000u) { off = ((w >> 10) & 0xFFFu) * 8u; wd = 8; kind = 3; }
+                else continue;
+                if (off > 0x40000u || acc.size() > 900u) continue;
+                char b2[24];
+                snprintf(b2, sizeof b2, "%u+%u+%u,", off, (unsigned)wd, (unsigned)kind);
+                acc += b2;
+            }
+            props[rva] = acc;
+            fprintf(f, "%#x\t%u\t%s\n", rva, size, acc.empty() ? "-" : acc.c_str());
+        }
+        fclose(f);
+    }
+
+    snprintf(path, sizeof path, "%s/_tables.tsv", root);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "table\tslots\tslot\tfn\tsize\tclass\tfields\n");
+        for (size_t i = 0; i < tables.size(); i++) {
+            const ClassTable &t = tables[i];
+            const char *cn = (t.name && t.name[0]) ? t.name : "-";
+            for (uint32_t s = 0; s < t.slots; s++) {
+                uint64_t raw = 0;
+                if (!d_rd(img, img.base + t.start + (uint64_t)s * 8u, &raw, 8)) break;
+                int how = 0;
+                const uint64_t v = macho_slot_value(img, mi, raw, &how);
+                if (!v) continue;
+                const uint32_t r = (uint32_t)(v - img.base);
+                std::map<uint32_t, std::string>::const_iterator it = props.find(r);
+                std::map<uint32_t, uint32_t>::const_iterator iz = fsize.find(r);
+                fprintf(f, "%#x\t%u\t%u\t%#x\t%u\t%s\t%s\n", t.start, t.slots, s, r,
+                        iz == fsize.end() ? 0u : iz->second, cn,
+                        it == props.end() ? "-" : it->second.c_str());
+                st.table_slots++;
+            }
+        }
+        fclose(f);
+    }
+
+    snprintf(path, sizeof path, "%s/_strings.tsv", root);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "fn\tstr_rva\tstring\n");
+        const uint64_t n = mi.text_vmsize / 4u;
+        for (uint64_t i = 0; i + 1 < n; i++) {
+            const uint64_t va = tb.lo + i * 4u;
+            uint64_t page = 0;
+            uint32_t rd = 0;
+            if (!adrp_calc(tb_word(tb, va), va, page, rd)) continue;
+            uint64_t full = 0;
+            if (!add_same(tb_word(tb, va + 4), rd, page, full)) continue;
+            std::string s;
+            if (!d_cstr(img, full, s) || s.size() < 6u || s.size() > 160u) continue;
+            bool printable = true;
+            for (size_t q = 0; q < s.size(); q++) {
+                const unsigned char c = (unsigned char)s[q];
+                if (c < 0x20u || c > 0x7eu) { printable = false; break; }
+            }
+            if (!printable) continue;
+            const uint32_t rva = (uint32_t)(va - img.base);
+            std::vector<uint32_t>::const_iterator it =
+                std::upper_bound(fs.v.begin(), fs.v.end(), rva);
+            if (it == fs.v.begin()) continue;
+            fprintf(f, "%#x\t%#x\t%s\n", *(it - 1), (uint32_t)(full - img.base), s.c_str());
+            st.str_refs++;
+        }
+        fclose(f);
+    }
+    RCL_LOGLN("[deep] export: table_slots=%u str_refs=%u", st.table_slots, st.str_refs);
+}
+
 void deep_globals(const Image &img, const MachInsight &mi, const FnStarts &fs,
                   const std::vector<ClassTable> &tables, const char *root, DeepStats &st) {
     const TextBuf &tb = text_buf_get(img, mi);

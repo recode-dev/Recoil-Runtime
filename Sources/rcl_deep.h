@@ -36,6 +36,8 @@ struct DeepStats {
 
     uint32_t func_total = 0;
     uint32_t func_ctor = 0;
+    uint32_t str_refs = 0;
+    uint32_t table_slots = 0;
     uint32_t func_dtor = 0;
     uint32_t func_singletons = 0;
     uint32_t globals = 0;
@@ -73,6 +75,8 @@ void deep_functions(const Image &img, const MachInsight &mi, const FnStarts &fs,
                     const std::vector<ClassTable> &tables, const char *root, DeepStats &st);
 void deep_globals(const Image &img, const MachInsight &mi, const FnStarts &fs,
                   const std::vector<ClassTable> &tables, const char *root, DeepStats &st);
+void deep_export(const Image &img, const MachInsight &mi, const FnStarts &fs,
+                 const std::vector<ClassTable> &tables, const char *root, DeepStats &st);
 void deep_indirect(const Image &img, const MachInsight &mi, const FnStarts &fs,
                    std::vector<ClassTable> &extra, DeepStats &st);
 void deep_logic(const char *root, DeepStats &st);
