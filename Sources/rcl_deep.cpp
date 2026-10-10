@@ -1,4 +1,5 @@
 #include "rcl_deep.h"
+#include "rcl_classdump.h"
 #include "rcl_docdata.h"
 #include "rcl_log.h"
 #include "rcl_names.h"
@@ -1662,6 +1663,35 @@ void deep_heap(const Image &img, const MachInsight &mi, const FnStarts &fs, cons
             if (first < mi.text_lo || first >= mi.text_hi) continue;
             if (fs.exact && !fs.is_start((uint32_t)(first - img.base))) continue;
             hits[(uint32_t)(v - img.base)]++;
+            {
+                const uint32_t trva = (uint32_t)(v - img.base);
+                uint64_t fld[32];
+                unsigned long long got2 = 0;
+                if (mach_vm_read_overwrite(mach_task_self_, addr + off, sizeof fld,
+                                           (unsigned long long)fld, &got2) == 0 &&
+                    got2 >= 8) {
+                    const uint32_t nw = (uint32_t)(got2 / 8);
+                    for (uint32_t k = 0; k < nw; k++) {
+                        const uint64_t q = fld[k];
+                        if (q < img.base || q - img.base >= img.image_vmsize) continue;
+                        std::string s;
+                        if (!d_cstr(img, q, s)) continue;
+                        if (s.size() < 6 || s.size() > 48) continue;
+                        if (s[0] < 'A' || s[0] > 'Z') continue;
+                        bool idok = true;
+                        for (size_t z = 0; z < s.size(); z++) {
+                            const char c = s[z];
+                            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                (c >= '0' && c <= '9') || c == '_')
+                                continue;
+                            idok = false;
+                            break;
+                        }
+                        if (!idok) continue;
+                        rcl_symbol_vote(trva, s.c_str(), "asset");
+                    }
+                }
+            }
         }
         addr = next;
     }

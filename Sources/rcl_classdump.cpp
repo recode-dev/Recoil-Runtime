@@ -2710,9 +2710,11 @@ static uint32_t sym_insn(const Image &img, uint64_t va) {
 static uint32_t sym_slot_rva(const Image &img, uint64_t raw) {
     if (!raw) return 0;
     uint64_t lim = img.image_vmsize ? img.image_vmsize : img.vmsize;
+    if (raw >= img.base && raw - img.base < lim) return (uint32_t)(raw - img.base);
     uint64_t t = raw & 0xFFFFFFFFFULL;
+    if (t >= img.base && t - img.base < lim) return (uint32_t)(t - img.base);
     if (t >= 0x100000000ULL && t - 0x100000000ULL < lim) return (uint32_t)(t - 0x100000000ULL);
-    if (t >= raw && t > 0x4000 && t < lim) return (uint32_t)t;
+    if (t > 0x4000 && t < lim) return (uint32_t)t;
     return 0;
 }
 
@@ -2981,7 +2983,9 @@ void write_symbols(const Image &img, const std::vector<ClassTable> &tables, cons
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "kind\trva\taddress\tname\tsource\tslots\n");
+    std::set<uint32_t> emitted;
     for (size_t i = 0; i < tables.size(); i++) {
+        if (!emitted.insert(tables[i].start).second) continue;
         const char *c = name_of_table(tables[i].start);
         const char *fam = c ? nullptr : family_of_table(tables[i].start);
         if (c) snprintf(nm, sizeof nm, "%s", c);
@@ -3014,11 +3018,13 @@ void write_symbols(const Image &img, const std::vector<ClassTable> &tables, cons
     FILE *b = fopen(sh, "w");
     snprintf(sh, sizeof sh, "%s/_symbols.txt", root);
     FILE *c2 = fopen(sh, "w");
+    std::set<uint32_t> emitted2;
     if (a) fprintf(a, "#include <idc.idc>\n\nstatic main() {\n");
     if (b) fprintf(b, "from ghidra.program.model.symbol import SourceType\n\n"
                       "def main():\n    st = currentProgram.getSymbolTable()\n"
                       "    base = currentProgram.getImageBase()\n");
     for (size_t i = 0; i < tables.size(); i++) {
+        if (!emitted2.insert(tables[i].start).second) continue;
         const char *cn = name_of_table(tables[i].start);
         const char *fam = cn ? nullptr : family_of_table(tables[i].start);
         if (!cn && !fam) continue;
