@@ -22,13 +22,26 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
-#include <mach/vm_map.h>
-#include <mach/vm_region.h>
 
 extern "C" int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
                                       unsigned long long size, unsigned long long out,
                                       unsigned long long *got);
+
+extern "C" int vm_region_64(unsigned int target_task, unsigned long long *address,
+                            unsigned long long *size, int flavor, void *info,
+                            unsigned int *count, unsigned int *object_name);
+
+struct BcRegionInfo64
+{
+    unsigned int protection;
+    unsigned int max_protection;
+    unsigned int inheritance;
+    unsigned int shared;
+    unsigned int reserved;
+    unsigned long long offset;
+    unsigned int behavior;
+    unsigned int user_wired_count;
+};
 #endif
 
 namespace rcl
@@ -2467,8 +2480,8 @@ static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std
         fprintf(f, "- no known class table yet\n");
         return;
     }
-    mach_vm_address_t addr = img.base;
-    mach_vm_size_t size = 0;
+    unsigned long long addr = img.base;
+    unsigned long long size = 0;
     uint64_t scanned = 0;
     const uint64_t cap = 384ull * 1024ull * 1024ull;
     std::map<uint32_t, uint32_t> inst;
@@ -2478,19 +2491,18 @@ static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std
     uint32_t regions = 0;
     for (;;)
     {
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t objname = MACH_PORT_NULL;
-        if (mach_vm_region(mach_task_self_, &addr, &size, VM_REGION_BASIC_INFO_64,
-                           (vm_region_info_t)&info, &cnt, &objname) != KERN_SUCCESS)
+        BcRegionInfo64 info;
+        unsigned int cnt = 10;
+        unsigned int objname = 0;
+        if (vm_region_64(mach_task_self_, &addr, &size, 9, &info, &cnt, &objname) != 0)
             break;
         if (!size)
             break;
         regions++;
-        const bool writable = (info.protection & VM_PROT_WRITE) != 0;
+        const bool writable = (info.protection & 2u) != 0;
         if (writable && size >= 16)
         {
-            for (uint64_t o = addr; o + 8 <= addr + size; o += 8)
+            for (unsigned long long o = addr; o + 8 <= addr + size; o += 8)
             {
                 if (scanned >= cap)
                     break;
