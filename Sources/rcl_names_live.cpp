@@ -25,7 +25,8 @@ std::map<uint32_t, uint32_t> g_doc_method;
 std::map<std::string, std::vector<uint32_t>> g_sig;
 std::map<uint32_t, uint32_t> g_inst;
 std::map<uint32_t, uint32_t> g_inst_score;
-uint32_t g_hits[NL_SRC_MAX + 1] = {0, 0, 0, 0, 0, 0};
+uint32_t g_hits[NL_SRC_MAX + 1] = {0, 0, 0, 0, 0, 0, 0};
+std::map<uint32_t, std::string> g_asset;
 
 const uint32_t kSigDfMax = 3;
 const uint32_t kSigMinLen = 4;
@@ -286,6 +287,41 @@ void nl_init(NlReadFn fn, void *ctx, uint64_t img_lo, uint64_t img_hi)
     }
 }
 
+bool asset_like(const std::string &s)
+{
+    if (s.size() < 8 || s.size() > 96)
+        return false;
+    bool alnum = true;
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        const char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= '_') || c == '/' ||
+              c == '.'))
+            alnum = false;
+    }
+    if (alnum)
+        return true;
+    return s.find('/') != std::string::npos;
+}
+
+void asset_take(uint32_t vt, const std::vector<std::string> &refs)
+{
+    const std::string *pick = nullptr;
+    for (size_t i = 0; i < refs.size(); i++)
+    {
+        if (!asset_like(refs[i]))
+            continue;
+        if (pick == nullptr || refs[i].size() > pick->size())
+            pick = &refs[i];
+    }
+    if (pick == nullptr)
+        return;
+    std::map<uint32_t, std::string>::iterator it = g_asset.find(vt);
+    if (it != g_asset.end() && it->second.size() >= pick->size())
+        return;
+    g_asset[vt] = *pick;
+}
+
 void nl_observe(uint32_t vt, const char *const *strs, uint32_t n)
 {
     if (!g_ready && g_read)
@@ -305,6 +341,7 @@ void nl_observe(uint32_t vt, const char *const *strs, uint32_t n)
         }
     }
     std::map<uint32_t, uint32_t> score;
+    asset_take(vt, refs);
     score_strings(refs, score);
     uint32_t best = 0;
     if (!best_of(score, kMinStringHits, best))
@@ -388,6 +425,18 @@ const char *nl_label(uint32_t vt, const uint32_t *slots, uint32_t nslots, char *
         scan_window(g_base + (uint64_t)slots[i], refs);
         score_strings(refs, by_string);
     }
+    std::map<uint32_t, std::string>::const_iterator as = g_asset.find(vt);
+    if (as != g_asset.end())
+    {
+        snprintf(buf, cap, "%s", as->second.c_str());
+        g_hits[NL_ASSET]++;
+        if (src)
+        {
+            *src = NL_ASSET;
+        }
+        return buf;
+    }
+
     if (best_of(by_string, kMinStringHits, best))
     {
         label_of(best, buf, cap);

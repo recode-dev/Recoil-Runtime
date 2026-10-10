@@ -13,7 +13,8 @@ enum NlSource
     NL_INSTANCE = 2,
     NL_DOC_METHODS = 3,
     NL_STRINGS = 4,
-    NL_METHOD_NAMES = 5,
+    NL_ASSET = 5,
+    NL_METHOD_NAMES = 6,
     NL_SRC_MAX = NL_METHOD_NAMES
 };
 

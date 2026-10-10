@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <set>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -1142,6 +1143,25 @@ bool bc_read(uint64_t va, void *dst, size_t n)
 #endif
 }
 
+bool bc_text8(uint64_t v, char *out)
+{
+    uint32_t alnum = 0;
+    for (int i = 0; i < 8; i++)
+    {
+        const char c = (char)((v >> (8 * i)) & 0xFF);
+        if (c < 32 || c > 126)
+            return false;
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_')
+            alnum++;
+    }
+    if (alnum < 4)
+        return false;
+    for (int i = 0; i < 8; i++)
+        out[i] = (char)((v >> (8 * i)) & 0xFF);
+    out[8] = 0;
+    return true;
+}
+
 int bc_kind(const Image &img, uint64_t v)
 {
     const uint64_t span = img.image_vmsize ? img.image_vmsize : img.vmsize;
@@ -1149,8 +1169,11 @@ int bc_kind(const Image &img, uint64_t v)
     uint32_t hi = 0;
     float f = 0.0f;
     float g = 0.0f;
+    char txt[9];
     if (v == 0)
         return 0;
+    if (bc_text8(v, txt))
+        return 6;
     if (v >= img.base && v - img.base < span)
         return 1;
     if ((v & 7) == 0 && v > 0x100000000ull && v < 0x800000000000ull)
@@ -1180,6 +1203,8 @@ const char *bc_kind_name(int k)
         return "int";
     case 5:
         return "other";
+    case 6:
+        return "text";
     default:
         return "zero";
     }
@@ -1220,11 +1245,11 @@ void bc_open_file(void)
     char path[1200];
     if (g_bc_f)
         return;
-    snprintf(path, sizeof path, "%s/battle-capture-log.txt", bc_dir());
+    snprintf(path, sizeof path, "%s/battle-capture-log.md", bc_dir());
     g_bc_f = fopen(path, "a");
     if (!g_bc_f)
     {
-        snprintf(path, sizeof path, "/tmp/battle-capture-log.txt");
+        snprintf(path, sizeof path, "/tmp/battle-capture-log.md");
         g_bc_f = fopen(path, "a");
     }
     if (!g_bc_f)
@@ -1484,6 +1509,27 @@ static void bc_observe_strings(const Image &img, uint64_t vt, const uint64_t *wo
         memcpy(buf[n], tmp, len + 1);
         strs[n] = buf[n];
         n++;
+    }
+    const unsigned char *raw = (const unsigned char *)words;
+    for (uint32_t i = 0; i < 512 && n < 64;)
+    {
+        if (raw[i] >= 32 && raw[i] <= 126)
+        {
+            uint32_t j = i;
+            while (j < 512 && raw[j] >= 32 && raw[j] <= 126)
+                j++;
+            const uint32_t len = j - i;
+            if (len >= 6 && len < 48)
+            {
+                memcpy(buf[n], raw + i, len);
+                buf[n][len] = 0;
+                strs[n] = buf[n];
+                n++;
+            }
+            i = j;
+        }
+        else
+            i++;
     }
     if (n)
         nl_observe((uint32_t)(vt - img.base), strs, n);
@@ -1752,7 +1798,7 @@ static void bc_write_offsets(const Image &img)
     std::vector<std::pair<uint32_t, uint64_t>> cls;
     bc_class_order(cls);
 
-    snprintf(path, sizeof path, "%s/battle-offsets.tsv", dir);
+    snprintf(path, sizeof path, "%s/battle-offsets.tsv.md", dir);
     FILE *f = fopen(path, "w");
     if (f)
     {
@@ -1863,12 +1909,42 @@ static void bc_write_offsets(const Image &img)
                 g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors,
                 (uint32_t)g_bc_access.size(), (uint32_t)g_bc_ref.size(), (uint32_t)g_bc_arr.size(),
                 (uint32_t)g_bc_cell.size());
+        std::map<uint32_t, std::string> lbl;
+        for (size_t c = 0; c < cls.size(); c++)
+        {
+            char lb[128];
+            bc_class_label(img, cls[c].second, lb, sizeof lb);
+            lbl[cls[c].first] = lb;
+        }
+        for (int pass = 0; pass < 6; pass++)
+        {
+            uint32_t added = 0;
+            for (size_t r = 0; r < g_bc_ref.size(); r++)
+            {
+                const uint32_t child = g_bc_ref[r].ccls;
+                const uint32_t parent = g_bc_ref[r].pcls;
+                std::map<uint32_t, std::string>::iterator pi = lbl.find(parent);
+                std::map<uint32_t, std::string>::iterator ci = lbl.find(child);
+                if (pi == lbl.end() || ci == lbl.end())
+                    continue;
+                if (ci->second.compare(0, 3, "vt_") != 0)
+                    continue;
+                if (pi->second.compare(0, 3, "vt_") == 0)
+                    continue;
+                char nb[192];
+                snprintf(nb, sizeof nb, "%s+0x%x", pi->second.c_str(), g_bc_ref[r].off);
+                ci->second = nb;
+                added++;
+            }
+            if (!added)
+                break;
+        }
         for (size_t c = 0; c < cls.size(); c++)
         {
             const uint32_t id = cls[c].first;
             const uint64_t vt = cls[c].second;
-            char label[128];
-            bc_class_label(img, vt, label, sizeof label);
+            char label[192];
+            snprintf(label, sizeof label, "%s", lbl[id].c_str());
             fprintf(f, "## class %u: %s\n\n", id, label);
             fprintf(f, "- vtable `+0x%llx` (0x%llx), fp `0x%llx`\n\n",
                     (unsigned long long)(vt - img.base), (unsigned long long)vt,
@@ -1888,17 +1964,48 @@ static void bc_write_offsets(const Image &img)
                 fprintf(f, "\n");
             }
             fprintf(f, "| offset | kind | sample |\n|---:|---|---|\n");
+            std::vector<std::string> texts;
+            std::string run;
+            uint64_t runend = 0;
             for (std::map<uint64_t, char>::iterator it = g_bc_slot.begin(); it != g_bc_slot.end();
                  ++it)
             {
                 if ((uint32_t)(it->first >> 32) != id)
                     continue;
+                const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
                 std::map<uint64_t, uint64_t>::iterator sm = g_bc_sample.find(it->first);
-                fprintf(f, "| `0x%x` | %s | `0x%llx` |\n", (uint32_t)(it->first & 0xffffffffu),
-                        bc_kind_name(it->second),
-                        (unsigned long long)(sm != g_bc_sample.end() ? sm->second : 0));
+                const uint64_t val = (sm != g_bc_sample.end() ? sm->second : 0);
+                char t8[9];
+                const bool istext = (it->second == 6 && bc_text8(val, t8));
+                if (istext)
+                    fprintf(f, "| `0x%x` | text | `%s` |\n", off, t8);
+                else
+                    fprintf(f, "| `0x%x` | %s | `0x%llx` |\n", off, bc_kind_name(it->second),
+                            (unsigned long long)val);
+                if (istext && run.size() && off == runend + 8)
+                {
+                    run += t8;
+                    runend = off;
+                }
+                else
+                {
+                    if (run.size() >= 8)
+                        texts.push_back(run);
+                    run = istext ? t8 : std::string();
+                    runend = off;
+                }
             }
+            if (run.size() >= 8)
+                texts.push_back(run);
             fprintf(f, "\n");
+            if (!texts.empty())
+            {
+                std::set<std::string> uniq(texts.begin(), texts.end());
+                fprintf(f, "Texts:");
+                for (std::set<std::string>::iterator ti = uniq.begin(); ti != uniq.end(); ++ti)
+                    fprintf(f, " `%s`", ti->c_str());
+                fprintf(f, "\n\n");
+            }
             bool anyRef = false;
             for (size_t r = 0; r < g_bc_ref.size(); r++)
             {
@@ -1909,8 +2016,8 @@ static void bc_write_offsets(const Image &img)
                     fprintf(f, "| member offset | -> class |\n|---:|---|\n");
                     anyRef = true;
                 }
-                char cl[128];
-                bc_label_of(img, g_bc_ref[r].ccls, cl, sizeof cl);
+                std::map<uint32_t, std::string>::iterator ci = lbl.find(g_bc_ref[r].ccls);
+                const char *cl = (ci != lbl.end()) ? ci->second.c_str() : "?";
                 fprintf(f, "| `0x%x` | %u %s |\n", g_bc_ref[r].off, g_bc_ref[r].ccls, cl);
             }
             if (anyRef)
