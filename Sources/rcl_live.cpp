@@ -5,6 +5,7 @@
 #include <string>
 #include <algorithm>
 #include "rcl_log.h"
+#include "rcl_objc.h"
 #include "rcl_alert.h"
 #include "rcl_classdump.h"
 #include "rcl_names.h"
@@ -1163,6 +1164,8 @@ bool bc_read(uint64_t va, void *dst, size_t n)
 #else
     if (!va || !n)
         return false;
+    if (g_bc_img.read)
+        return g_bc_img.read(g_bc_img.ctx, va, dst, n);
     memcpy(dst, (const void *)(uintptr_t)va, n);
     return true;
 #endif
@@ -2524,12 +2527,259 @@ static void bc_clean_old(const char *root)
     bc_rm_tree(path);
 }
 
+struct BcLayout
+{
+    uint32_t fields[48];
+    uint32_t nfields;
+    uint32_t floats[16];
+    uint32_t nfloats;
+    uint32_t cells[8];
+    uint32_t ncells;
+    uint32_t ctor;
+    uint32_t flag_sum[4];
+};
+
+static uint32_t bc_adrp_at(const Image &img, uint32_t rva, uint32_t i, uint64_t *page,
+                           uint32_t *rd)
+{
+    uint32_t w = 0;
+    if (!bc_read(img.base + rva + i, &w, 4) || (w & 0x9f000000u) != 0x90000000u)
+        return 0;
+    int64_t imm = (int64_t)((((w >> 5) & 0x7ffffu) << 2) | ((w >> 29) & 3u));
+    if (imm & (1ll << 20))
+        imm |= ~((1ll << 21) - 1);
+    *page = ((img.base + rva + i) & ~0xfffull) + (uint64_t)(imm << 12);
+    *rd = w & 0x1fu;
+    return 1;
+}
+
+static std::map<uint32_t, uint32_t> g_bc_vtref;
+static bool g_bc_vtref_done = false;
+
+static void bc_vtref_scan(const Image &img)
+{
+    if (g_bc_vtref_done)
+        return;
+    g_bc_vtref_done = true;
+    uint64_t text_lo = 0;
+    uint64_t text_hi = 0;
+    if (!macho_text_range(img, text_lo, text_hi))
+        return;
+    uint64_t page = 0;
+    uint32_t reg = 0xffffffffu;
+    for (uint64_t i = 0; i + 8 <= text_hi - text_lo; i += 4)
+    {
+        uint32_t w = 0;
+        const uint64_t at = text_lo + i;
+        if (!bc_read(at, &w, 4))
+            break;
+        if ((w & 0x9f000000u) == 0x90000000u)
+        {
+            int64_t imm = (int64_t)((((w >> 5) & 0x7ffffu) << 2) | ((w >> 29) & 3u));
+            if (imm & (1ll << 20))
+                imm |= ~((1ll << 21) - 1);
+            page = (at & ~0xfffull) + (uint64_t)(imm << 12);
+            reg = w & 0x1fu;
+            continue;
+        }
+        if ((w & 0x7f000000u) != 0x11000000u || ((w >> 5) & 0x1fu) != reg)
+            continue;
+        const uint64_t addr = page + ((w >> 10) & 0xfffu);
+        if (addr < img.base || addr - img.base >= (uint64_t)img.image_vmsize)
+            continue;
+        const uint32_t rva = (uint32_t)(addr - img.base);
+        if (rva < 0x800000u)
+            continue;
+        const uint32_t site = (uint32_t)(text_lo - img.base + i);
+        if (g_bc_vtref.find(rva) == g_bc_vtref.end())
+            g_bc_vtref[rva] = site;
+    }
+    RCL_LOGLN("[layout] %zu table references indexed", g_bc_vtref.size());
+}
+
+static void bc_layout_add(uint32_t *list, uint32_t *n, uint32_t cap, uint32_t off)
+{
+    if (!off || *n >= cap)
+        return;
+    for (uint32_t i = 0; i < *n; i++)
+    {
+        if (list[i] == off)
+            return;
+    }
+    list[(*n)++] = off;
+}
+
+static void bc_layout_scan(const Image &img, uint32_t fn_rva, uint32_t vt_rva, BcLayout *out,
+                           uint32_t budget)
+{
+    uint64_t page = 0;
+    uint32_t rd = 0;
+    uint32_t reg = 0xffffffffu;
+    for (uint32_t i = 0; i + 8 <= budget; i += 4)
+    {
+        if (bc_adrp_at(img, fn_rva, i, &page, &rd))
+        {
+            reg = rd;
+            continue;
+        }
+        uint32_t w = 0;
+        if (!bc_read(img.base + fn_rva + i, &w, 4))
+            return;
+        if ((w & 0x7f000000u) == 0x11000000u && ((w >> 5) & 0x1fu) == reg)
+        {
+            if (page + ((w >> 10) & 0xfffu) == img.base + vt_rva)
+            {
+                out->ctor = fn_rva;
+                uint32_t j = i + 4;
+                for (; j + 8 <= budget; j += 4)
+                {
+                    uint32_t s = 0;
+                    if (!bc_read(img.base + fn_rva + j, &s, 4))
+                        break;
+                    if ((s & 0xffc00000u) == 0xf9000000u)
+                    {
+                        const uint32_t imm = ((s >> 10) & 0xfffu) * 8u;
+                        if (imm && imm < 0x4000u)
+                            bc_layout_add(out->fields, &out->nfields, 48, imm);
+                    }
+                    else if ((s & 0xffc00000u) == 0xb9000000u)
+                    {
+                        const uint32_t imm = ((s >> 10) & 0xfffu) * 4u;
+                        if (imm && imm < 0x4000u)
+                            bc_layout_add(out->fields, &out->nfields, 48, imm);
+                    }
+                    else if ((s & 0xffc00000u) == 0x39000000u)
+                    {
+                        const uint32_t imm = (s >> 10) & 0xfffu;
+                        if (imm && imm < 0x4000u)
+                            bc_layout_add(out->fields, &out->nfields, 48, imm);
+                    }
+                }
+                return;
+            }
+        }
+    }
+}
+
+static void bc_stores_from(const Image &img, uint32_t site, BcLayout *out, uint32_t budget)
+{
+    for (uint32_t j = 0; j + 8 <= budget; j += 4)
+    {
+        uint32_t s = 0;
+        if (!bc_read(img.base + site + j, &s, 4))
+            return;
+        if ((s & 0xffc00000u) == 0xf9000000u)
+        {
+            const uint32_t imm = ((s >> 10) & 0xfffu) * 8u;
+            if (imm && imm < 0x4000u)
+                bc_layout_add(out->fields, &out->nfields, 48, imm);
+        }
+        else if ((s & 0xffc00000u) == 0xb9000000u)
+        {
+            const uint32_t imm = ((s >> 10) & 0xfffu) * 4u;
+            if (imm && imm < 0x4000u)
+                bc_layout_add(out->fields, &out->nfields, 48, imm);
+        }
+        else if ((s & 0xffc00000u) == 0x39000000u)
+        {
+            const uint32_t imm = (s >> 10) & 0xfffu;
+            if (imm && imm < 0x4000u)
+                bc_layout_add(out->fields, &out->nfields, 48, imm);
+        }
+    }
+}
+
+static void bc_getter_scan(const Image &img, uint32_t fn_rva, BcLayout *out)
+{
+    for (uint32_t i = 0; i + 8 <= 64; i += 4)
+    {
+        uint32_t w = 0;
+        uint32_t n = 0;
+        if (!bc_read(img.base + fn_rva + i, &w, 4))
+            return;
+        if ((w & 0xffc00000u) == 0xbd400000u)
+        {
+            const uint32_t imm = ((w >> 10) & 0xfffu) * 4u;
+            if (!bc_read(img.base + fn_rva + i + 4, &n, 4))
+                return;
+            if (n == 0xd65f03c0u && imm < 0x1000u)
+                bc_layout_add(out->floats, &out->nfloats, 16, imm);
+        }
+    }
+}
+
+static uint32_t bc_cell_refs(const Image &img, uint32_t fn_rva, uint32_t *cells, uint32_t cap,
+                             uint32_t budget)
+{
+    uint32_t n = 0;
+    uint64_t page = 0;
+    uint32_t rd = 0;
+    uint32_t reg = 0xffffffffu;
+    for (uint32_t i = 0; i + 8 <= budget && n < cap; i += 4)
+    {
+        if (bc_adrp_at(img, fn_rva, i, &page, &rd))
+        {
+            reg = rd;
+            continue;
+        }
+        uint32_t w = 0;
+        if (!bc_read(img.base + fn_rva + i, &w, 4))
+            break;
+        if ((w & 0x7f000000u) != 0x11000000u || ((w >> 5) & 0x1fu) != reg)
+            continue;
+        const uint64_t addr = page + ((w >> 10) & 0xfffu);
+        if (addr < img.base || addr - img.base >= img.image_vmsize)
+            continue;
+        const uint32_t rva = (uint32_t)(addr - img.base);
+        if (rva < img.image_vmsize / 2)
+            continue;
+        bool dup = false;
+        for (uint32_t k = 0; k < n; k++)
+        {
+            if (cells[k] == rva)
+            {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup)
+            cells[n++] = rva;
+    }
+    return n;
+}
+
+static void bc_slot_flags(const Image &img, uint32_t table_rva, uint32_t slots, BcLayout *out)
+{
+    uint32_t counts[4] = {0, 0, 0, 0};
+    if (slots > 256)
+        slots = 256;
+    for (uint32_t i = 0; i < slots; i++)
+    {
+        uint64_t w = 0;
+        if (!bc_read(img.base + table_rva + (uint64_t)i * 8, &w, 8) || !w)
+            break;
+        const uint32_t hi = (uint32_t)(w >> 32);
+        if (hi == 0x00100001u)
+            counts[0]++;
+        else if (hi == 0x00300001u)
+            counts[1]++;
+        else if (hi == 0)
+            counts[2]++;
+        else
+            counts[3]++;
+    }
+    for (int i = 0; i < 4; i++)
+        out->flag_sum[i] = counts[i];
+}
+
 static void bc_write_one(const Image &img, const char *root,
                          const std::vector<std::pair<uint32_t, uint64_t>> &cls,
                          const std::map<uint32_t, uint32_t> &kind_of,
                          const std::map<uint32_t, std::string> &lbl,
                          const std::map<uint32_t, int> &src_of)
 {
+    bc_vtref_scan(img);
+
     char path[1200];
     snprintf(path, sizeof path, "%s/BattleDumpAll.md", root);
     FILE *f = fopen(path, "w");
@@ -2662,6 +2912,63 @@ static void bc_write_one(const Image &img, const char *root,
                         (mn && *mn && strcmp(mn, "-") != 0) ? mn : "");
             }
             fprintf(f, "\n");
+        }
+
+        if (nslots)
+        {
+            BcLayout lay;
+            lay.nfields = 0;
+            lay.nfloats = 0;
+            lay.ncells = 0;
+            lay.ctor = 0;
+            for (int i = 0; i < 4; i++)
+                lay.flag_sum[i] = 0;
+            uint32_t scan_max = nslots < 16 ? nslots : 16;
+            for (uint32_t s = 0; s < scan_max && !lay.ctor; s++)
+                bc_layout_scan(img, slots[s], (uint32_t)(vt - img.base), &lay, 384);
+            std::map<uint32_t, uint32_t>::iterator ref =
+                g_bc_vtref.find((uint32_t)(vt - img.base));
+            if (ref != g_bc_vtref.end())
+            {
+                if (!lay.ctor)
+                    lay.ctor = ref->second;
+                bc_stores_from(img, ref->second, &lay, 512);
+            }
+            for (uint32_t s = 0; s < scan_max; s++)
+                bc_getter_scan(img, slots[s], &lay);
+            for (uint32_t s = 0; s < scan_max && lay.ncells < 8; s++)
+                lay.ncells += bc_cell_refs(img, slots[s], lay.cells + lay.ncells,
+                                           8 - lay.ncells, 512);
+            bc_slot_flags(img, (uint32_t)(vt - img.base), nslots, &lay);
+            fprintf(f, "#### layout\n\n");
+            if (lay.ctor)
+                fprintf(f, "- initialiser `0x%x` stores the table, so this class is built there\n",
+                        lay.ctor);
+            if (lay.nfields)
+            {
+                fprintf(f, "- field offsets written by the initialiser:");
+                for (uint32_t i = 0; i < lay.nfields; i++)
+                    fprintf(f, " `0x%x`", lay.fields[i]);
+                fprintf(f, "\n");
+                fprintf(f, "- low bound on the object size `0x%x`\n",
+                        lay.fields[lay.nfields - 1] + 8);
+            }
+            if (lay.nfloats)
+            {
+                fprintf(f, "- float getters, `return this->f[off]`:");
+                for (uint32_t i = 0; i < lay.nfloats; i++)
+                    fprintf(f, " `0x%x`", lay.floats[i]);
+                fprintf(f, "\n");
+            }
+            if (lay.ncells)
+            {
+                fprintf(f, "- data cells this class touches:");
+                for (uint32_t i = 0; i < lay.ncells; i++)
+                    fprintf(f, " `0x%x`", lay.cells[i]);
+                fprintf(f, "\n");
+            }
+            fprintf(f, "- slot flags: pair `0x00100001` %u, `0x00300001` %u, empty %u, other %u\n\n",
+                    lay.flag_sum[0], lay.flag_sum[1], lay.flag_sum[2], lay.flag_sum[3]);
         }
 
         uint32_t shown = 0;
@@ -2835,7 +3142,78 @@ static void bc_write_one(const Image &img, const char *root,
         fprintf(f, "| refs `%u` |\n\n", refs.count(id) ? refs[id] : 0);
     }
 
-    fprintf(f, "## root containers\n\n| offset | count | element class | class |\n"
+    fprintf(f, "## class relations\n\n");
+    fprintf(f, "- a class whose slots start with the slots of another class shares its head, which "
+               "is what inheritance looks like in a flat table\n\n");
+    fprintf(f, "| class | kind | slots | shares the head with |\n|-------|------|------:|"
+               "---------------------|\n");
+    {
+        std::vector<std::vector<uint32_t>> v(cls.size());
+        for (size_t c = 0; c < cls.size(); c++)
+        {
+            uint32_t slots[128];
+            const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 128);
+            v[c].assign(slots, slots + n);
+        }
+        for (size_t a = 0; a < cls.size(); a++)
+        {
+            const char *best = "";
+            for (size_t b = 0; b < cls.size() && best[0] == 0; b++)
+            {
+                if (a == b || v[b].size() < 4 || v[a].size() < 4)
+                    continue;
+                if (v[b].size() > v[a].size())
+                    continue;
+                uint32_t same = 0;
+                for (size_t k = 0; k < v[b].size(); k++)
+                {
+                    if (v[a][k] == v[b][k])
+                        same++;
+                }
+                if (same >= v[b].size() - 1 && same >= 4)
+                    best = lbl.find(cls[b].first)->second.c_str();
+            }
+            fprintf(f, "| %s | `%s` | %zu | %s |\n", lbl.find(cls[a].first)->second.c_str(),
+                    nl_kind_name(kind_of.find(cls[a].first)->second), v[a].size(), best);
+        }
+    }
+
+    fprintf(f, "\n## fingerprints\n\n");
+    fprintf(f, "- one line per class, meant to be compared with another build: the slot count, how "
+               "many slots the reference bundle names, and how many slots call into another slot "
+               "of the same family\n\n");
+    fprintf(f, "| class | slots | named | internal calls |\n|-------|------:|------:|"
+               "---------------:|\n");
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        uint32_t slots[128];
+        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 128);
+        uint32_t named = 0;
+        uint32_t internal = 0;
+        for (uint32_t s = 0; s < n; s++)
+        {
+            const char *mn = bc_method_name(img, slots[s]);
+            if (mn && *mn && strcmp(mn, "-") != 0)
+                named++;
+            uint32_t calls[8];
+            const uint32_t got = bc_calls_of(img, slots[s], calls, 8, 192);
+            for (uint32_t k = 0; k < got; k++)
+            {
+                for (uint32_t t = 0; t < n; t++)
+                {
+                    if (slots[t] == calls[k])
+                    {
+                        internal++;
+                        break;
+                    }
+                }
+            }
+        }
+        fprintf(f, "| %s | %u | %u | %u |\n", lbl.find(cls[c].first)->second.c_str(), n, named,
+                internal);
+    }
+
+    fprintf(f, "\n## root containers\n\n| offset | count | element class | class |\n"
                "|-------:|------:|--------------:|-------|\n");
     for (size_t r = 0; r < g_bc_arr.size(); r++)
     {
@@ -2846,6 +3224,11 @@ static void bc_write_one(const Image &img, const char *root,
         fprintf(f, "| `0x%x` | %u | %u | %s |\n", g_bc_arr[r].off, g_bc_arr[r].n,
                 g_bc_arr[r].ccls, cl);
     }
+
+#if defined(__APPLE__)
+    fprintf(f, "\n## objc classes of this image\n\n");
+    objc_dump(f, img.base, img.image_vmsize ? img.image_vmsize : img.vmsize);
+#endif
 
     fprintf(f, "\n## method tables of this binary\n\n");
     rcl_targets_scan(img, f);
