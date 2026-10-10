@@ -374,6 +374,18 @@ uint32_t kind_of_text(const std::string &s)
                                          "_debris", "_spark", "_lobby_", "_ulti",    "_atk",
                                          "_def",   "_idle",  "_walk",   "_run",      "_hit",
                                          "_ground", "_wall"};
+    static const char *const kCosmetic[] = {"pin",     "icon",    "badge",   "spray",  "emote",
+                                           "skin",    "frame",   "banner",  "sticker", "namecolor",
+                                           "gift",    "shop",    "market",  "mastery", "quest",
+                                           "rank",    "season",  "pass",    "offer",  "bundle",
+                                           "alliance", "club",   "friend",  "profile", "music",
+                                           "font",    "locale",  "string",  "theme",  "chat",
+                                           "stream",  "mail",    "trophy",  "reward", "unlock",
+                                           "tutorial", "currency"};
+    if (has_any(h, kCosmetic, sizeof kCosmetic / sizeof kCosmetic[0]))
+    {
+        return NLK_ASSET;
+    }
     if (has_any(h, kLogic, sizeof kLogic / sizeof kLogic[0]))
     {
         return NLK_LOGIC;
