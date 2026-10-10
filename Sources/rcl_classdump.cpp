@@ -1149,6 +1149,20 @@ void slots_of(const Image &img, const ClassTable &t, std::vector<uint32_t> &out,
     std::sort(out.begin(), out.end());
 }
 
+const char *class_from_signature_text(const char *s, char *out, size_t cap) {
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') p++;
+    const char *b = p;
+    while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
+           *p == '_')
+        p++;
+    if (p - b < 3 || p[0] != ':' || p[1] != ':') return nullptr;
+    if ((size_t)(p - b) + 1 > cap) return nullptr;
+    memcpy(out, b, (size_t)(p - b));
+    out[p - b] = 0;
+    return out;
+}
+
 void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
                               const std::vector<ClassTable> &tables,
                               const std::map<uint32_t, FnAgg> &fns) {
@@ -1171,7 +1185,9 @@ void name_tables_from_strings(const Image &img, const std::vector<StrEnt> &strs,
                 const StrEnt *e = find_str(strs, it->second.str_list[k]);
                 if (!e || !read_str(img, *e, buf, sizeof buf)) continue;
                 const bool cs = class_specific_string(buf);
+                char sbuf[128];
                 const char *owner = ref_class_for_signature(buf);
+                if (!owner) owner = class_from_signature_text(buf, sbuf, sizeof sbuf);
                 if (owner) votes[owner] += cs ? 2 : 1;
                 if (cs && class_from_text(buf, cbuf, sizeof cbuf)) own[cbuf] += 1;
             }
