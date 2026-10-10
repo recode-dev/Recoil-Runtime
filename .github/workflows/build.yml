@@ -7,11 +7,22 @@ on:
   workflow_dispatch:
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile every translation unit
+        run: |
+          set -e
+          for f in Sources/*.cpp; do
+            g++ -fsyntax-only -std=c++17 -Wall -Wextra -Werror -Wno-unused-parameter \
+                -DRCL_HOST_TEST -ISources "$f"
+          done
+
   dylib:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Theos
         run: |
           export THEOS="$RUNNER_TEMP/theos"
@@ -20,20 +31,16 @@ jobs:
           curl -fsSL -o "$THEOS/bin/ldid" \
             https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64
           chmod +x "$THEOS/bin/ldid"
-          "$THEOS/bin/ldid" -v || true
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           echo "$THEOS/bin" >> "$GITHUB_PATH"
-
       - name: Build
         run: make -j4
-
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: RecoilRuntime-dylib
           path: RecoilRuntime.dylib
           if-no-files-found: error
-
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
