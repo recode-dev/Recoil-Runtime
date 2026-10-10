@@ -1199,6 +1199,14 @@ static void bc_note_arr(uint32_t pcls, uint32_t ccls, uint32_t off, uint32_t via
             if (g_bc_arr[i].n < n) g_bc_arr[i].n = n;
             return;
         }
+    } else {
+        for (size_t i = 0; i < g_bc_arr.size(); i++) {
+            if (g_bc_arr[i].pcls != kBcRootCls) continue;
+            if (g_bc_arr[i].via != via || g_bc_arr[i].off != off || g_bc_arr[i].ccls != ccls)
+                continue;
+            g_bc_arr.erase(g_bc_arr.begin() + (std::ptrdiff_t)i);
+            break;
+        }
     }
     if (g_bc_arr.size() >= 4096) return;
     BcArr a;
@@ -1335,8 +1343,8 @@ static void bc_collect(const Image &img, uint64_t cur, uint64_t mgr) {
         g_bc_roots = true;
         bc_scan_globals(img);
     }
-    if (mgr) bc_walk(img, mgr, 6, 2048);
     if (cur) bc_walk(img, cur, 6, 2048);
+    else if (mgr) bc_walk(img, mgr, 6, 2048);
 }
 
 static void bc_write_offsets(const Image &img) {
