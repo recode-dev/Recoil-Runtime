@@ -217,12 +217,37 @@ static bool gsm_slots_from_code(const Image &img, uint64_t *out, int cap, int &c
     return count > 0;
 }
 
+static uint64_t g_slot[8];
+static int g_slot_n = 0;
+static uint64_t g_slot_base = 0;
+static bool g_slot_scanned = false;
+
+static bool gsm_slots(const Image &img, uint64_t *slots, int &ns) {
+    if (g_slot_base != img.base) {
+        g_slot_base = img.base;
+        g_slot_scanned = false;
+        g_slot_n = 0;
+    }
+    if (!g_slot_scanned) {
+        g_slot_scanned = true;
+        uint64_t s[8];
+        int got = 0;
+        if (gsm_slots_from_code(img, s, 8, got)) {
+            for (int i = 0; i < got; i++) g_slot[i] = s[i];
+            g_slot_n = got;
+        }
+    }
+    for (int i = 0; i < g_slot_n; i++) slots[i] = g_slot[i];
+    ns = g_slot_n;
+    return ns > 0;
+}
+
 static bool discover_live(const Image &img, LiveAnchors &a) {
     a = LiveAnchors();
     if (!img.ok()) return false;
     uint64_t slots[8];
     int ns = 0;
-    if (!gsm_slots_from_code(img, slots, 8, ns)) return false;
+    if (!gsm_slots(img, slots, ns)) return false;
     for (int i = 0; i < ns; i++) {
         uint64_t obj = 0;
         uint32_t st = 0;
@@ -247,28 +272,36 @@ static const LiveAnchors &anchors_for(const Image &img) {
     if (g_la_base != img.base) {
         g_la_base = img.base;
         g_la_tried = false;
-    }
-    if (!g_la_tried) {
-        g_la_tried = true;
         g_la = LiveAnchors();
-        const uint64_t ovh = env_u64("RCL_HOME_SLOT_RVA", 0);
-        if (ovh) {
-            g_la.home_slot = img.base + ovh;
-            if (rd64(g_la.home_slot, g_la.home) && g_la.home) g_la.ok = true;
-        } else if (!discover_live(img, g_la)) {
-            RCL_LOGLN("[live] singleton not discovered; live dump will report candidates only");
-        }
-        if (g_la.ok) {
-            g_la.state_off = (uint32_t)env_u64("RCL_STATE_OFF", g_la.state_off);
-            g_la.current_off = (uint32_t)env_u64("RCL_CURRENT_OFF", g_la.current_off);
-            g_la.mgr_off = (uint32_t)env_u64("RCL_MGR_OFF", g_la.mgr_off);
-            g_la.input_off = (uint32_t)env_u64("RCL_INPUT_OFF", g_la.input_off);
-            RCL_LOGLN("[live] singleton slot=0x%llx state=+0x%x current=+0x%x mgr=+0x%x input=+0x%x "
-                      "arr=+0x%x cap=+0x%x count=+0x%x",
-                      (unsigned long long)g_la.home_slot, g_la.state_off, g_la.current_off,
-                      g_la.mgr_off, g_la.input_off, g_la.arr_off, g_la.cap_off, g_la.count_off);
-        }
     }
+    if (g_la.ok) return g_la;
+    LiveAnchors cand;
+    const uint64_t ovh = env_u64("RCL_HOME_SLOT_RVA", 0);
+    if (ovh) {
+        cand.home_slot = img.base + ovh;
+        if (rd64(cand.home_slot, cand.home) && cand.home) cand.ok = true;
+    } else if (!discover_live(img, cand)) {
+        if (!g_la_tried) {
+            g_la_tried = true;
+            uint64_t slots[8];
+            int ns = 0;
+            const bool have = gsm_slots(img, slots, ns);
+            RCL_LOGLN("[live] state slot %s (%d candidate(s)); manager not up yet, retrying",
+                      have ? "resolved" : "not resolved", have ? ns : 0);
+        }
+        return g_la;
+    }
+    cand.state_off = (uint32_t)env_u64("RCL_STATE_OFF", cand.state_off);
+    cand.current_off = (uint32_t)env_u64("RCL_CURRENT_OFF", cand.current_off);
+    cand.mgr_off = (uint32_t)env_u64("RCL_MGR_OFF", cand.mgr_off);
+    cand.input_off = (uint32_t)env_u64("RCL_INPUT_OFF", cand.input_off);
+    RCL_LOGLN("[live] singleton slot=0x%llx (+0x%llx) state=+0x%x current=+0x%x mgr=+0x%x input=+0x%x "
+              "arr=+0x%x cap=+0x%x count=+0x%x",
+              (unsigned long long)cand.home_slot, (unsigned long long)(cand.home_slot - img.base),
+              cand.state_off, cand.current_off, cand.mgr_off, cand.input_off, cand.arr_off,
+              cand.cap_off, cand.count_off);
+    g_la = cand;
+    g_la_tried = true;
     return g_la;
 }
 
@@ -1239,8 +1272,11 @@ void battle_capture_autostart(const Image &img)
     {
         const LiveAnchors &a = anchors_for(img);
         if (g_bc_f) {
-            fprintf(g_bc_f, "# anchors home_slot=0x%llx state_off=0x%x current_off=0x%x mgr_off=0x%x\n",
-                    (unsigned long long)(a.home_slot - img.base), a.state_off, a.current_off, a.mgr_off);
+            if (a.ok)
+                fprintf(g_bc_f, "# anchors home_slot=+0x%llx state_off=0x%x current_off=0x%x mgr_off=0x%x\n",
+                        (unsigned long long)(a.home_slot - img.base), a.state_off, a.current_off, a.mgr_off);
+            else
+                fprintf(g_bc_f, "# anchors pending: state manager not created yet\n");
             fflush(g_bc_f);
         }
     }
