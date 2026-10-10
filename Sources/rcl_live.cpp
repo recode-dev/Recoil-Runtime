@@ -621,6 +621,7 @@ static void dump_getters(const Image &img, uint64_t vptr, int first, int last, c
 }
 
 static bool g_bc_nl_ready = false;
+static int g_bc_last_src = -1;
 static const char *bc_class_label(const Image &img, uint64_t vt, char *buf, size_t cap);
 
 static void dump_object(const Image &img, uint64_t o, int idx, bool full)
@@ -1282,6 +1283,7 @@ void bc_open_file(void)
     fflush(g_bc_f);
 }
 
+static void bc_sem_note(uint32_t id, uint32_t off, int kind, uint64_t value);
 static uint32_t bc_walk_depth_max(void);
 static uint32_t bc_walk_nodes(void);
 static useconds_t bc_poll_us(void);
@@ -1416,12 +1418,14 @@ static const char *bc_class_label(const Image &img, uint64_t vt, char *buf, size
     uint32_t src = 0;
     const uint32_t rva = (uint32_t)(vt - img.base);
     nl_label(rva, slots, n, buf, cap, &src);
+    g_bc_last_src = (int)src;
     if (src == NL_STRINGS || src == NL_ASSET || src == NL_METHOD_NAMES || src == NL_NONE)
     {
         const char *tbl = rcl_table_label(rva);
         if (tbl && *tbl)
         {
             snprintf(buf, cap, "%s", tbl);
+            g_bc_last_src = 100;
             return buf;
         }
     }
@@ -1522,10 +1526,14 @@ static void bc_note_fields(const Image &img, uint32_t id, const uint64_t *words)
             continue;
         const uint64_t key = ((uint64_t)id << 32) | (uint64_t)(k * 8);
         if (g_bc_slot.find(key) != g_bc_slot.end())
+        {
+            bc_sem_note(id, k * 8, g_bc_slot[key], words[k]);
             continue;
+        }
         const int kind = bc_kind(img, words[k]);
         g_bc_slot[key] = (char)kind;
         g_bc_sample[key] = words[k];
+        bc_sem_note(id, k * 8, kind, words[k]);
         g_bc_fields++;
         fprintf(g_bc_f, "field %u off=0x%x kind=%s sample=0x%llx\n", id, k * 8, bc_kind_name(kind),
                 (unsigned long long)words[k]);
@@ -2093,6 +2101,35 @@ static void bc_all_rows(FILE *out, const char *path)
     fclose(in);
 }
 
+static const char *bc_src_name(int src)
+{
+    switch (src)
+    {
+    case NL_OVERLAY:
+        return "names file";
+    case NL_DOC_VT:
+        return "documented table";
+    case NL_DOC_METHODS:
+        return "method votes";
+    case NL_SLOTSET:
+        return "slot set match";
+    case NL_STRUCT:
+        return "structural match";
+    case NL_STRINGS:
+        return "string window";
+    case NL_METHOD_NAMES:
+        return "method name";
+    case NL_ASSET:
+        return "asset string";
+    case NL_INSTANCE:
+        return "deep dump table";
+    case 100:
+        return "class table rva";
+    default:
+        return "unnamed";
+    }
+}
+
 static void bc_battle_line(FILE *out)
 {
     fprintf(out, "- captured in battle: state `%u`, scene `0x%llx`, players `0x%llx`, "
@@ -2274,6 +2311,692 @@ static void bc_write_classes(const Image &img, const char *root,
     }
     fclose(f);
     RCL_LOGLN("[battle] class list written to %s", path);
+}
+
+struct BcSem
+{
+    char kind;
+    uint32_t reads;
+    uint32_t changes;
+    int64_t last;
+    double dmin;
+    double dmax;
+    int64_t imin;
+    int64_t imax;
+};
+
+static std::map<uint64_t, BcSem> g_bc_sem;
+static std::map<uint32_t, std::string> g_bc_sigdb;
+static std::map<std::string, uint32_t> g_bc_data_names;
+static uint32_t g_bc_sigdb_hits = 0;
+static uint32_t g_bc_sigdb_new = 0;
+static uint32_t g_bc_data_files = 0;
+
+static void bc_sem_note(uint32_t id, uint32_t off, int kind, uint64_t value)
+{
+    const uint64_t key = ((uint64_t)id << 32) | (uint64_t)off;
+    BcSem &s = g_bc_sem[key];
+    if (s.reads == 0)
+    {
+        s.kind = (char)kind;
+        s.last = (int64_t)value;
+        s.imin = (int64_t)value;
+        s.imax = (int64_t)value;
+        s.dmin = (double)value;
+        s.dmax = (double)value;
+    }
+    else
+    {
+        if (s.last != (int64_t)value)
+            s.changes++;
+        s.last = (int64_t)value;
+        if ((int64_t)value < s.imin)
+            s.imin = (int64_t)value;
+        if ((int64_t)value > s.imax)
+            s.imax = (int64_t)value;
+        if ((double)value < s.dmin)
+            s.dmin = (double)value;
+        if ((double)value > s.dmax)
+            s.dmax = (double)value;
+    }
+    s.reads++;
+}
+
+static uint32_t bc_norm_word(uint32_t w)
+{
+    if ((w & 0xfc000000u) == 0x94000000u)
+        return w & 0xfc000000u;
+    if ((w & 0x7c000000u) == 0x14000000u)
+        return w & 0x7c000000u;
+    if ((w & 0x9f000000u) == 0x90000000u)
+        return w & 0x9f00001fu;
+    if ((w & 0x9f000000u) == 0x10000000u)
+        return w & 0x9f00001fu;
+    if ((w & 0x7f000000u) == 0x11000000u)
+        return w & 0xff800000u;
+    if ((w & 0x7f000000u) == 0x51000000u)
+        return w & 0xff800000u;
+    if ((w & 0x3b000000u) == 0x39000000u)
+        return w & 0xffc00000u;
+    if ((w & 0x3b000000u) == 0x29000000u)
+        return w & 0xffc00000u;
+    if ((w & 0x3b000000u) == 0x18000000u)
+        return w & 0xffc00000u;
+    if ((w & 0xff000000u) == 0x54000000u)
+        return w & 0xff800000u;
+    if ((w & 0xffe00000u) == 0xb4000000u)
+        return w & 0xffe0001fu;
+    return w;
+}
+
+static uint32_t bc_fn_hash(const Image &img, uint32_t rva, int normalized)
+{
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 64; i++)
+    {
+        uint32_t w = 0;
+        if (!bc_read(img.base + rva + (uint64_t)i * 4, &w, 4))
+            break;
+        if (normalized)
+            w = bc_norm_word(w);
+        h = (h ^ w) * 16777619u;
+    }
+    return h ? h : 1u;
+}
+
+static uint32_t bc_slot_rvas(const Image &img, uint64_t vt, uint32_t *out, uint32_t cap)
+{
+    uint32_t n = 0;
+    for (; n < cap; n++)
+    {
+        uint64_t w = 0;
+        if (!bc_read(vt + (uint64_t)n * 8, &w, 8) || !w || !in_image(img, w))
+            break;
+        out[n] = (uint32_t)(w - img.base);
+    }
+    return n;
+}
+
+static void bc_db_load(const char *root)
+{
+    char path[1200];
+    snprintf(path, sizeof path, "%s/functions.db", root);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof line, f))
+    {
+        if (line[0] == '#')
+            continue;
+        unsigned int h = 0;
+        char name[256];
+        if (sscanf(line, "%x %255s", &h, name) != 2)
+            continue;
+        if (h)
+            g_bc_sigdb[h] = name;
+    }
+    fclose(f);
+}
+
+static void bc_db_apply(const Image &img, const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                        std::map<uint32_t, std::string> &lbl)
+{
+    if (g_bc_sigdb.empty())
+        return;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t id = cls[c].first;
+        std::string &cur = lbl[id];
+        if (bc_class_named(cur.c_str()))
+            continue;
+        uint32_t slots[96];
+        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 96);
+        std::map<std::string, uint32_t> votes;
+        for (uint32_t sl = 0; sl < n; sl++)
+        {
+            for (int nrm = 0; nrm < 2; nrm++)
+            {
+                std::map<uint32_t, std::string>::iterator it =
+                    g_bc_sigdb.find(bc_fn_hash(img, slots[sl], nrm));
+                if (it == g_bc_sigdb.end())
+                    continue;
+                const char *sep = strstr(it->second.c_str(), "::");
+                if (sep && sep != it->second.c_str())
+                {
+                    const std::string pre(it->second.c_str(), (size_t)(sep - it->second.c_str()));
+                    votes[pre]++;
+                }
+                else
+                {
+                    votes[it->second]++;
+                }
+            }
+        }
+        uint32_t best = 0;
+        bool tie = false;
+        std::string bn;
+        for (std::map<std::string, uint32_t>::iterator it = votes.begin(); it != votes.end(); ++it)
+        {
+            if (it->second > best)
+            {
+                best = it->second;
+                bn = it->first;
+                tie = false;
+            }
+            else if (it->second == best)
+            {
+                tie = true;
+            }
+        }
+        if (best >= 2 && !tie)
+        {
+            cur = bn;
+            g_bc_sigdb_hits++;
+        }
+    }
+}
+
+static void bc_db_store(const Image &img, const char *root,
+                        const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                        const std::map<uint32_t, std::string> &lbl)
+{
+    char path[1200];
+    snprintf(path, sizeof path, "%s/functions.db", root);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# function hash to name, written by Recoil-Runtime\n");
+    uint32_t written = 0;
+    std::map<uint32_t, std::string> fresh;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const std::string &lb = lbl.find(cls[c].first)->second;
+        if (!bc_class_named(lb.c_str()))
+            continue;
+        uint32_t slots[96];
+        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 96);
+        for (uint32_t s = 0; s < n; s++)
+        {
+            const char *mn = name_for_rva(slots[s]);
+            const std::string nm =
+                (mn && strcmp(mn, "-") != 0) ? std::string(mn) : lb;
+            for (int nrm = 0; nrm < 2; nrm++)
+            {
+                const uint32_t h = bc_fn_hash(img, slots[s], nrm);
+                std::map<uint32_t, std::string>::iterator it = fresh.find(h);
+                if (it != fresh.end())
+                {
+                    continue;
+                }
+                fresh[h] = nm;
+                fprintf(f, "%08x %s\n", h, nm.c_str());
+                written++;
+                if (g_bc_sigdb.find(h) == g_bc_sigdb.end())
+                    g_bc_sigdb_new++;
+            }
+        }
+    }
+    fclose(f);
+    RCL_LOGLN("[resolve] sigdb stored %u entries, %u new", written, g_bc_sigdb_new);
+}
+
+static uint32_t bc_calls_of(const Image &img, uint32_t rva, uint32_t *out, uint32_t cap,
+                            uint32_t budget)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i + 4 <= budget && n < cap; i += 4)
+    {
+        uint32_t w = 0;
+        if (!bc_read(img.base + rva + i, &w, 4))
+            break;
+        if ((w & 0xfc000000u) != 0x94000000u)
+            continue;
+        int32_t imm = (int32_t)(w & 0x03ffffffu);
+        if (imm & 0x02000000)
+            imm |= 0xfc000000;
+        const int64_t t = (int64_t)rva + (int64_t)i + (int64_t)imm * 4;
+        if (t > 0 && (uint64_t)t < img.image_vmsize)
+            out[n++] = (uint32_t)t;
+    }
+    return n;
+}
+
+static uint32_t bc_strings_of(const Image &img, uint32_t rva, char out[][96], uint32_t cap,
+                              uint32_t budget)
+{
+    uint32_t n = 0;
+    uint64_t page = 0;
+    uint32_t page_reg = 0xffffffffu;
+    for (uint32_t i = 0; i + 4 <= budget && n < cap; i += 4)
+    {
+        uint32_t w = 0;
+        if (!bc_read(img.base + rva + i, &w, 4))
+            break;
+        if ((w & 0x9f000000u) == 0x90000000u)
+        {
+            const uint32_t rd = w & 0x1fu;
+            const uint64_t immlo = (w >> 29) & 3u;
+            const uint64_t immhi = (w >> 5) & 0x7ffffu;
+            int64_t imm = (int64_t)((immhi << 2) | immlo);
+            if (imm & (1ll << 20))
+                imm |= ~((1ll << 21) - 1);
+            page = ((img.base + rva + i) & ~0xfffull) + (uint64_t)(imm << 12);
+            page_reg = rd;
+            continue;
+        }
+        if ((w & 0x7f000000u) == 0x11000000u && ((w >> 5) & 0x1fu) == page_reg)
+        {
+            const uint64_t imm12 = (w >> 10) & 0xfffu;
+            const uint64_t addr = page + imm12;
+            if (addr < img.base || addr - img.base >= img.image_vmsize)
+                continue;
+            char s[96];
+            bc_str_at(addr, s, sizeof s);
+            if (strlen(s) < 6)
+                continue;
+            bool dup = false;
+            for (uint32_t k = 0; k < n; k++)
+            {
+                if (strcmp(out[k], s) == 0)
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup)
+                continue;
+            snprintf(out[n], 96, "%s", s);
+            n++;
+        }
+    }
+    return n;
+}
+
+static void bc_data_load(const char *root)
+{
+    const char *e = getenv("RCL_DATA_DIR");
+    char dir[1024];
+    if (e && *e)
+        snprintf(dir, sizeof dir, "%s", e);
+    else
+        snprintf(dir, sizeof dir, "%s/Data", root);
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    struct dirent *ent;
+    uint32_t files = 0;
+    while ((ent = readdir(d)) != nullptr && files < 400)
+    {
+        const char *nm = ent->d_name;
+        const size_t ln = strlen(nm);
+        if (ln < 5 || (strcmp(nm + ln - 4, ".csv") != 0 && strcmp(nm + ln - 5, ".json") != 0))
+            continue;
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%s", dir, nm);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+        files++;
+        char line[4096];
+        uint32_t lines = 0;
+        while (fgets(line, sizeof line, f) && lines < 3)
+        {
+            lines++;
+            for (char *p = line; *p;)
+            {
+                while (*p && !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_'))
+                    p++;
+                char *st = p;
+                while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                              (*p >= '0' && *p <= '9') || *p == '_'))
+                    p++;
+                const size_t tok = (size_t)(p - st);
+                if (tok >= 5 && tok < 64)
+                {
+                    const std::string key(st, tok);
+                    if (g_bc_data_names.find(key) == g_bc_data_names.end())
+                        g_bc_data_names[key] = files;
+                }
+            }
+        }
+        fclose(f);
+        if (g_bc_data_names.size() > 40000)
+            break;
+    }
+    closedir(d);
+    g_bc_data_files = files;
+    RCL_LOGLN("[resolve] data names %u from %u files in %s", (uint32_t)g_bc_data_names.size(),
+              files, dir);
+}
+
+static void bc_write_fields(const Image &img, const char *root,
+                            const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                            const std::map<uint32_t, std::string> &lbl)
+{
+    char path[1200];
+    snprintf(path, sizeof path, "%s/fields.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# every field the battle dump saw, with the behaviour it showed\n\n");
+    fprintf(f, "- `reads` is how often the walk touched the offset, `changes` how often the "
+               "value differed from the previous read\n");
+    fprintf(f, "- `guess` comes from the value: `object` points at a heap object with a vtable, "
+               "`data` at a plain image address, `text` at a readable string, `float` when the "
+               "word reads as a plausible float and not as an offset, `state` when it changed "
+               "under the battle, `const` when it never did\n\n");
+    uint32_t n_obj = 0;
+    uint32_t n_state = 0;
+    uint32_t n_text = 0;
+    uint32_t n_const = 0;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t id = cls[c].first;
+        fprintf(f, "## %u. %s\n\n", id, lbl.find(id)->second.c_str());
+        fprintf(f, "| off | kind | reads | changes | min | max | guess | sample |\n");
+        fprintf(f, "|-----|------|------:|--------:|-----|-----|-------|--------|\n");
+        for (std::map<uint64_t, BcSem>::iterator it = g_bc_sem.begin(); it != g_bc_sem.end(); ++it)
+        {
+            if ((uint32_t)(it->first >> 32) != id)
+                continue;
+            const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
+            const BcSem &s = it->second;
+            const uint64_t val = (uint64_t)s.last;
+            const char *guess = "const";
+            char extra[128];
+            extra[0] = 0;
+            if (s.kind == 6)
+            {
+                guess = "text";
+                bc_str_at(val, extra, sizeof extra);
+                n_text++;
+            }
+            else if (in_image(img, val))
+            {
+                uint64_t vt = 0;
+                if (bc_read(val, &vt, 8) && vtable_valid(img, vt))
+                {
+                    guess = "object";
+                    n_obj++;
+                }
+                else
+                    guess = "data";
+            }
+            else if (s.changes > 0)
+            {
+                const float fv = (float)(uint32_t)val;
+                const uint32_t bits = (uint32_t)val;
+                float f = 0.0f;
+                memcpy(&f, &bits, 4);
+                if (fv == fv && f == f && (f > 1e-3f || f < -1e-3f) && f < 1e4f && f > -1e4f)
+                    guess = "float";
+                else
+                    guess = "state";
+                n_state++;
+            }
+            else
+                n_const++;
+            fprintf(f, "| `0x%x` | %s | %u | %u | %lld | %lld | %s | `0x%llx` %s |\n", off,
+                    bc_kind_name(s.kind), s.reads, s.changes, (long long)s.imin, (long long)s.imax,
+                    guess, (unsigned long long)val, extra);
+        }
+        fprintf(f, "\n");
+    }
+    fclose(f);
+    RCL_LOGLN("[resolve] fields: object %u state %u text %u const %u", n_obj, n_state, n_text,
+              n_const);
+}
+
+static void bc_list_add(char *list, size_t cap, const char *s)
+{
+    const size_t used = strlen(list);
+    if (used + strlen(s) + 4 >= cap)
+        return;
+    snprintf(list + used, cap - used, "%s`%s` ", used ? " " : "", s);
+}
+
+static void bc_write_anchors(const Image &img, const char *root,
+                             const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                             const std::map<uint32_t, std::string> &lbl)
+{
+    char path[1200];
+    snprintf(path, sizeof path, "%s/anchors.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# strings each class touches, the fastest way to name one by hand\n\n");
+    fprintf(f, "- strings come from the field values of the class and from the code of its "
+               "slots\n");
+    fprintf(f, "- `data` says how many of the strings are keys of the data files the game ships, "
+               "which is the strong hint for a Logic table class\n\n");
+    fprintf(f, "| class | type | kind | data keys | strings |\n");
+    fprintf(f, "|-------|------|------|----------:|--------|\n");
+    uint32_t total_keys = 0;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t id = cls[c].first;
+        const std::string &lb = lbl.find(id)->second;
+        char list[2048];
+        list[0] = 0;
+        uint32_t keys = 0;
+        uint32_t shown = 0;
+        for (std::map<uint64_t, BcSem>::iterator it = g_bc_sem.begin(); it != g_bc_sem.end(); ++it)
+        {
+            if ((uint32_t)(it->first >> 32) != id || it->second.kind != 6)
+                continue;
+            char s[96];
+            bc_str_at((uint64_t)it->second.last, s, sizeof s);
+            if (strlen(s) < 6 || shown >= 6)
+                continue;
+            if (strchr(s, ' '))
+                continue;
+            shown++;
+            bc_list_add(list, sizeof list, s);
+            if (g_bc_data_names.find(s) != g_bc_data_names.end())
+                keys++;
+        }
+        uint32_t slots[96];
+        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 96);
+        for (uint32_t s = 0; s < n && shown < 10; s++)
+        {
+            char strs[4][96];
+            const uint32_t got = bc_strings_of(img, slots[s], strs, 4, 384);
+            for (uint32_t k = 0; k < got && shown < 10; k++)
+            {
+                shown++;
+                bc_list_add(list, sizeof list, strs[k]);
+                if (g_bc_data_names.find(strs[k]) != g_bc_data_names.end())
+                    keys++;
+            }
+        }
+        total_keys += keys;
+        fprintf(f, "| %s | %s | `%s` | %u | %s |\n", lb.c_str(), bc_type_name(lb.c_str()),
+                nl_kind_name(nl_kind((uint32_t)(cls[c].second - img.base))), keys, list);
+    }
+    fclose(f);
+    RCL_LOGLN("[resolve] anchors written, data keys hit %u", total_keys);
+}
+
+static void bc_write_globals(const Image &img, const char *root,
+                             const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                             const std::map<uint32_t, std::string> &lbl)
+{
+    char path[1200];
+    snprintf(path, sizeof path, "%s/globals.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# data cells that hold an object of a class\n\n");
+    fprintf(f, "- a run of neighbouring cells that hold the same class is a table or array, a "
+               "lone cell is the singleton or the holder of one object\n");
+    fprintf(f, "- `refs` is how many code sites were seen touching that class\n\n");
+    fprintf(f, "| cell | class | class | kind | refs | shape |\n");
+    fprintf(f, "|------|-------|-------|------|-----:|-------|\n");
+    std::map<uint32_t, std::string> label_of_id;
+    for (size_t c = 0; c < cls.size(); c++)
+        label_of_id[cls[c].first] = lbl.find(cls[c].first)->second;
+    std::map<uint32_t, uint32_t> refs;
+    for (size_t i = 0; i < g_bc_access.size(); i++)
+        refs[g_bc_access[i].cls]++;
+    std::vector<std::pair<uint64_t, uint32_t>> cells;
+    for (std::map<uint64_t, uint32_t>::iterator it = g_bc_cell.begin(); it != g_bc_cell.end();
+         ++it)
+        cells.push_back(std::make_pair(it->first, it->second));
+    std::sort(cells.begin(), cells.end());
+    uint32_t tables = 0;
+    uint32_t singles = 0;
+    for (size_t i = 0; i < cells.size(); i++)
+    {
+        uint32_t run = 1;
+        while (i + run < cells.size() && cells[i + run].second == cells[i].second &&
+               cells[i + run].first - cells[i + run - 1].first <= 16)
+            run++;
+        const char *shape = run >= 3 ? "table" : "single";
+        if (run >= 3)
+            tables++;
+        else
+            singles++;
+        fprintf(f, "| `0x%llx` | %u | %s | `%s` | %u | %s (%u) |\n",
+                (unsigned long long)cells[i].first, cells[i].second,
+                label_of_id.count(cells[i].second) ? label_of_id[cells[i].second].c_str() : "-",
+                nl_kind_name(nl_kind((uint32_t)(bc_vt_of(cells[i].second)
+                                                    ? bc_vt_of(cells[i].second) - img.base
+                                                    : 0))),
+                refs.count(cells[i].second) ? refs[cells[i].second] : 0, shape, run);
+        i += run - 1;
+    }
+    fclose(f);
+    RCL_LOGLN("[resolve] globals: %u tables, %u singles", tables, singles);
+}
+
+static void bc_write_callgraph(const Image &img, const char *root,
+                               const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                               const std::map<uint32_t, std::string> &lbl)
+{
+    std::map<uint32_t, uint32_t> owner;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        uint32_t slots[96];
+        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 96);
+        for (uint32_t s = 0; s < n; s++)
+        {
+            if (owner.find(slots[s]) == owner.end())
+                owner[slots[s]] = cls[c].first;
+        }
+    }
+    char path[1200];
+    snprintf(path, sizeof path, "%s/callgraph.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# calls between the classes of the dump\n\n");
+    fprintf(f, "- an edge means a slot of the first class branches to a slot of the second, so a "
+               "class with a named neighbour is the next one to name\n");
+    fprintf(f, "- `evidence` counts the calls behind the edge\n\n");
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> edges;
+    uint32_t scanned = 0;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        uint32_t slots[96];
+        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 96);
+        for (uint32_t s = 0; s < n; s++)
+        {
+            uint32_t calls[24];
+            const uint32_t got = bc_calls_of(img, slots[s], calls, 24, 256);
+            scanned++;
+            for (uint32_t k = 0; k < got; k++)
+            {
+                std::map<uint32_t, uint32_t>::iterator it = owner.find(calls[k]);
+                if (it == owner.end() || it->second == cls[c].first)
+                    continue;
+                edges[std::make_pair(cls[c].first, it->second)]++;
+            }
+        }
+    }
+    fprintf(f, "| from | from class | to | to class | evidence |\n");
+    fprintf(f, "|------|------------|----|----------|---------:|\n");
+    for (std::map<std::pair<uint32_t, uint32_t>, uint32_t>::iterator it = edges.begin();
+         it != edges.end(); ++it)
+    {
+        const std::pair<uint32_t, uint32_t> &k = it->first;
+        fprintf(f, "| %u | %s | %u | %s | %u |\n", k.first, lbl.find(k.first)->second.c_str(),
+                k.second, lbl.find(k.second)->second.c_str(), it->second);
+    }
+    fclose(f);
+    RCL_LOGLN("[resolve] callgraph: %zu edges from %u scanned slots", edges.size(), scanned);
+}
+
+static void bc_write_resolve(const Image &img, const char *root,
+                             const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                             const std::map<uint32_t, uint32_t> &kind_of,
+                             const std::map<uint32_t, std::string> &lbl)
+{
+    uint32_t doc_classes = 0;
+    uint32_t doc_rvas = 0;
+    uint32_t doc_in = 0;
+    nl_build_check(&doc_classes, &doc_rvas, &doc_in);
+    uint32_t hits[NL_SRC_MAX + 1];
+    nl_stats(hits);
+    char path[1200];
+    snprintf(path, sizeof path, "%s/Resolve.md", root);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# how the names of this dump were found\n\n");
+    fprintf(f, "- reference bundle: `%u` classes with methods, `%u` of their first method rvas "
+               "land inside this binary, so the bundle %s this build\n",
+            doc_classes, doc_in,
+            (doc_in * 10 >= doc_classes * 8) ? "matches" : "does NOT match");
+    uint32_t named = 0;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        if (bc_class_named(lbl.find(cls[c].first)->second.c_str()))
+            named++;
+    }
+    fprintf(f, "- `%u` of `%zu` classes carry a name, the rest are string hits or unnamed "
+               "vtables\n",
+            named, cls.size());
+    fprintf(f, "\n## name sources, in the order they are tried\n\n");
+    fprintf(f, "| source | classes named |\n|--------|--------------:|\n");
+    fprintf(f, "| overlay file | %u |\n", hits[NL_OVERLAY]);
+    fprintf(f, "| documented vtable | %u |\n", hits[NL_DOC_VT]);
+    fprintf(f, "| method slot votes | %u |\n", hits[NL_DOC_METHODS]);
+    fprintf(f, "| slot set match | %u |\n", hits[NL_SLOTSET]);
+    fprintf(f, "| structural match | %u |\n", hits[NL_STRUCT]);
+    fprintf(f, "| string window | %u |\n", hits[NL_STRINGS]);
+    fprintf(f, "| method name prefix | %u |\n", hits[NL_METHOD_NAMES]);
+    fprintf(f, "| class table of the deep dump | %u |\n", hits[NL_INSTANCE]);
+    fprintf(f, "\n## learning\n\n");
+    fprintf(f, "- function db entries loaded `%zu`, new this run `%u`\n", g_bc_sigdb.size(),
+            g_bc_sigdb_new);
+    fprintf(f, "- data files read `%u`, key names `%zu`\n", g_bc_data_files,
+            g_bc_data_names.size());
+    fprintf(f, "- fields tracked `%zu`, calls scanned `%zu` arrays, globals `%zu`\n",
+            g_bc_sem.size(), g_bc_arr.size(), g_bc_cell.size());
+    fprintf(f, "\n## files\n\n");
+    fprintf(f, "- `CLASSES.md` every class, most readable first\n");
+    fprintf(f, "- `BattleDumpAll.md` every row of every class\n");
+    fprintf(f, "- `fields.md` field behaviour, `anchors.md` strings per class, `globals.md` data "
+               "cells, `callgraph.md` calls between classes\n");
+    fprintf(f, "- `functions.db` function hash to name, grows every run and is what makes the "
+               "next build resolve without the bundle\n");
+    fprintf(f, "\n## names to fix first\n\n");
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t id = cls[c].first;
+        const std::string &lb = lbl.find(id)->second;
+        if (!bc_class_named(lb.c_str()) && !bc_class_known(lb.c_str()))
+            continue;
+        if (bc_class_named(lb.c_str()))
+            continue;
+        std::map<uint32_t, uint32_t>::const_iterator kit = kind_of.find(id);
+        fprintf(f, "- `%s` %s vtable `0x%llx`\n", lb.c_str(),
+                nl_kind_name(kit == kind_of.end() ? (uint32_t)NLK_UNKNOWN : kit->second),
+                (unsigned long long)(cls[c].second - img.base));
+    }
+    fclose(f);
+    RCL_LOGLN("[resolve] report written to %s", path);
 }
 
 static void bc_write_all(const Image &img, const char *root,
@@ -2651,8 +3374,21 @@ static void bc_write_offsets(const Image &img)
     std::vector<std::pair<uint32_t, uint64_t>> cls;
     bc_class_order(cls);
 
+    char names_path[1200];
+    const char *nf = getenv("RCL_NAMES_FILE");
+    if (nf && *nf)
+        nl_load_names_file(nf);
+    else
+    {
+        snprintf(names_path, sizeof names_path, "%s/names.txt", root);
+        nl_load_names_file(names_path);
+    }
+    bc_db_load(root);
+    bc_data_load(root);
+
     std::map<uint32_t, uint32_t> kind_of;
     std::map<uint32_t, std::string> lbl;
+    std::map<uint32_t, int> src_of;
     uint32_t per_kind[NLK_KIND_MAX + 1] = {0, 0, 0, 0, 0};
     for (size_t c = 0; c < cls.size(); c++)
     {
@@ -2660,9 +3396,11 @@ static void bc_write_offsets(const Image &img)
         char lb[128];
         bc_class_label(img, cls[c].second, lb, sizeof lb);
         lbl[id] = lb;
+        src_of[id] = g_bc_last_src;
         kind_of[id] = nl_kind((uint32_t)(cls[c].second - img.base));
         per_kind[kind_of[id]]++;
     }
+    bc_db_apply(img, cls, lbl);
     for (int pass = 0; pass < 6; pass++)
     {
         uint32_t added = 0;
@@ -2749,22 +3487,31 @@ static void bc_write_offsets(const Image &img)
     fprintf(f, "`type` is `name` for an entry named as a class, `string` when the word only "
                "pointed at a string, `vt` when nothing named it.  The whole dump is also in "
                "`BattleDumpAll.md`.\n\n");
-    fprintf(f, "| class id | kind | state | type | search key | folder | label |\n");
-    fprintf(f, "|---------:|------|-------|------|------------|--------|-------|\n");
+    fprintf(f, "`source` says which pass produced the name, see `Resolve.md`.\n\n");
+    fprintf(f, "| class id | kind | state | type | source | search key | folder | label |\n");
+    fprintf(f, "|---------:|------|-------|------|--------|------------|--------|-------|\n");
     for (size_t c = 0; c < cls.size(); c++)
     {
         const uint32_t id = cls[c].first;
         const std::string &lb = lbl.find(id)->second;
         char cdir[900];
         bc_class_dir(cdir, sizeof cdir, root, kind_of[id], bc_vt_of(id) - img.base, lb.c_str());
-        fprintf(f, "| %u | `%s` | %s | %s | `%s` | `%s` | %s |\n", id, nl_kind_name(kind_of[id]),
-                bc_class_known(lb.c_str()) ? "known" : "unknown",
+        std::map<uint32_t, int>::const_iterator si = src_of.find(id);
+        fprintf(f, "| %u | `%s` | %s | %s | %s | `%s` | `%s` | %s |\n", id,
+                nl_kind_name(kind_of[id]), bc_class_known(lb.c_str()) ? "known" : "unknown",
                 bc_type_name(lb.c_str()),
-                bc_search_key(lb.c_str()), cdir, lb.c_str());
+                bc_src_name(si == src_of.end() ? -1 : si->second), bc_search_key(lb.c_str()), cdir,
+                lb.c_str());
     }
     fclose(f);
     bc_write_all(img, root, cls, kind_of, lbl);
     bc_write_classes(img, root, cls, kind_of, lbl);
+    bc_write_fields(img, root, cls, lbl);
+    bc_write_anchors(img, root, cls, lbl);
+    bc_write_globals(img, root, cls, lbl);
+    bc_write_callgraph(img, root, cls, lbl);
+    bc_write_resolve(img, root, cls, kind_of, lbl);
+    bc_db_store(img, root, cls, lbl);
     RCL_LOGLN("[battle] battle dump: %zu classes (%u known) in %s", cls.size(), known, root);
 }
 

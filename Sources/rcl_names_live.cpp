@@ -273,6 +273,26 @@ void score_strings(const std::vector<std::string> &refs, std::map<uint32_t, uint
     }
 }
 
+std::map<uint32_t, std::string> g_over_vt;
+std::map<uint32_t, std::string> g_over_method;
+
+bool over_lookup(uint32_t rva, char *buf, size_t cap)
+{
+    std::map<uint32_t, std::string>::const_iterator it = g_over_vt.find(rva);
+    if (it != g_over_vt.end())
+    {
+        snprintf(buf, cap, "%s", it->second.c_str());
+        return true;
+    }
+    it = g_over_method.find(rva);
+    if (it != g_over_method.end())
+    {
+        snprintf(buf, cap, "%s", it->second.c_str());
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 
 void nl_init(NlReadFn fn, void *ctx, uint64_t img_lo, uint64_t img_hi)
@@ -286,6 +306,239 @@ void nl_init(NlReadFn fn, void *ctx, uint64_t img_lo, uint64_t img_hi)
     {
         build();
     }
+}
+
+void nl_add_name(uint32_t rva, const char *label, bool is_vt)
+{
+    if (!label || !*label)
+    {
+        return;
+    }
+    if (is_vt)
+    {
+        g_over_vt[rva] = label;
+    }
+    else
+    {
+        g_over_method[rva] = label;
+    }
+}
+
+bool nl_load_names_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+    {
+        return false;
+    }
+    char line[512];
+    uint32_t added = 0;
+    while (fgets(line, sizeof line, f))
+    {
+        char label[256];
+        char kind[16];
+        unsigned long long rva = 0;
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+        {
+            continue;
+        }
+        if (sscanf(line, "%15s %255s %llx", kind, label, &rva) != 3)
+        {
+            continue;
+        }
+        const bool isvt = (strcmp(kind, "class") == 0 || strcmp(kind, "vt") == 0);
+        if (!isvt && strcmp(kind, "method") != 0)
+        {
+            continue;
+        }
+        nl_add_name((uint32_t)rva, label, isvt);
+        added++;
+    }
+    fclose(f);
+    return added > 0;
+}
+
+const char *nl_match_slots(const uint32_t *slots, uint32_t nslots, char *buf, size_t cap,
+                           uint32_t *score, uint32_t *cls_out)
+{
+    if (!g_ready && g_read)
+    {
+        build();
+    }
+    if (nslots > kMaxSlots)
+    {
+        nslots = kMaxSlots;
+    }
+    std::map<uint32_t, uint32_t> hits;
+    uint32_t documented = 0;
+    for (uint32_t i = 0; i < nslots; i++)
+    {
+        std::map<uint32_t, uint32_t>::const_iterator it = g_doc_method.find(slots[i]);
+        if (it != g_doc_method.end())
+        {
+            hits[it->second]++;
+            documented++;
+        }
+    }
+    uint32_t best = 0;
+    uint32_t bnh = 0;
+    bool tie = false;
+    for (std::map<uint32_t, uint32_t>::const_iterator it = hits.begin(); it != hits.end(); ++it)
+    {
+        if (it->second > bnh)
+        {
+            bnh = it->second;
+            best = it->first;
+            tie = false;
+        }
+        else if (it->second == bnh)
+        {
+            tie = true;
+        }
+    }
+    if (documented < 3 || bnh < 3 || tie)
+    {
+        return nullptr;
+    }
+    if (bnh * 10 < documented * 6)
+    {
+        return nullptr;
+    }
+    const DocClass &d = kDocClasses[best];
+    if (d.vt_slots && nslots + 2 < d.vt_slots)
+    {
+        return nullptr;
+    }
+    if (d.count >= 4 && bnh * 10 < (uint32_t)d.count * 5)
+    {
+        return nullptr;
+    }
+    label_of(best, buf, cap);
+    if (score)
+    {
+        *score = bnh;
+    }
+    if (cls_out)
+    {
+        *cls_out = best;
+    }
+    return buf;
+}
+
+const char *nl_structural(const uint32_t *slots, uint32_t nslots, char *buf, size_t cap,
+                          uint32_t *score)
+{
+    if (!g_ready && g_read)
+    {
+        build();
+    }
+    if (nslots > kMaxSlots)
+    {
+        nslots = kMaxSlots;
+    }
+    std::vector<uint32_t> cand;
+    for (uint32_t i = 0; i < kDocClassCount; i++)
+    {
+        const DocClass &d = kDocClasses[i];
+        if (d.count < 4)
+        {
+            continue;
+        }
+        if (d.vt_slots && (nslots > d.vt_slots + 2 || nslots + 2 < d.vt_slots))
+        {
+            continue;
+        }
+        uint32_t covered = 0;
+        for (uint32_t k = d.first; k < d.first + d.count && k < kDocMethodCount; k++)
+        {
+            const uint32_t rva = kDocMethods[k].rva;
+            for (uint32_t s = 0; s < nslots; s++)
+            {
+                if (slots[s] == rva)
+                {
+                    covered++;
+                    break;
+                }
+            }
+        }
+        if (covered < 3 || covered * 10 < (uint32_t)d.count * 7)
+        {
+            continue;
+        }
+        cand.push_back(i);
+    }
+    if (cand.size() != 1)
+    {
+        return nullptr;
+    }
+    label_of(cand[0], buf, cap);
+    if (score)
+    {
+        *score = 1;
+    }
+    return buf;
+}
+
+uint32_t nl_build_check(uint32_t *classes, uint32_t *rvas, uint32_t *in_image)
+{
+    if (!g_ready && g_read)
+    {
+        build();
+    }
+    uint32_t nc = 0;
+    uint32_t nr = 0;
+    uint32_t nin = 0;
+    for (uint32_t i = 0; i < kDocClassCount; i++)
+    {
+        const DocClass &d = kDocClasses[i];
+        if (!d.count)
+        {
+            continue;
+        }
+        nc++;
+        const uint32_t rva = kDocMethods[d.first].rva;
+        nr++;
+        if (rva && g_base + rva >= g_lo && g_base + rva < g_hi)
+        {
+            nin++;
+        }
+    }
+    if (classes)
+    {
+        *classes = nc;
+    }
+    if (rvas)
+    {
+        *rvas = nr;
+    }
+    if (in_image)
+    {
+        *in_image = nin;
+    }
+    return nin;
+}
+
+uint32_t nl_doc_count(void)
+{
+    return kDocClassCount;
+}
+
+uint32_t nl_doc_vt_slots(uint32_t cls)
+{
+    if (cls >= kDocClassCount)
+    {
+        return 0;
+    }
+    return kDocClasses[cls].vt_slots;
+}
+
+const char *nl_doc_name(uint32_t cls)
+{
+    if (cls >= kDocClassCount)
+    {
+        return nullptr;
+    }
+    return kDocBlob + kDocClasses[cls].name;
 }
 
 bool asset_like(const std::string &s)
@@ -450,6 +703,16 @@ const char *nl_label(uint32_t vt, const uint32_t *slots, uint32_t nslots, char *
         nslots = kMaxSlots;
     }
 
+    if (over_lookup(vt, buf, cap))
+    {
+        g_hits[NL_OVERLAY]++;
+        if (src)
+        {
+            *src = NL_OVERLAY;
+        }
+        return buf;
+    }
+
     std::map<uint32_t, uint32_t>::const_iterator vtit = g_doc_vt.find(vt);
     if (vtit != g_doc_vt.end())
     {
@@ -493,6 +756,28 @@ const char *nl_label(uint32_t vt, const uint32_t *slots, uint32_t nslots, char *
             *src = NL_DOC_METHODS;
         }
         return buf;
+    }
+
+    {
+        uint32_t score = 0;
+        if (nl_match_slots(slots, nslots, buf, cap, &score, nullptr))
+        {
+            g_hits[NL_SLOTSET]++;
+            if (src)
+            {
+                *src = NL_SLOTSET;
+            }
+            return buf;
+        }
+        if (nl_structural(slots, nslots, buf, cap, &score))
+        {
+            g_hits[NL_STRUCT]++;
+            if (src)
+            {
+                *src = NL_STRUCT;
+            }
+            return buf;
+        }
     }
 
     std::map<uint32_t, uint32_t> by_string;
