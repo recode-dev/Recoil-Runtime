@@ -3,6 +3,7 @@
 #include "rcl_docgen.h"
 #include "rcl_log.h"
 #include "rcl_names.h"
+#include "rcl_names_live.h"
 #include "rcl_live.h"
 #include "rcl_deep.h"
 #include "rcl_macho.h"
@@ -2944,6 +2945,283 @@ void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
 
 } // namespace
 
+static uint32_t meth_strings(const Image &img, uint32_t rva, char out[][128], uint32_t cap,
+                            uint32_t budget)
+{
+    uint32_t n = 0;
+    uint64_t page = 0;
+    uint32_t page_reg = 0xffffffffu;
+    for (uint32_t i = 0; i + 8 <= budget && n < cap; i += 4)
+    {
+        uint32_t w = 0;
+        if (!img.read(img.ctx, img.base + rva + i, &w, 4))
+            break;
+        if ((w & 0x9f000000u) == 0x90000000u)
+        {
+            page_reg = w & 0x1fu;
+            int64_t imm = (int64_t)((((w >> 5) & 0x7ffffu) << 2) | ((w >> 29) & 3u));
+            if (imm & (1ll << 20))
+                imm |= ~((1ll << 21) - 1);
+            page = ((img.base + rva + i) & ~0xfffull) + (uint64_t)(imm << 12);
+            continue;
+        }
+        if ((w & 0x7f000000u) != 0x11000000u || ((w >> 5) & 0x1fu) != page_reg)
+            continue;
+        const uint64_t addr = page + ((w >> 10) & 0xfffu);
+        if (addr < img.base || addr - img.base >= img.image_vmsize)
+            continue;
+        std::string s;
+        if (!img.cstr(addr, s) || s.size() < 6 || s.size() > 120)
+            continue;
+        bool dup = false;
+        for (uint32_t k = 0; k < n; k++)
+        {
+            if (strcmp(out[k], s.c_str()) == 0)
+            {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        snprintf(out[n], 128, "%s", s.c_str());
+        n++;
+    }
+    return n;
+}
+
+static uint32_t table_entries(const Image &img, uint32_t start, uint32_t slots, uint32_t *out,
+                              uint32_t cap)
+{
+    uint32_t n = 0;
+    if (slots > cap)
+        slots = cap;
+    for (uint32_t i = 0; i < slots; i++)
+    {
+        uint64_t w = 0;
+        if (!img.read(img.ctx, img.base + start + (uint64_t)i * 8, &w, 8) || !w)
+            break;
+        uint32_t rva = 0;
+        if (w >= img.base && w - img.base < img.image_vmsize)
+            rva = (uint32_t)(w - img.base);
+        else
+        {
+            const uint32_t lo = (uint32_t)(w & 0xffffffffu);
+            const uint32_t hi = (uint32_t)(w >> 32);
+            if ((hi == 0x00100001u || hi == 0x00300001u) && lo < 0x10000000u)
+                rva = lo;
+        }
+        if (!rva || rva >= (uint32_t)img.image_vmsize)
+            continue;
+        out[n++] = rva;
+    }
+    return n;
+}
+
+uint32_t rcl_targets_scan(const Image &img)
+{
+    if (!img.ok())
+        return 0;
+    std::vector<ClassTable> tables = scan_class_tables(img, nullptr);
+    std::map<uint32_t, std::string> method_sig;
+    std::map<std::string, uint32_t> method_rva;
+    std::map<std::string, uint32_t> class_table;
+    std::map<uint32_t, uint32_t> entry_table;
+    std::map<uint32_t, uint32_t> entry_owner;
+    uint32_t scanned = 0;
+    for (size_t t = 0; t < tables.size() && scanned < 60000; t++)
+    {
+        uint32_t entries[64];
+        const uint32_t n = table_entries(img, tables[t].start, tables[t].slots, entries, 64);
+        for (uint32_t e = 0; e < n; e++)
+        {
+            if (entry_table.find(entries[e]) == entry_table.end())
+                entry_table[entries[e]] = tables[t].start;
+        }
+        for (uint32_t e = 0; e < n && scanned < 60000; e++)
+        {
+            scanned++;
+            if (method_sig.count(entries[e]))
+                continue;
+            char strs[5][128];
+            const uint32_t got = meth_strings(img, entries[e], strs, 5, 320);
+            if (!got)
+                continue;
+            const char *cs[5];
+            for (uint32_t k = 0; k < got; k++)
+                cs[k] = strs[k];
+            char sig[192];
+            uint32_t score = 0;
+            if (!nl_method_sig_by_strings(cs, got, sig, sizeof sig, &score, nullptr))
+                continue;
+            method_sig[entries[e]] = sig;
+            if (method_rva.find(sig) == method_rva.end())
+                method_rva[sig] = entries[e];
+            const char *sep = strstr(sig, "::");
+            if (sep)
+            {
+                const std::string cls(sig, (size_t)(sep - sig));
+                if (class_table.find(cls) == class_table.end())
+                    class_table[cls] = tables[t].start;
+            }
+        }
+    }
+    uint32_t bundle_hits = 0;
+    for (uint32_t k = 0; k < nl_doc_method_count(); k++)
+    {
+        uint32_t rva = 0;
+        char sig[192];
+        if (!nl_doc_method_at(k, &rva, nullptr, sig, sizeof sig) || !rva || !*sig)
+            continue;
+        std::map<uint32_t, uint32_t>::iterator et = entry_table.find(rva);
+        if (et == entry_table.end())
+            continue;
+        bundle_hits++;
+        if (method_sig.find(rva) == method_sig.end())
+            method_sig[rva] = sig;
+        if (method_rva.find(sig) == method_rva.end())
+            method_rva[sig] = rva;
+        const char *sep = strstr(sig, "::");
+        if (sep)
+        {
+            const std::string cls(sig, (size_t)(sep - sig));
+            if (class_table.find(cls) == class_table.end())
+                class_table[cls] = et->second;
+        }
+    }
+    RCL_LOGLN("[targets] scanned %u methods, identified %zu (%u from the bundle rvas), classes %zu",
+              scanned, method_sig.size(), bundle_hits, class_table.size());
+
+    char path[1200];
+    snprintf(path, sizeof path, "%s/methods.md", dumps_root());
+    FILE *f = fopen(path, "w");
+    if (f)
+    {
+        fprintf(f, "# methods identified in this binary by their own strings\n\n");
+        fprintf(f, "- a method lands here when the strings it references match the signatures the "
+                   "reference bundle recorded for it, so the rva is the address in THIS build\n");
+        fprintf(f, "- `score` is how many of those signature strings the function really "
+                   "references, two is the minimum\n\n");
+        fprintf(f, "| class | method | method rva | table rva |\n|-------|--------|-----------:|"
+                   "----------:|\n");
+        std::map<std::string, std::pair<uint32_t, uint32_t>> rows;
+        for (std::map<uint32_t, std::string>::iterator it = method_sig.begin();
+             it != method_sig.end(); ++it)
+        {
+            const char *sep = strstr(it->second.c_str(), "::");
+            const std::string cls =
+                sep ? std::string(it->second.c_str(), (size_t)(sep - it->second.c_str()))
+                    : std::string(it->second);
+            std::map<std::string, uint32_t>::iterator ct = class_table.find(cls);
+            rows[it->second] = std::make_pair(it->first,
+                                             ct == class_table.end() ? 0u : ct->second);
+        }
+        uint32_t written = 0;
+        for (std::map<std::string, std::pair<uint32_t, uint32_t>>::iterator it = rows.begin();
+             it != rows.end(); ++it)
+        {
+            const char *sep = strstr(it->first.c_str(), "::");
+            const std::string cls =
+                sep ? std::string(it->first.c_str(), (size_t)(sep - it->first.c_str()))
+                    : std::string("-");
+            fprintf(f, "| %s | `%s` | `0x%x` | `0x%x` |\n", cls.c_str(), it->first.c_str(),
+                    it->second.first, it->second.second);
+            written++;
+        }
+        fclose(f);
+        RCL_LOGLN("[targets] methods written to %s (%u rows)", path, written);
+    }
+
+    const char *tf = getenv("RCL_TARGETS");
+    char tpath[1200];
+    if (tf && *tf)
+        snprintf(tpath, sizeof tpath, "%s", tf);
+    else
+        snprintf(tpath, sizeof tpath, "%s/../targets.txt", dumps_root());
+    FILE *tin = fopen(tpath, "r");
+    if (!tin)
+        return (uint32_t)method_sig.size();
+
+    snprintf(path, sizeof path, "%s/targets.md", dumps_root());
+    f = fopen(path, "w");
+    if (!f)
+    {
+        fclose(tin);
+        return (uint32_t)method_sig.size();
+    }
+    uint32_t total = 0;
+    uint32_t done = 0;
+    uint32_t cls_only = 0;
+    fprintf(f, "# the wanted offsets against this binary\n\n");
+    fprintf(f, "- source `%s`, methods identified `%zu`, class tables `%zu`\n\n", tpath,
+            method_sig.size(), class_table.size());
+    fprintf(f, "| target | status | class | method | rva |\n|--------|--------|-------|--------|"
+               "----:|\n");
+    char line[512];
+    std::vector<std::string> pending;
+    while (fscanf(tin, "%511s", line) == 1)
+    {
+        std::string t(line);
+        if (t.empty() || t[0] == '#')
+            continue;
+        total++;
+        std::string norm = t;
+        const size_t dp = norm.find("__");
+        if (dp != std::string::npos)
+            norm = norm.substr(0, dp) + "_" + norm.substr(dp + 2);
+        std::string found_sig;
+        uint32_t found_rva = 0;
+        for (std::map<std::string, uint32_t>::iterator it = method_rva.begin();
+             it != method_rva.end(); ++it)
+        {
+            std::string sig = it->first;
+            for (size_t k = 0; (k = sig.find("::", k)) != std::string::npos;)
+                sig.replace(k, 2, "_");
+            const size_t par = sig.find('(');
+            if (par != std::string::npos)
+                sig.erase(par);
+            if (sig == norm || (sig.size() > norm.size() &&
+                                sig.compare(0, norm.size(), norm) == 0))
+            {
+                found_sig = it->first;
+                found_rva = it->second;
+                break;
+            }
+        }
+        if (!found_sig.empty())
+        {
+            done++;
+            const char *sep = strstr(found_sig.c_str(), "::");
+            const std::string cls =
+                sep ? std::string(found_sig.c_str(), (size_t)(sep - found_sig.c_str()))
+                    : std::string("-");
+            fprintf(f, "| `%s` | resolved | %s | `%s` | `0x%x` |\n", t.c_str(), cls.c_str(),
+                    found_sig.c_str(), found_rva);
+            continue;
+        }
+        const size_t us = norm.find('_');
+        const std::string cls = (us == std::string::npos) ? norm : norm.substr(0, us);
+        std::map<std::string, uint32_t>::iterator ct = class_table.find(cls);
+        if (ct != class_table.end())
+        {
+            cls_only++;
+            fprintf(f, "| `%s` | class only | %s |  | `0x%x` |\n", t.c_str(), cls.c_str(),
+                    ct->second);
+        }
+        else
+            pending.push_back(t);
+    }
+    fclose(tin);
+    fprintf(f, "\n%u targets, %u resolved, %u class only, %zu unresolved\n", total, done,
+            cls_only, pending.size());
+    for (size_t i = 0; i < pending.size(); i++)
+        fprintf(f, "- unresolved `%s`\n", pending[i].c_str());
+    fclose(f);
+    RCL_LOGLN("[targets] %u targets, %u resolved, %u class only, %zu unresolved -> %s", total, done,
+              cls_only, pending.size(), path);
+    return done;
+}
+
 const char *rcl_table_label(uint32_t rva)
 {
     const char *n = name_of_table(rva);
@@ -3048,6 +3326,8 @@ void dump_class_tree(const Image &img)
     }
     RCL_LOGLN("[classes] end tables=%zu slots=%llu named_slots=%llu", t.size(),
               (unsigned long long)slots, (unsigned long long)named);
+
+    rcl_targets_scan(img);
 }
 
 std::vector<ClassBoundary> discover_class_boundaries(const Image &img)

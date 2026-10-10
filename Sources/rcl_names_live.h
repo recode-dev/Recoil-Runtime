@@ -18,7 +18,8 @@ enum NlSource
     NL_OVERLAY = 7,
     NL_SLOTSET = 8,
     NL_STRUCT = 9,
-    NL_SRC_MAX = NL_STRUCT
+    NL_SIGMETHOD = 10,
+    NL_SRC_MAX = NL_SIGMETHOD
 };
 
 typedef bool (*NlReadFn)(void *ctx, uint64_t va, void *dst, size_t n);
@@ -49,6 +50,15 @@ uint32_t nl_doc_count(void);
 uint32_t nl_doc_vt_slots(uint32_t cls);
 
 const char *nl_doc_name(uint32_t cls);
+
+const char *nl_method_sig_by_strings(const char *const *strs, uint32_t n, char *buf, size_t cap,
+                                     uint32_t *score, uint32_t *cls_out);
+
+const char *nl_method_sig_at(uint32_t method_idx);
+
+uint32_t nl_doc_method_count(void);
+
+bool nl_doc_method_at(uint32_t k, uint32_t *rva, uint32_t *cls, char *sig, size_t cap);
 
 enum NlKind
 {

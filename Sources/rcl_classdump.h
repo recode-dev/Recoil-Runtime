@@ -53,6 +53,7 @@ void rcl_symbol_vocab_add(const char *token);
 void set_skip_bundle(bool skip);
 const char *dumps_root();
 const char *rcl_table_label(uint32_t rva);
+uint32_t rcl_targets_scan(const Image &img);
 void live_docs_note(const Image &img, uint32_t state, int tick);
 void live_docs_flush(const Image &img);
 

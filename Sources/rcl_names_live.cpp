@@ -23,6 +23,8 @@ bool g_ready = false;
 std::map<uint32_t, uint32_t> g_doc_vt;
 std::map<uint32_t, uint32_t> g_doc_method;
 std::map<std::string, std::vector<uint32_t>> g_sig;
+std::map<std::string, uint32_t> g_sig_method;
+std::map<uint32_t, std::string> g_method_sig_text;
 std::map<uint32_t, uint32_t> g_inst;
 std::map<uint32_t, uint32_t> g_inst_score;
 uint32_t g_hits[NL_SRC_MAX + 1] = {0, 0, 0, 0, 0, 0, 0};
@@ -198,6 +200,52 @@ void collect_sig(uint32_t cls, std::map<std::string, uint32_t> &df,
     }
 }
 
+void collect_method_sig(uint32_t mi, std::map<std::string, uint32_t> &df,
+                        std::map<std::string, uint32_t> *into)
+{
+    const DocMethod &m = kDocMethods[mi];
+    if (!m.hints)
+    {
+        return;
+    }
+    const char *p = kDocBlob + m.hints;
+    std::string cur;
+    bool quoted = false;
+    for (;;)
+    {
+        const char c = *p;
+        if (c == '\'')
+        {
+            if (quoted && cur.size() >= kSigMinLen)
+            {
+                if (into == nullptr)
+                {
+                    df[cur]++;
+                }
+                else
+                {
+                    std::map<std::string, uint32_t>::const_iterator it = df.find(cur);
+                    if (it != df.end() && it->second <= 1)
+                    {
+                        (*into)[cur] = mi;
+                    }
+                }
+            }
+            cur.clear();
+            quoted = !quoted;
+        }
+        else if (quoted)
+        {
+            cur.push_back(c);
+        }
+        if (c == 0)
+        {
+            break;
+        }
+        p++;
+    }
+}
+
 void build()
 {
     std::map<std::string, uint32_t> df;
@@ -220,6 +268,20 @@ void build()
     for (uint32_t i = 0; i < kDocClassCount; i++)
     {
         collect_sig(i, df, &g_sig);
+    }
+    std::map<std::string, uint32_t> mdf;
+    for (uint32_t k = 0; k < kDocMethodCount; k++)
+    {
+        collect_method_sig(k, mdf, nullptr);
+    }
+    for (uint32_t k = 0; k < kDocMethodCount; k++)
+    {
+        collect_method_sig(k, mdf, &g_sig_method);
+        const char *sig = kDocBlob + kDocMethods[k].sig;
+        if (sig && *sig)
+        {
+            g_method_sig_text[k] = sig;
+        }
     }
     g_ready = true;
 }
@@ -530,6 +592,104 @@ uint32_t nl_doc_vt_slots(uint32_t cls)
         return 0;
     }
     return kDocClasses[cls].vt_slots;
+}
+
+uint32_t nl_doc_method_count(void)
+{
+    return kDocMethodCount;
+}
+
+bool nl_doc_method_at(uint32_t k, uint32_t *rva, uint32_t *cls, char *sig, size_t cap)
+{
+    if (k >= kDocMethodCount)
+    {
+        return false;
+    }
+    if (rva)
+        *rva = kDocMethods[k].rva;
+    if (sig)
+        snprintf(sig, cap, "%s", kDocBlob + kDocMethods[k].sig);
+    if (cls)
+    {
+        *cls = 0;
+        for (uint32_t i = 0; i < kDocClassCount; i++)
+        {
+            const DocClass &d = kDocClasses[i];
+            if (k >= d.first && k < d.first + d.count)
+            {
+                *cls = i;
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+const char *nl_method_sig_at(uint32_t method_idx)
+{
+    if (!g_ready && g_read)
+    {
+        build();
+    }
+    std::map<uint32_t, std::string>::const_iterator it = g_method_sig_text.find(method_idx);
+    return (it == g_method_sig_text.end()) ? nullptr : it->second.c_str();
+}
+
+const char *nl_method_sig_by_strings(const char *const *strs, uint32_t n, char *buf, size_t cap,
+                                     uint32_t *score, uint32_t *cls_out)
+{
+    if (!g_ready && g_read)
+    {
+        build();
+    }
+    std::map<uint32_t, uint32_t> votes;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        if (!strs[i] || !*strs[i])
+        {
+            continue;
+        }
+        std::map<std::string, uint32_t>::const_iterator it = g_sig_method.find(strs[i]);
+        if (it != g_sig_method.end())
+        {
+            votes[it->second]++;
+        }
+    }
+    uint32_t best = 0;
+    uint32_t bn = 0;
+    bool tie = false;
+    for (std::map<uint32_t, uint32_t>::const_iterator it = votes.begin(); it != votes.end(); ++it)
+    {
+        if (it->second > bn)
+        {
+            bn = it->second;
+            best = it->first;
+            tie = false;
+        }
+        else if (it->second == bn)
+        {
+            tie = true;
+        }
+    }
+    if (bn < 2 || tie)
+    {
+        return nullptr;
+    }
+    const char *sig = nl_method_sig_at(best);
+    if (!sig || !*sig)
+    {
+        return nullptr;
+    }
+    snprintf(buf, cap, "%s", sig);
+    if (score)
+    {
+        *score = bn;
+    }
+    if (cls_out)
+    {
+        *cls_out = best;
+    }
+    return buf;
 }
 
 const char *nl_doc_name(uint32_t cls)
