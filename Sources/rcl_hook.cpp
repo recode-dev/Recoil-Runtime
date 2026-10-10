@@ -13,27 +13,26 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
-#include <libkern/OSCacheControl.h>
-#include <sys/mman.h>
+#include <mach/thread_act.h>
+#include <pthread.h>
+#include <unistd.h>
 #endif
 
 namespace rcl {
 
 namespace {
 
-const uint32_t kMaxHooks = 24;
-
-struct Target {
-    uint32_t rva;
-    uint32_t count;
-};
-
 uint64_t g_base = 0;
 uint64_t g_vmsize = 0;
+
 uint32_t *g_fn_start = nullptr;
 uint32_t *g_fn_table = nullptr;
 uint32_t g_fn_n = 0;
-uint32_t g_hooked = 0;
+
+uint32_t *g_sink = nullptr;
+uint32_t g_sink_n = 0;
+
+uint32_t g_hits = 0;
 
 bool is_ident(const char *s, size_t n) {
     if (n < 5 || n > 48) return false;
@@ -66,28 +65,6 @@ uint32_t table_for_rva(uint32_t rva) {
 
 #if defined(__APPLE__)
 
-extern "C" void rcl_runtime_shim();
-
-__asm__(
-    ".text\n"
-    ".p2align 3\n"
-    ".globl _rcl_runtime_shim\n"
-    "_rcl_runtime_shim:\n"
-    "    sub sp, sp, #0x60\n"
-    "    stp x0, x1, [sp, #0x10]\n"
-    "    stp x2, x3, [sp, #0x20]\n"
-    "    stp x4, x5, [sp, #0x30]\n"
-    "    stp x16, x30, [sp, #0x40]\n"
-    "    ldp x0, x1, [sp, #0x10]\n"
-    "    ldr x2, [sp, #0x48]\n"
-    "    bl _rcl_hook_note\n"
-    "    ldp x16, x30, [sp, #0x40]\n"
-    "    ldp x4, x5, [sp, #0x30]\n"
-    "    ldp x2, x3, [sp, #0x20]\n"
-    "    ldp x0, x1, [sp, #0x10]\n"
-    "    add sp, sp, #0x60\n"
-    "    br x16\n");
-
 bool rdmem(uint64_t va, void *dst, size_t n) {
     unsigned long long got = 0;
     if (mach_vm_read_overwrite(mach_task_self_, va, n, (unsigned long long)(uintptr_t)dst, &got) !=
@@ -110,72 +87,65 @@ bool ident_at(uint64_t va, char *out, size_t cap) {
     return is_ident(out, i);
 }
 
-bool prologue_unsafe(uint32_t w) {
-    if ((w & 0x9F000000u) == 0x90000000u) return true;
-    if ((w & 0x9F000000u) == 0x10000000u) return true;
-    if ((w & 0x1F000000u) == 0x10000000u) return true;
-    if ((w & 0x3B000000u) == 0x18000000u) return true;
-    if ((w & 0xFE000000u) == 0x54000000u) return true;
-    if ((w & 0x7C000000u) == 0x14000000u) return true;
-    if ((w & 0x7C000000u) == 0x94000000u) return true;
-    if ((w & 0xFF800000u) == 0x91000000u) return true;
-    if ((w & 0x7F800000u) == 0x11000000u) return true;
-    return false;
-}
-
-void *trampoline_for(void *target) {
-    void *mem = mmap(nullptr, 64, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (mem == MAP_FAILED) return nullptr;
-    if (!rdmem((uint64_t)(uintptr_t)target, mem, 16)) return nullptr;
-    uint32_t *p = (uint32_t *)mem;
-    p[4] = 0x58000050u;
-    p[5] = 0xD61F0200u;
-    const uint64_t back = (uint64_t)(uintptr_t)target + 16;
-    memcpy((char *)mem + 24, &back, 8);
-    sys_icache_invalidate(mem, 64);
-    return mem;
-}
-
-bool patch_entry(void *target, void *shim, void *tramp) {
-    const uintptr_t page = (uintptr_t)target & ~(uintptr_t)0xFFF;
-    if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
-    uint32_t *p = (uint32_t *)target;
-    const int64_t delta = (int64_t)(uintptr_t)shim - (int64_t)((uintptr_t)target + 4);
-    if (delta < -0x8000000 || delta > 0x7FFFFFC) {
-        mprotect((void *)page, 0x4000, PROT_READ | PROT_EXEC);
-        return false;
+bool sink_contains(uint64_t pc, uint32_t *out_sink) {
+    if (pc < g_base || pc - g_base >= g_vmsize) return false;
+    const uint32_t r = (uint32_t)(pc - g_base);
+    uint32_t lo = 0, hi = g_sink_n, best = 0;
+    bool found = false;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (g_sink[mid] <= r) {
+            best = mid;
+            found = true;
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
-    p[0] = 0x58000050u;
-    p[1] = 0x14000000u | ((uint32_t)(delta >> 2) & 0x3FFFFFFu);
-    const uint64_t tv = (uint64_t)(uintptr_t)tramp;
-    memcpy((char *)target + 8, &tv, 8);
-    sys_icache_invalidate(target, 16);
-    mprotect((void *)page, 0x4000, PROT_READ | PROT_EXEC);
+    if (!found) return false;
+    if (r - g_sink[best] >= 0x3000) return false;
+    if (out_sink) *out_sink = g_sink[best];
     return true;
+}
+
+void trace_sample(uint64_t pc, uint64_t lr, uint64_t x0, uint64_t x1) {
+    if (!sink_contains(pc, nullptr)) return;
+    char name[64];
+    if (!ident_at(x0, name, sizeof name) && !ident_at(x1, name, sizeof name)) return;
+    if (lr < g_base || lr - g_base >= g_vmsize) return;
+    const uint32_t trva = table_for_rva((uint32_t)(lr - g_base));
+    if (!trva) return;
+    rcl_symbol_vote(trva, name, "trace");
+    g_hits++;
+}
+
+void *rcl_sampler(void *) {
+    for (;;) {
+        thread_act_array_t list = nullptr;
+        mach_msg_type_number_t cnt = 0;
+        if (task_threads(mach_task_self(), &list, &cnt) == KERN_SUCCESS && list) {
+            for (mach_msg_type_number_t i = 0; i < cnt; i++) {
+                arm_thread_state64_t st;
+                mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+                if (thread_get_state(list[i], ARM_THREAD_STATE64, (thread_state_t)&st, &sc) ==
+                    KERN_SUCCESS)
+                    trace_sample(st.__pc, st.__lr, st.__x[0], st.__x[1]);
+                mach_port_deallocate(mach_task_self(), list[i]);
+            }
+            vm_deallocate(mach_task_self(), (vm_address_t)list, cnt * sizeof(thread_t));
+        }
+        usleep(300);
+    }
+    return nullptr;
 }
 
 #endif
 
 }  // namespace
 
-extern "C" void rcl_hook_note(uint64_t a0, uint64_t a1, uint64_t a2) {
+bool runtime_trace_install(const Image &img, const std::vector<ClassTable> &tables) {
 #if defined(__APPLE__)
-    char name[64];
-    if (!ident_at(a0, name, sizeof name) && !ident_at(a1, name, sizeof name)) return;
-    if (a2 < g_base || a2 - g_base >= g_vmsize) return;
-    const uint32_t trva = table_for_rva((uint32_t)(a2 - g_base));
-    if (!trva) return;
-    rcl_symbol_vote(trva, name, "hook");
-#else
-    (void)a0;
-    (void)a1;
-    (void)a2;
-#endif
-}
-
-bool runtime_hooks_install(const Image &img, const std::vector<ClassTable> &tables) {
-#if defined(__APPLE__)
-    const char *on = getenv("RCL_HOOKS");
+    const char *on = getenv("RCL_TRACE");
     if (!on || *on != '1') return false;
 
     g_base = img.base;
@@ -213,10 +183,6 @@ bool runtime_hooks_install(const Image &img, const std::vector<ClassTable> &tabl
     std::map<uint32_t, uint32_t> calls;
     const uint64_t text_lo = img.base + 0x4000;
     const uint64_t text_hi = img.base + img.vmsize;
-    const char *cs0 = getenv("RCL_STR_LO");
-    const char *cs1 = getenv("RCL_STR_HI");
-    const uint64_t slo = cs0 ? strtoull(cs0, nullptr, 0) : img.base;
-    const uint64_t shi = cs1 ? strtoull(cs1, nullptr, 0) : 0;
     uint64_t last_page[32];
     for (int r = 0; r < 32; r++) last_page[r] = 0;
     uint64_t str_seen = 0;
@@ -233,7 +199,7 @@ bool runtime_hooks_install(const Image &img, const std::vector<ClassTable> &tabl
             if ((w >> 22) & 3u) imm <<= 12;
             if (last_page[rn]) {
                 const uint64_t t = last_page[rn] + imm;
-                if (t >= slo && (shi ? t < shi : t < img.base + g_vmsize)) str_seen = va;
+                if (t >= img.base && t - img.base < g_vmsize) str_seen = va;
             }
             continue;
         }
@@ -246,46 +212,25 @@ bool runtime_hooks_install(const Image &img, const std::vector<ClassTable> &tabl
         calls[(uint32_t)(dst - img.base)]++;
     }
 
-    std::vector<Target> top;
-    for (std::map<uint32_t, uint32_t>::iterator it = calls.begin(); it != calls.end(); ++it) {
-        Target t;
-        t.rva = it->first;
-        t.count = it->second;
-        top.push_back(t);
+    std::vector<uint32_t> picks;
+    for (std::map<uint32_t, uint32_t>::iterator it = calls.begin(); it != calls.end(); ++it)
+        if (it->second >= 2) picks.push_back(it->first);
+    const char *mx = getenv("RCL_TRACE_MAX");
+    size_t want = mx ? (size_t)strtoul(mx, nullptr, 0) : 32u;
+    if (picks.size() > want) picks.resize(want);
+    if (picks.empty()) {
+        RCL_LOGLN("[trace] no string-sink candidates");
+        return false;
     }
-    std::sort(top.begin(), top.end(), [](const Target &a, const Target &b) { return a.count > b.count; });
+    std::sort(picks.begin(), picks.end());
+    g_sink = (uint32_t *)malloc(sizeof(uint32_t) * picks.size());
+    g_sink_n = (uint32_t)picks.size();
+    for (uint32_t i = 0; i < g_sink_n; i++) g_sink[i] = picks[i];
 
-    const char *mx = getenv("RCL_HOOK_MAX");
-    uint32_t want = mx ? (uint32_t)strtoul(mx, nullptr, 0) : 8u;
-    if (want > kMaxHooks) want = kMaxHooks;
-    uint32_t skipped = 0;
-    for (size_t i = 0; i < top.size() && g_hooked < want; i++) {
-        void *target = (void *)(uintptr_t)(img.base + top[i].rva);
-        uint32_t w[4];
-        if (!rdmem((uint64_t)(uintptr_t)target, w, sizeof w)) {
-            skipped++;
-            continue;
-        }
-        if (prologue_unsafe(w[0]) || prologue_unsafe(w[1]) || prologue_unsafe(w[2]) ||
-            prologue_unsafe(w[3])) {
-            skipped++;
-            continue;
-        }
-        void *tramp = trampoline_for(target);
-        if (!tramp) {
-            skipped++;
-            continue;
-        }
-        if (!patch_entry(target, (void *)(uintptr_t)rcl_runtime_shim, tramp)) {
-            skipped++;
-            continue;
-        }
-        g_hooked++;
-        RCL_LOGLN("[hook] installed at %#x (string calls=%u)", top[i].rva, top[i].count);
-    }
-    RCL_LOGLN("[hook] candidates %u, installed %u, skipped %u", (uint32_t)top.size(), g_hooked,
-              skipped);
-    return g_hooked > 0;
+    pthread_t th;
+    if (pthread_create(&th, nullptr, rcl_sampler, nullptr) == 0) pthread_detach(th);
+    RCL_LOGLN("[trace] sampling %u string sinks, fn map %u", g_sink_n, g_fn_n);
+    return true;
 #else
     (void)img;
     (void)tables;

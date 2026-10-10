@@ -119,7 +119,7 @@ void report_run(const Image &img, const Seeds &s) {
     ScanStats ss;
     std::vector<ClassTable> tb = scan_class_tables(img, &ss);
     symbolize_tables(img, tb);
-    runtime_hooks_install(img, tb);
+    runtime_trace_install(img, tb);
     write_class_docs(img);
     RCL_LOGLN("");
     write_symbols(img, tb, dumps_root());

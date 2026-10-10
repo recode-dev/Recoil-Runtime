@@ -8,6 +8,6 @@ namespace rcl {
 
 struct ClassTable;
 
-bool runtime_hooks_install(const Image &img, const std::vector<ClassTable> &tables);
+bool runtime_trace_install(const Image &img, const std::vector<ClassTable> &tables);
 
 }
