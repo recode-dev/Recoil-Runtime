@@ -1810,39 +1810,80 @@ static uint32_t kind_lookup(const std::map<uint32_t, uint32_t> &m, uint32_t id)
     return (it == m.end()) ? (uint32_t)NLK_UNKNOWN : it->second;
 }
 
-static void bc_write_kind(const Image &img, uint32_t kd, const char *dir,
+static void bc_safe_name(char *out, size_t cap, const char *in)
+{
+    size_t n = 0;
+    for (const char *p = in; *p && n + 1 < cap; p++)
+    {
+        const char c = *p;
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        out[n++] = ok ? c : '_';
+    }
+    out[n] = 0;
+    if (!n)
+        snprintf(out, cap, "unnamed");
+}
+
+static bool bc_class_known(const char *label)
+{
+    return strncmp(label, "vt_", 3) != 0 && strcmp(label, "unknown") != 0;
+}
+
+static void bc_class_dir(char *out, size_t cap, const char *root, uint32_t kd,
+                         const char *label)
+{
+    char safe[192];
+    bc_safe_name(safe, sizeof safe, label);
+    snprintf(out, cap, "%s/%s/%s/%s", root, bc_class_known(label) ? "known" : "unknown",
+             nl_kind_name(kd), safe);
+}
+
+static void bc_mkdir_p(const char *path)
+{
+    char buf[1200];
+    snprintf(buf, sizeof buf, "%s", path);
+    for (char *p = buf + 1; *p; p++)
+    {
+        if (*p != '/')
+            continue;
+        *p = 0;
+        mkdir(buf, 0755);
+        *p = '/';
+    }
+    mkdir(buf, 0755);
+}
+
+static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
                           const std::vector<std::pair<uint32_t, uint64_t>> &cls,
-                          const std::map<uint32_t, uint32_t> &kind_of)
+                          const std::map<uint32_t, uint32_t> &kind_of,
+                          const std::map<uint32_t, std::string> &lbl)
 {
     char path[1200];
-    const char *kname = nl_kind_name(kd);
-    uint32_t nk = 0;
     for (size_t c = 0; c < cls.size(); c++)
-        if (kind_lookup(kind_of, cls[c].first) == kd)
-            nk++;
-    snprintf(path, sizeof path, "%s/%s", dir, kname);
-    mkdir(path, 0755);
-    snprintf(path, sizeof path, "%s/%s/battle-offsets.tsv.md", dir, kname);
-    FILE *f = fopen(path, "w");
-    if (f)
     {
-        fprintf(f, "# recoil battle offsets\n");
-        fprintf(f,
-                "# image_base=0x%llx vmsize=0x%llx state=%u scene=0x%llx players=0x%llx count=%u "
-                "tick=%llu\n",
-                (unsigned long long)img.base,
-                (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize), g_bc_state,
-                (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players, g_bc_pcount,
-                (unsigned long long)g_bc_tick);
-        fprintf(f, "kind\tclass_id\tclass\tslot\toff\thint\tvalue\trva\tname\n");
-        for (size_t c = 0; c < cls.size(); c++)
+        const uint32_t id = cls[c].first;
+        const uint64_t vt = cls[c].second;
+        if (kind_lookup(kind_of, id) != kd)
+            continue;
+        char label[192];
+        snprintf(label, sizeof label, "%s", lbl.find(id)->second.c_str());
+        char cdir[900];
+        bc_class_dir(cdir, sizeof cdir, root, kd, label);
+        bc_mkdir_p(cdir);
+        snprintf(path, sizeof path, "%s/offsets.tsv.md", cdir);
+        FILE *f = fopen(path, "w");
+        if (f)
         {
-            const uint32_t id = cls[c].first;
-            const uint64_t vt = cls[c].second;
-            if (kind_lookup(kind_of, id) != kd)
-                continue;
-            char label[128];
-            bc_class_label(img, vt, label, sizeof label);
+            fprintf(f, "# recoil battle offsets\n");
+            fprintf(f,
+                    "# image_base=0x%llx vmsize=0x%llx state=%u scene=0x%llx players=0x%llx "
+                    "count=%u tick=%llu\n",
+                    (unsigned long long)img.base,
+                    (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize),
+                    g_bc_state, (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players,
+                    g_bc_pcount, (unsigned long long)g_bc_tick);
+            fprintf(f, "kind\tclass_id\tclass\tslot\toff\thint\tvalue\trva\tname\n");
             fprintf(f, "class\t%u\t%s\t\t\t\t0x%llx\t0x%llx\t%s\n", id, label,
                     (unsigned long long)bc_fp(img, vt), (unsigned long long)(vt - img.base), label);
             uint64_t rvas[64];
@@ -1908,72 +1949,24 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *dir,
                 fprintf(f, "global\t%u\t%s\t\t\tcell\t\t0x%llx\t\n", id, label,
                         (unsigned long long)it->first);
             }
+            fclose(f);
         }
-        for (size_t r = 0; r < g_bc_arr.size(); r++)
-        {
-            if (g_bc_arr[r].pcls != kBcRootCls)
-                continue;
-            if (kind_lookup(kind_of, g_bc_arr[r].ccls) != kd)
-                continue;
-            char cl[128];
-            bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
-            fprintf(f, "container\t\troot\t%u\t0x%x\tarray\t%u\t0x%llx\t%s\n", g_bc_arr[r].ccls,
-                    g_bc_arr[r].off, g_bc_arr[r].n,
-                    (unsigned long long)(bc_vt_of(g_bc_arr[r].ccls) - img.base), cl);
-        }
-        fclose(f);
-        RCL_LOGLN("[battle] offsets tsv written to %s", path);
-    }
+        RCL_LOGLN("[battle] class tsv written to %s", path);
 
-    snprintf(path, sizeof path, "%s/battle-offsets.md", dir);
-    f = fopen(path, "w");
-    if (f)
-    {
-        fprintf(f, "# Battle offsets (Recoil-Runtime)\n\n");
-        fprintf(f, "- image base: `0x%llx`, vmsize `0x%llx`\n", (unsigned long long)img.base,
-                (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
-        fprintf(f, "- state `%u`, scene `0x%llx`, players `0x%llx`, count `%u`, polls `%llu`\n",
-                g_bc_state, (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players,
-                g_bc_pcount, (unsigned long long)g_bc_tick);
-        fprintf(f, "- folder `%s`: `%u` of `%zu` classes\n\n", kname, nk, cls.size());
-        std::map<uint32_t, std::string> lbl;
-        for (size_t c = 0; c < cls.size(); c++)
+        snprintf(path, sizeof path, "%s/offsets.md", cdir);
+        f = fopen(path, "w");
+        if (f)
         {
-            char lb[128];
-            bc_class_label(img, cls[c].second, lb, sizeof lb);
-            lbl[cls[c].first] = lb;
-        }
-        for (int pass = 0; pass < 6; pass++)
-        {
-            uint32_t added = 0;
-            for (size_t r = 0; r < g_bc_ref.size(); r++)
-            {
-                const uint32_t child = g_bc_ref[r].ccls;
-                const uint32_t parent = g_bc_ref[r].pcls;
-                std::map<uint32_t, std::string>::iterator pi = lbl.find(parent);
-                std::map<uint32_t, std::string>::iterator ci = lbl.find(child);
-                if (pi == lbl.end() || ci == lbl.end())
-                    continue;
-                if (ci->second.compare(0, 3, "vt_") != 0)
-                    continue;
-                if (pi->second.compare(0, 3, "vt_") == 0)
-                    continue;
-                char nb[192];
-                snprintf(nb, sizeof nb, "%s+0x%x", pi->second.c_str(), g_bc_ref[r].off);
-                ci->second = nb;
-                added++;
-            }
-            if (!added)
-                break;
-        }
-        for (size_t c = 0; c < cls.size(); c++)
-        {
-            const uint32_t id = cls[c].first;
-            const uint64_t vt = cls[c].second;
-            if (kind_lookup(kind_of, id) != kd)
-                continue;
-            char label[192];
-            snprintf(label, sizeof label, "%s", lbl[id].c_str());
+            fprintf(f, "# Battle offsets (Recoil-Runtime)\n\n");
+            fprintf(f, "- image base: `0x%llx`, vmsize `0x%llx`\n",
+                    (unsigned long long)img.base,
+                    (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
+            fprintf(f,
+                    "- state `%u`, scene `0x%llx`, players `0x%llx`, count `%u`, polls `%llu`\n",
+                    g_bc_state, (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players,
+                    g_bc_pcount, (unsigned long long)g_bc_tick);
+            fprintf(f, "- folder `%s`, %s\n\n", nl_kind_name(kd),
+                    bc_class_known(label) ? "known" : "unknown");
             fprintf(f, "## class %u: %s\n\n", id, label);
             fprintf(f, "- vtable `+0x%llx` (0x%llx), fp `0x%llx`\n\n",
                     (unsigned long long)(vt - img.base), (unsigned long long)vt,
@@ -2047,7 +2040,7 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *dir,
                     fprintf(f, "| member offset | -> class |\n|---:|---|\n");
                     anyRef = true;
                 }
-                std::map<uint32_t, std::string>::iterator ci = lbl.find(g_bc_ref[r].ccls);
+                std::map<uint32_t, std::string>::const_iterator ci = lbl.find(g_bc_ref[r].ccls);
                 const char *cl = (ci != lbl.end()) ? ci->second.c_str() : "?";
                 fprintf(f, "| `0x%x` | %u %s |\n", g_bc_ref[r].off, g_bc_ref[r].ccls, cl);
             }
@@ -2109,57 +2102,129 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *dir,
             }
             if (any)
                 fprintf(f, "\n\n");
+            fclose(f);
         }
-        for (size_t r = 0; r < g_bc_arr.size(); r++)
-        {
-            if (g_bc_arr[r].pcls != kBcRootCls)
-                continue;
-            char cl[128];
-            bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
-            fprintf(f, "## root container off `0x%x`, count %u\n\n- element class %u %s\n\n",
-                    g_bc_arr[r].off, g_bc_arr[r].n, g_bc_arr[r].ccls, cl);
-        }
-        fclose(f);
-        RCL_LOGLN("[battle] offsets md written to %s", path);
+        RCL_LOGLN("[battle] class md written to %s", path);
     }
 }
 
 static void bc_write_offsets(const Image &img)
 {
-    const char *dir = bc_dir();
+    char root[900];
+    snprintf(root, sizeof root, "%s/BattleDump", bc_dir());
+    bc_mkdir_p(root);
+
     std::vector<std::pair<uint32_t, uint64_t>> cls;
     bc_class_order(cls);
 
     std::map<uint32_t, uint32_t> kind_of;
+    std::map<uint32_t, std::string> lbl;
     uint32_t per_kind[NLK_KIND_MAX + 1] = {0, 0, 0, 0, 0};
     for (size_t c = 0; c < cls.size(); c++)
     {
-        const uint32_t kind = nl_kind((uint32_t)(cls[c].second - img.base));
-        kind_of[cls[c].first] = kind;
-        per_kind[kind]++;
+        const uint32_t id = cls[c].first;
+        char lb[128];
+        bc_class_label(img, cls[c].second, lb, sizeof lb);
+        lbl[id] = lb;
+        kind_of[id] = nl_kind((uint32_t)(cls[c].second - img.base));
+        per_kind[kind_of[id]]++;
     }
+    for (int pass = 0; pass < 6; pass++)
+    {
+        uint32_t added = 0;
+        for (size_t r = 0; r < g_bc_ref.size(); r++)
+        {
+            const uint32_t child = g_bc_ref[r].ccls;
+            const uint32_t parent = g_bc_ref[r].pcls;
+            std::map<uint32_t, std::string>::iterator pi = lbl.find(parent);
+            std::map<uint32_t, std::string>::iterator ci = lbl.find(child);
+            if (pi == lbl.end() || ci == lbl.end())
+                continue;
+            if (ci->second.compare(0, 3, "vt_") != 0)
+                continue;
+            if (pi->second.compare(0, 3, "vt_") == 0)
+                continue;
+            char nb[192];
+            snprintf(nb, sizeof nb, "%s+0x%x", pi->second.c_str(), g_bc_ref[r].off);
+            ci->second = nb;
+            added++;
+        }
+        if (!added)
+            break;
+    }
+
+    uint32_t per_split[NLK_KIND_MAX + 1][2] = {{0}};
+    uint32_t known = 0;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const bool kk = bc_class_known(lbl[cls[c].first].c_str());
+        per_split[kind_of[cls[c].first]][kk ? 0 : 1]++;
+        if (kk)
+            known++;
+    }
+
     for (uint32_t kd = 0; kd <= NLK_KIND_MAX; kd++)
     {
         if (per_kind[kd])
-            bc_write_kind(img, kd, dir, cls, kind_of);
+            bc_write_kind(img, kd, root, cls, kind_of, lbl);
     }
 
     char path[1200];
-    snprintf(path, sizeof path, "%s/battle-offsets-INDEX.md", dir);
+    snprintf(path, sizeof path, "%s/root-containers.md", root);
     FILE *f = fopen(path, "w");
+    if (f)
+    {
+        fprintf(f, "# root container, offsets into the root class\n\n");
+        fprintf(f, "| offset | count | element class | class |\n|---:|---:|---|---|\n");
+        for (size_t r = 0; r < g_bc_arr.size(); r++)
+        {
+            if (g_bc_arr[r].pcls != kBcRootCls)
+                continue;
+            char cl[192];
+            bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
+            fprintf(f, "| `0x%x` | %u | %u | %s |\n", g_bc_arr[r].off, g_bc_arr[r].n,
+                    g_bc_arr[r].ccls, cl);
+        }
+        fclose(f);
+    }
+
+    snprintf(path, sizeof path, "%s/INDEX.md", root);
+    f = fopen(path, "w");
     if (!f)
         return;
-    fprintf(f, "# battle offsets, one folder per class kind\n\n");
-    fprintf(f, "| folder | classes |\n|--------|---------|\n");
-    for (uint32_t kd = 0; kd <= NLK_KIND_MAX; kd++)
-        fprintf(f, "| `%s` | %u |\n", nl_kind_name(kd), per_kind[kd]);
+    fprintf(f, "# battle dump, one folder per class\n\n");
+    fprintf(f, "- image base `0x%llx`, vmsize `0x%llx`, state `%u`, scene `0x%llx`, "
+               "players `0x%llx`, count `%u`, polls `%llu`\n",
+            (unsigned long long)img.base,
+            (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize), g_bc_state,
+            (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players, g_bc_pcount,
+            (unsigned long long)g_bc_tick);
     fprintf(f,
-            "\nclasses `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
-            "member refs `%u`, arrays `%u`, globals `%u`\n",
+            "- classes `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
+            "member refs `%u`, arrays `%u`, globals `%u`\n\n",
             g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors, (uint32_t)g_bc_access.size(),
             (uint32_t)g_bc_ref.size(), (uint32_t)g_bc_arr.size(), (uint32_t)g_bc_cell.size());
+    fprintf(f, "known and unknown classes are split first, then by kind, then one folder per "
+               "class\n\n");
+    fprintf(f, "| kind | known | unknown | classes |\n|------|------:|--------:|--------:|\n");
+    for (uint32_t kd = 0; kd <= NLK_KIND_MAX; kd++)
+        fprintf(f, "| `%s` | %u | %u | %u |\n", nl_kind_name(kd), per_split[kd][0],
+                per_split[kd][1], per_kind[kd]);
+    fprintf(f, "| **total** | **%u** | **%u** | **%zu** |\n\n", known,
+            (uint32_t)cls.size() - known, cls.size());
+    fprintf(f, "| class id | kind | state | folder | label |\n|---------:|------|-------|--------|"
+               "-------|\n");
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t id = cls[c].first;
+        const std::string &lb = lbl.find(id)->second;
+        char cdir[900];
+        bc_class_dir(cdir, sizeof cdir, root, kind_of[id], lb.c_str());
+        fprintf(f, "| %u | `%s` | %s | `%s` | %s |\n", id, nl_kind_name(kind_of[id]),
+                bc_class_known(lb.c_str()) ? "known" : "unknown", cdir, lb.c_str());
+    }
     fclose(f);
-    RCL_LOGLN("[battle] offsets index written to %s", path);
+    RCL_LOGLN("[battle] battle dump: %zu classes (%u known) in %s", cls.size(), known, root);
 }
 
 void bc_close(void)
