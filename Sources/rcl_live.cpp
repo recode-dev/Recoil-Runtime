@@ -988,12 +988,15 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     uint32_t coordObjs = 0;
     uint32_t moved = 0;
     uint32_t maxInst = 0;
+    uint32_t strong = 0;
+    uint32_t coordPerCls[32];
+    uint64_t cls[32];
+    uint32_t inst[32];
+    uint32_t clsN = 0;
     bc_open_file();
     if (!g_bc_f) return;
     {
-        uint64_t cls[32];
-        uint32_t inst[32];
-        uint32_t clsN = 0;
+        for (i = 0; i < 32; i++) coordPerCls[i] = 0;
         for (i = 0; i < n && i < 128; i++) {
             uint64_t obj = 0;
             uint64_t vt = 0;
@@ -1034,20 +1037,41 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
                     break;
                 }
             }
-            for (k = 0; k < 64; k++) {
-                uint32_t lo = (uint32_t)words[k];
-                uint32_t hi = (uint32_t)(words[k] >> 32);
-                if (lo >= 200u && lo <= 40000u && hi >= 200u && hi <= 40000u) {
-                    off = k * 8;
-                    px = (int32_t)lo;
-                    py = (int32_t)hi;
-                    found = 1;
+            for (j = 0; j < 160; j++) {
+                if (g_bc_prev[j].valid && g_bc_prev[j].obj == obj && g_bc_prev[j].off < 512u) {
+                    uint64_t w = words[g_bc_prev[j].off / 8];
+                    off = g_bc_prev[j].off;
+                    px = (int32_t)(uint32_t)w;
+                    py = (int32_t)(uint32_t)(w >> 32);
+                    found = 2;
                     break;
+                }
+            }
+            if (!found) {
+                for (k = 0; k < 64; k++) {
+                    uint32_t lo = (uint32_t)words[k];
+                    uint32_t hi = (uint32_t)(words[k] >> 32);
+                    if (lo >= 200u && lo <= 40000u && hi >= 200u && hi <= 40000u) {
+                        off = k * 8;
+                        px = (int32_t)lo;
+                        py = (int32_t)hi;
+                        found = 1;
+                        break;
+                    }
                 }
             }
             if (!found) continue;
             coordObjs++;
             if (instHere > maxInst) maxInst = instHere;
+            {
+                uint32_t ci = 0;
+                for (ci = 0; ci < clsN && ci < 32; ci++) {
+                    if (cls[ci] == vt) {
+                        coordPerCls[ci]++;
+                        break;
+                    }
+                }
+            }
             if (nextN < 160) {
                 next[nextN].obj = obj;
                 next[nextN].off = off;
@@ -1070,12 +1094,18 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
         }
     }
     for (i = 0; i < 160; i++) g_bc_prev[i] = i < nextN ? next[i] : BcPos{0, 0, 0, 0, 0};
-    inBattle = (moved >= 2);
+    {
+        uint32_t ci = 0;
+        for (ci = 0; ci < clsN && ci < 32; ci++) {
+            if (inst[ci] >= 2 && inst[ci] <= 24 && coordPerCls[ci] >= 4) strong = 1;
+        }
+    }
+    inBattle = (strong || moved >= 2);
     g_bc_last_n = n;
     if ((g_bc_tick % 10) == 0) {
-        fprintf(g_bc_f, "poll %llu state=%u n=%u coord=%u moved=%u inst=%u live=%d classes=%u fields=%u\n",
-                (unsigned long long)g_bc_tick, state, n, coordObjs, moved, maxInst, inBattle ? 1 : 0, g_bc_classes,
-                g_bc_fields);
+        fprintf(g_bc_f, "poll %llu state=%u n=%u coord=%u moved=%u inst=%u players=%d live=%d classes=%u fields=%u\n",
+                (unsigned long long)g_bc_tick, state, n, coordObjs, moved, maxInst, strong ? 1 : 0, inBattle ? 1 : 0,
+                g_bc_classes, g_bc_fields);
         fflush(g_bc_f);
     }
     if (inBattle) {
