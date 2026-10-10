@@ -302,7 +302,7 @@ bool asset_like(const std::string &s)
     }
     if (alnum)
         return true;
-    return s.find('/') != std::string::npos;
+    return s.find('/') != std::string::npos || s.find('_') != std::string::npos;
 }
 
 void asset_take(uint32_t vt, const std::vector<std::string> &refs)
@@ -599,7 +599,11 @@ uint32_t nl_kind(uint32_t vt)
         std::map<uint32_t, std::string>::const_iterator ai = g_asset.find(vt);
         if (ai != g_asset.end())
         {
-            kind = kind_of_text(ai->second);
+            const std::string &a = ai->second;
+            if (a.find(".csv") != std::string::npos || a.find("csv_logic") != std::string::npos)
+                kind = NLK_ASSET;
+            else
+                kind = kind_of_text(a);
         }
     }
     g_kind[vt] = kind;
