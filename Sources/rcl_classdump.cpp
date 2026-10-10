@@ -2699,6 +2699,43 @@ static bool bundle_copy(const char *src, const char *dst) {
     return true;
 }
 
+void write_symbols(const std::vector<ClassTable> &tables, const char *root) {
+    char path[1024];
+    char nm[192];
+    snprintf(path, sizeof path, "%s/_symbols.tsv", root);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "rva\taddress\tname\tsource\tslots\n");
+    for (size_t i = 0; i < tables.size(); i++) {
+        const char *c = name_of_table(tables[i].start);
+        const char *fam = c ? nullptr : family_of_table(tables[i].start);
+        if (c) snprintf(nm, sizeof nm, "%s", c);
+        else if (fam) snprintf(nm, sizeof nm, "~%s", fam);
+        else snprintf(nm, sizeof nm, "vt_%x", tables[i].start);
+        fprintf(f, "%#x\t0x%llx\t%s\t%s\t%u\n", tables[i].start,
+                0x100000000ULL + (uint64_t)tables[i].start, nm,
+                c ? "named" : (fam ? "family" : "address"), tables[i].slots);
+    }
+    fclose(f);
+
+    snprintf(path, sizeof path, "%s/_symbols.idc", root);
+    f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "#include <idc.idc>\n\nstatic main() {\n");
+    for (size_t i = 0; i < tables.size(); i++) {
+        const char *c = name_of_table(tables[i].start);
+        const char *fam = c ? nullptr : family_of_table(tables[i].start);
+        if (!c && !fam) continue;
+        snprintf(nm, sizeof nm, "%s", c ? c : fam);
+        for (char *q = nm; *q; q++)
+            if (*q == '~' || *q == ' ' || *q == ':' || *q == '-') *q = '_';
+        fprintf(f, "    MakeName(0x%llx, \"%s\");\n",
+                0x100000000ULL + (uint64_t)tables[i].start, nm);
+    }
+    fprintf(f, "}\n");
+    fclose(f);
+}
+
 static bool g_skip_bundle = false;
 
 void set_skip_bundle(bool skip) { g_skip_bundle = skip; }
