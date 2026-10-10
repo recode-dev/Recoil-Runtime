@@ -2122,6 +2122,8 @@ struct BcSem
     char kind;
     uint32_t reads;
     uint32_t changes;
+    uint32_t bchg;
+    uint32_t lchg;
     int64_t last;
     double dmin;
     double dmax;
@@ -2152,7 +2154,13 @@ static void bc_sem_note(uint32_t id, uint32_t off, int kind, uint64_t value)
     else
     {
         if (s.last != (int64_t)value)
+        {
             s.changes++;
+            if (g_bc_state == 5)
+                s.bchg++;
+            else
+                s.lchg++;
+        }
         s.last = (int64_t)value;
         if ((int64_t)value < s.imin)
             s.imin = (int64_t)value;
@@ -2503,6 +2511,74 @@ static void bc_rm_tree(const char *path)
     rmdir(path);
 }
 
+#if defined(__APPLE__)
+extern "C" int mach_vm_region(unsigned int task, unsigned long long *address,
+                              unsigned long long *size, int flavor, void *info,
+                              unsigned int *count, unsigned int *object_name);
+#endif
+
+static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std::string> &lbl)
+{
+#if defined(__APPLE__)
+    std::map<uint64_t, uint32_t> vtout;
+    for (std::map<uint64_t, uint32_t>::const_iterator it = g_bc_vt.begin(); it != g_bc_vt.end();
+         ++it)
+        vtout[it->first] = it->second;
+    if (vtout.empty())
+    {
+        fprintf(f, "- no known class table yet\n");
+        return;
+    }
+    uint64_t addr = img.base;
+    uint64_t scanned = 0;
+    const uint64_t cap = 384ull * 1024ull * 1024ull;
+    std::map<uint32_t, uint32_t> inst;
+    std::map<uint32_t, uint64_t> first;
+    unsigned int info[8];
+    unsigned int cnt = 8;
+    unsigned int obj = 0;
+    uint64_t size = 0;
+    while (scanned < cap && mach_vm_region(mach_task_self_, &addr, &size, 9, info, &cnt, &obj) == 0)
+    {
+        const unsigned int prot = info[1];
+        const bool writable = (prot & 1u) == 0 && (prot & 2u) == 0;
+        if (writable && size >= 16)
+        {
+            for (uint64_t o = addr; o + 8 <= addr + size; o += 8)
+            {
+                if (scanned >= cap)
+                    break;
+                scanned += 8;
+                uint64_t w = 0;
+                if (!bc_read(o, &w, 8) || !w)
+                    continue;
+                std::map<uint64_t, uint32_t>::iterator it = vtout.find(w);
+                if (it == vtout.end())
+                    continue;
+                inst[it->second]++;
+                if (first.find(it->second) == first.end())
+                    first[it->second] = o;
+            }
+        }
+        addr += size;
+    }
+    fprintf(f, "- heap pass scanned `%llu` bytes of writable memory\n\n",
+            (unsigned long long)scanned);
+    fprintf(f, "| class | instances | first object |\n|-------|----------:|-------------:|\n");
+    for (std::map<uint32_t, uint32_t>::iterator it = inst.begin(); it != inst.end(); ++it)
+    {
+        std::map<uint32_t, std::string>::const_iterator lb = lbl.find(it->first);
+        fprintf(f, "| %s | %u | `0x%llx` |\n",
+                lb == g_bc_lbl.end() ? "-" : lb->second.c_str(), it->second,
+                (unsigned long long)first[it->first]);
+    }
+#else
+    (void)img;
+    (void)lbl;
+    fprintf(f, "- the heap pass runs in the game, not in the host check\n");
+#endif
+}
+
 static void bc_clean_old(const char *root)
 {
     static const char *const gone[] = {"INDEX.md",       "CLASSES.md", "Resolve.md",
@@ -2555,6 +2631,35 @@ static uint32_t bc_adrp_at(const Image &img, uint32_t rva, uint32_t i, uint64_t 
 
 static std::map<uint32_t, uint32_t> g_bc_vtref;
 static bool g_bc_vtref_done = false;
+static std::map<uint32_t, uint32_t> g_bc_calls;
+static bool g_bc_calls_done = false;
+
+static void bc_callcount_scan(const Image &img)
+{
+    if (g_bc_calls_done)
+        return;
+    g_bc_calls_done = true;
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    if (!macho_text_range(img, lo, hi))
+        return;
+    for (uint64_t i = 0; i + 4 <= hi - lo; i += 4)
+    {
+        uint32_t w = 0;
+        if (!bc_read(lo + i, &w, 4))
+            break;
+        if ((w & 0xfc000000u) != 0x94000000u)
+            continue;
+        int32_t imm = (int32_t)(w & 0x03ffffffu);
+        if (imm & 0x02000000)
+            imm |= 0xfc000000;
+        const int64_t t = (int64_t)(lo - img.base + i) + (int64_t)imm * 4;
+        if (t <= 0 || (uint64_t)t >= img.image_vmsize)
+            continue;
+        g_bc_calls[(uint32_t)t]++;
+    }
+    RCL_LOGLN("[calls] %zu call targets indexed", g_bc_calls.size());
+}
 
 static void bc_vtref_scan(const Image &img)
 {
@@ -2779,6 +2884,7 @@ static void bc_write_one(const Image &img, const char *root,
                          const std::map<uint32_t, int> &src_of)
 {
     bc_vtref_scan(img);
+    bc_callcount_scan(img);
 
     char path[1200];
     snprintf(path, sizeof path, "%s/BattleDumpAll.md", root);
@@ -2904,12 +3010,14 @@ static void bc_write_one(const Image &img, const char *root,
         const uint32_t nslots = bc_slot_rvas(img, vt, slots, 128);
         if (nslots)
         {
-            fprintf(f, "#### methods\n\n| slot | rva | name |\n|---:|---|---|\n");
+            fprintf(f, "#### methods\n\n| slot | rva | name | called from |\n|---:|---|---|---:|\n");
             for (uint32_t s = 0; s < nslots; s++)
             {
                 const char *mn = bc_method_name(img, slots[s]);
-                fprintf(f, "| %u | `0x%x` | %s |\n", s, slots[s],
-                        (mn && *mn && strcmp(mn, "-") != 0) ? mn : "");
+                std::map<uint32_t, uint32_t>::const_iterator cc = g_bc_calls.find(slots[s]);
+                fprintf(f, "| %u | `0x%x` | %s | %u |\n", s, slots[s],
+                        (mn && *mn && strcmp(mn, "-") != 0) ? mn : "",
+                        cc == g_bc_calls.end() ? 0u : cc->second);
             }
             fprintf(f, "\n");
         }
@@ -2978,8 +3086,9 @@ static void bc_write_one(const Image &img, const char *root,
                 continue;
             if (!shown)
             {
-                fprintf(f, "#### fields\n\n| off | kind | reads | changes | min | max | guess | "
-                           "sample |\n|-----|------|------:|--------:|-----|-----|-------|--------|\n");
+                fprintf(f, "#### fields\n\n| off | kind | reads | changes | battle | lobby | min | "
+                           "max | guess | sample |\n|-----|------|------:|--------:|-------:|"
+                           "------:|-----|-----|-------|--------|\n");
             }
             shown++;
             const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
@@ -3009,9 +3118,11 @@ static void bc_write_one(const Image &img, const char *root,
             }
             if (strlen(extra) > 100)
                 extra[100] = 0;
-            fprintf(f, "| `0x%x` | %s | %u | %u | %lld | %lld | %s | `0x%llx` %s |\n", off,
-                    bc_kind_name(sm.kind), sm.reads, sm.changes, (long long)sm.imin,
-                    (long long)sm.imax, guess, (unsigned long long)val, extra);
+            if (sm.bchg && !sm.lchg)
+                snprintf(extra + strlen(extra), (sizeof extra) - strlen(extra), " battle-only");
+            fprintf(f, "| `0x%x` | %s | %u | %u | %u | %u | %lld | %lld | %s | `0x%llx` %s |\n", off,
+                    bc_kind_name(sm.kind), sm.reads, sm.changes, sm.bchg, sm.lchg,
+                    (long long)sm.imin, (long long)sm.imax, guess, (unsigned long long)val, extra);
         }
         if (shown)
             fprintf(f, "\n");
@@ -3141,6 +3252,9 @@ static void bc_write_one(const Image &img, const char *root,
             fprintf(f, "\n");
         fprintf(f, "| refs `%u` |\n\n", refs.count(id) ? refs[id] : 0);
     }
+
+    fprintf(f, "## heap objects\n\n");
+    bc_heap_pass(img, f, lbl);
 
     fprintf(f, "## class relations\n\n");
     fprintf(f, "- a class whose slots start with the slots of another class shares its head, which "

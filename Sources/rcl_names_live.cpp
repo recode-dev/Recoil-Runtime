@@ -506,7 +506,7 @@ const char *nl_structural(const uint32_t *slots, uint32_t nslots, char *buf, siz
         {
             continue;
         }
-        if (d.vt_slots && (nslots > d.vt_slots + 2 || nslots + 2 < d.vt_slots))
+        if (d.vt_slots && (nslots > (uint32_t)d.vt_slots + 2u || nslots + 2u < (uint32_t)d.vt_slots))
         {
             continue;
         }
