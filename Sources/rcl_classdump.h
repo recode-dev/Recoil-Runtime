@@ -41,6 +41,7 @@ struct ScanStats {
 std::vector<ClassTable> scan_class_tables(const Image &img, ScanStats *st = nullptr);
 void dump_class_tree(const Image &img);
 void write_class_docs(const Image &img);
+void write_all_bundle();
 void live_docs_note(const Image &img, uint32_t state, int tick);
 void live_docs_flush(const Image &img);
 

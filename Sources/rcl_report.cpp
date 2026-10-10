@@ -117,6 +117,8 @@ void report_run(const Image &img, const Seeds &s) {
     }
     write_class_docs(img);
     RCL_LOGLN("");
+    write_all_bundle();
+    RCL_LOGLN("");
     RCL_LOGLN("== end ==");
 }
 

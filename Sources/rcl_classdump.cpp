@@ -8,6 +8,7 @@
 #include "rcl_deep.h"
 #include "rcl_macho.h"
 #include <algorithm>
+#include <dirent.h>
 #include <map>
 #include <set>
 #include <pthread.h>
@@ -2596,6 +2597,80 @@ void write_class_docs(const Image &img) {
               files, unknown, root, methods_ok, methods_all);
     RCL_LOGLN("[docs] classes=%u methods=%u tables=%zu", kDocClassCount, kDocMethodCount,
               ix.tables.size());
+}
+
+static bool bundle_ext_ok(const char *name) {
+    size_t n = strlen(name);
+    if (n > 4 && strcmp(name + n - 4, ".tsv") == 0) return true;
+    if (n > 3 && strcmp(name + n - 3, ".md") == 0) return true;
+    return false;
+}
+
+static bool bundle_copy(const char *src, const char *dst) {
+    FILE *a = fopen(src, "rb");
+    if (!a) return false;
+    FILE *b = fopen(dst, "wb");
+    if (!b) {
+        fclose(a);
+        return false;
+    }
+    char buf[16384];
+    size_t n = 0;
+    while ((n = fread(buf, 1, sizeof buf, a)) > 0)
+        if (fwrite(buf, 1, n, b) != n) {
+            fclose(a);
+            fclose(b);
+            return false;
+        }
+    fclose(a);
+    fclose(b);
+    return true;
+}
+
+void write_all_bundle() {
+    const char *mode = getenv("RCL_DOCS");
+    if (mode && *mode == '0') return;
+
+    char root[512];
+    snprintf(root, sizeof root, "%s", dump_root());
+    char all[1024];
+    snprintf(all, sizeof all, "%s/All", root);
+    mkdir_one(all);
+
+    DIR *d = opendir(root);
+    if (!d) return;
+    uint32_t copied = 0;
+    struct dirent *e = nullptr;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (strcmp(e->d_name, "All") == 0 || strcmp(e->d_name, "cache") == 0) continue;
+        char sub[2048];
+        snprintf(sub, sizeof sub, "%s/%s", root, e->d_name);
+        struct stat sb;
+        if (stat(sub, &sb) != 0) continue;
+        if (!S_ISDIR(sb.st_mode)) {
+            if (!bundle_ext_ok(e->d_name)) continue;
+            char dst[2048];
+            snprintf(dst, sizeof dst, "%s/%s", all, e->d_name);
+            if (bundle_copy(sub, dst)) copied++;
+            continue;
+        }
+        DIR *sd = opendir(sub);
+        if (!sd) continue;
+        struct dirent *se = nullptr;
+        while ((se = readdir(sd))) {
+            if (se->d_name[0] == '.') continue;
+            if (!bundle_ext_ok(se->d_name)) continue;
+            char src[2048];
+            char dst[2048];
+            snprintf(src, sizeof src, "%s/%s", sub, se->d_name);
+            snprintf(dst, sizeof dst, "%s/%s_%s", all, e->d_name, se->d_name);
+            if (bundle_copy(src, dst)) copied++;
+        }
+        closedir(sd);
+    }
+    closedir(d);
+    RCL_LOGLN("[docs] All: %u files in %s", copied, all);
 }
 
 
