@@ -2,9 +2,11 @@
 #include <thread>
 #include <map>
 #include <vector>
+#include <algorithm>
 #include "rcl_log.h"
 #include "rcl_alert.h"
 #include "rcl_classdump.h"
+#include "rcl_names.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -855,7 +857,13 @@ uint32_t g_bc_state = 0;
 uint64_t g_bc_scene = 0;
 std::map<uint64_t, uint32_t> g_bc_vt;
 std::map<uint64_t, char> g_bc_slot;
+std::map<uint64_t, uint64_t> g_bc_sample;
 std::vector<uint64_t> g_bc_want;
+struct BcAccess {
+    uint32_t cls;
+    uint32_t rva;
+};
+std::vector<BcAccess> g_bc_access;
 
 bool bc_read(uint64_t va, void *dst, size_t n) {
 #if defined(__APPLE__)
@@ -991,7 +999,11 @@ void bc_code_pass(const Image &img) {
             }
             for (size_t w = 0; w < g_bc_want.size(); w++) {
                 if (t == g_bc_want[w]) {
-                    fprintf(g_bc_f, "access %u rva=0x%llx\n", g_bc_vt[t], (unsigned long long)(at - img.base));
+                    BcAccess acc;
+                    acc.cls = g_bc_vt[t];
+                    acc.rva = (uint32_t)(at - img.base);
+                    g_bc_access.push_back(acc);
+                    fprintf(g_bc_f, "access %u rva=0x%llx\n", acc.cls, (unsigned long long)(at - img.base));
                     g_bc_accessors++;
                     hit = true;
                     break;
@@ -1003,6 +1015,159 @@ void bc_code_pass(const Image &img) {
     fflush(g_bc_f);
 }
 
+const char *doc_class_name(uint32_t vt);
+const char *name_of_table(uint32_t start);
+
+static const char *bc_class_label(const Image &img, uint64_t vt, char *buf, size_t cap) {
+    if (in_image(img, vt)) {
+        const uint32_t rva = (uint32_t)(vt - img.base);
+        const char *n = name_of_table(rva);
+        if (!n || !*n) n = doc_class_name(rva);
+        if (n && *n && strcmp(n, "-") != 0) {
+            snprintf(buf, cap, "%s", n);
+            return buf;
+        }
+    }
+    for (uint32_t slot = 0; slot < 12; slot++) {
+        uint64_t w = 0;
+        if (!bc_read(vt + (uint64_t)slot * 8, &w, 8) || !w || !in_text(img, w)) continue;
+        const char *nm = name_for_rva((uint32_t)(w - img.base));
+        if (!nm || strcmp(nm, "-") == 0) continue;
+        const char *sep = strstr(nm, "::");
+        if (!sep || sep == nm) continue;
+        size_t len = (size_t)(sep - nm);
+        if (len >= cap) len = cap - 1;
+        memcpy(buf, nm, len);
+        buf[len] = 0;
+        return buf;
+    }
+    snprintf(buf, cap, "unknown");
+    return buf;
+}
+
+static void bc_class_order(std::vector<std::pair<uint32_t, uint64_t>> &out) {
+    for (std::map<uint64_t, uint32_t>::iterator it = g_bc_vt.begin(); it != g_bc_vt.end(); ++it)
+        out.push_back(std::make_pair(it->second, it->first));
+    std::sort(out.begin(), out.end());
+}
+
+static uint32_t bc_class_methods(const Image &img, uint64_t vt, uint64_t *rvas, uint32_t cap) {
+    uint32_t k = 0;
+    for (k = 0; k < cap; k++) {
+        uint64_t w = 0;
+        if (!bc_read(vt + (uint64_t)k * 8, &w, 8) || !w) break;
+        if (!in_image(img, w)) break;
+        rvas[k] = w;
+    }
+    return k;
+}
+
+static void bc_write_offsets(const Image &img) {
+    const char *dir = bc_dir();
+    char path[1200];
+    std::vector<std::pair<uint32_t, uint64_t>> cls;
+    bc_class_order(cls);
+
+    snprintf(path, sizeof path, "%s/battle-offsets.tsv", dir);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "# recoil battle offsets\n");
+        fprintf(f, "# image_base=0x%llx vmsize=0x%llx state=%u scene=+0x%llx players=+0x%llx count=%u tick=%llu\n",
+                (unsigned long long)img.base, (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize),
+                g_bc_state, (unsigned long long)(g_bc_scene ? (g_bc_scene - img.base) : 0),
+                (unsigned long long)(g_bc_players ? (g_bc_players - img.base) : 0), g_bc_pcount,
+                (unsigned long long)g_bc_tick);
+        fprintf(f, "kind\tclass_id\tclass\tslot\toff\thint\tvalue\trva\tname\n");
+        for (size_t c = 0; c < cls.size(); c++) {
+            const uint32_t id = cls[c].first;
+            const uint64_t vt = cls[c].second;
+            char label[128];
+            bc_class_label(img, vt, label, sizeof label);
+            fprintf(f, "class\t%u\t%s\t\t\t\t0x%llx\t0x%llx\t%s\n", id, label,
+                    (unsigned long long)bc_fp(img, vt), (unsigned long long)(vt - img.base), label);
+            uint64_t rvas[64];
+            const uint32_t nm = bc_class_methods(img, vt, rvas, 64);
+            for (uint32_t s = 0; s < nm; s++) {
+                const uint32_t rva = (uint32_t)(rvas[s] - img.base);
+                const char *name = name_for_rva(rva);
+                fprintf(f, "method\t%u\t%s\t%u\t\t\t0x%llx\t%s\n", id, label, s, (unsigned long long)rva,
+                        (name && strcmp(name, "-") != 0) ? name : "");
+            }
+            for (std::map<uint64_t, char>::iterator it = g_bc_slot.begin(); it != g_bc_slot.end(); ++it) {
+                if ((uint32_t)(it->first >> 32) != id) continue;
+                const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
+                std::map<uint64_t, uint64_t>::iterator sm = g_bc_sample.find(it->first);
+                fprintf(f, "field\t%u\t%s\t\t0x%x\t%s\t0x%llx\t\t\n", id, label, off, bc_kind_name(it->second),
+                        (unsigned long long)(sm != g_bc_sample.end() ? sm->second : 0));
+            }
+            for (size_t a = 0; a < g_bc_access.size(); a++) {
+                if (g_bc_access[a].cls != id) continue;
+                fprintf(f, "access\t%u\t%s\t\t\t\t\t0x%x\t\n", id, label, g_bc_access[a].rva);
+            }
+        }
+        fclose(f);
+        RCL_LOGLN("[battle] offsets tsv written to %s", path);
+    }
+
+    snprintf(path, sizeof path, "%s/battle-offsets.md", dir);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "# Battle offsets (Recoil-Runtime)\n\n");
+        fprintf(f, "- image base: `0x%llx`, vmsize `0x%llx`\n", (unsigned long long)img.base,
+                (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
+        fprintf(f, "- state `%u`, scene `+0x%llx`, players `+0x%llx`, count `%u`, polls `%llu`\n",
+                g_bc_state, (unsigned long long)(g_bc_scene ? (g_bc_scene - img.base) : 0),
+                (unsigned long long)(g_bc_players ? (g_bc_players - img.base) : 0), g_bc_pcount,
+                (unsigned long long)g_bc_tick);
+        fprintf(f, "- classes `%u`, fields `%u`, method slots `%u`, code refs `%u`\n\n",
+                g_bc_classes, g_bc_fields, g_bc_accessors, (uint32_t)g_bc_access.size());
+        for (size_t c = 0; c < cls.size(); c++) {
+            const uint32_t id = cls[c].first;
+            const uint64_t vt = cls[c].second;
+            char label[128];
+            bc_class_label(img, vt, label, sizeof label);
+            fprintf(f, "## class %u: %s\n\n", id, label);
+            fprintf(f, "- vtable `+0x%llx` (0x%llx), fp `0x%llx`\n\n", (unsigned long long)(vt - img.base),
+                    (unsigned long long)vt, (unsigned long long)bc_fp(img, vt));
+            uint64_t rvas[64];
+            const uint32_t nm = bc_class_methods(img, vt, rvas, 64);
+            if (nm) {
+                fprintf(f, "| slot | rva | name |\n|---:|---|---|\n");
+                for (uint32_t s = 0; s < nm; s++) {
+                    const uint32_t rva = (uint32_t)(rvas[s] - img.base);
+                    const char *name = name_for_rva(rva);
+                    fprintf(f, "| %u | `0x%x` | %s |\n", s, rva,
+                            (name && strcmp(name, "-") != 0) ? name : "-");
+                }
+                fprintf(f, "\n");
+            }
+            fprintf(f, "| offset | kind | sample |\n|---:|---|---|\n");
+            for (std::map<uint64_t, char>::iterator it = g_bc_slot.begin(); it != g_bc_slot.end(); ++it) {
+                if ((uint32_t)(it->first >> 32) != id) continue;
+                std::map<uint64_t, uint64_t>::iterator sm = g_bc_sample.find(it->first);
+                fprintf(f, "| `0x%x` | %s | `0x%llx` |\n", (uint32_t)(it->first & 0xffffffffu),
+                        bc_kind_name(it->second),
+                        (unsigned long long)(sm != g_bc_sample.end() ? sm->second : 0));
+            }
+            fprintf(f, "\n");
+            bool any = false;
+            for (size_t a = 0; a < g_bc_access.size(); a++) {
+                if (g_bc_access[a].cls != id) continue;
+                if (!any) {
+                    fprintf(f, "Code references: ");
+                    any = true;
+                } else {
+                    fprintf(f, ", ");
+                }
+                fprintf(f, "`0x%x`", g_bc_access[a].rva);
+            }
+            if (any) fprintf(f, "\n\n");
+        }
+        fclose(f);
+        RCL_LOGLN("[battle] offsets md written to %s", path);
+    }
+}
+
 void bc_close(void) {
     if (!g_bc_f) {
         g_bc_active = false;
@@ -1012,6 +1177,7 @@ void bc_close(void) {
         g_bc_code = true;
         bc_code_pass(g_bc_img);
     }
+    if (g_bc_classes > 0) bc_write_offsets(g_bc_img);
     fprintf(g_bc_f, "# battle end poll=%llu classes=%u objects=%u fields=%u accessors=%u\n",
             (unsigned long long)g_bc_tick, g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors);
 
@@ -1240,6 +1406,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             if (g_bc_slot.find(key) != g_bc_slot.end()) continue;
             kind = bc_kind(img, words[k]);
             g_bc_slot[key] = (char)kind;
+            g_bc_sample[key] = words[k];
             g_bc_fields++;
             fprintf(g_bc_f, "field %u off=0x%x kind=%s sample=0x%llx\n", id, k * 8, bc_kind_name(kind),
                     (unsigned long long)words[k]);
@@ -1249,6 +1416,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
         g_bc_code = true;
         bc_code_pass(img);
     }
+    if (g_bc_classes > 0 && (g_bc_tick % 600) == 0) bc_write_offsets(img);
     if ((g_bc_tick % 10) == 0) fflush(g_bc_f);
 }
 
