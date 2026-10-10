@@ -115,14 +115,12 @@ void report_run(const Image &img, const Seeds &s) {
         if (!e || *e != '0') dump_class_columns(img, s);
         RCL_LOGLN("");
     }
+    ScanStats ss;
+    std::vector<ClassTable> tb = scan_class_tables(img, &ss);
+    symbolize_tables(img, tb);
     write_class_docs(img);
     RCL_LOGLN("");
-    {
-        ScanStats ss;
-        std::vector<ClassTable> tb = scan_class_tables(img, &ss);
-        symbolize_tables(img, tb);
-        write_symbols(img, tb, dumps_root());
-    }
+    write_symbols(img, tb, dumps_root());
     RCL_LOGLN("");
     write_all_bundle();
     RCL_LOGLN("");
