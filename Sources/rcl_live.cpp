@@ -119,15 +119,14 @@ static bool manager_fields(const Image &img, uint64_t mgr, LiveAnchors &a, uint6
             uint64_t ar = 0;
             if (!rd64(mgr + a_off[ai], ar)) continue;
             if (!object_ptr(img, ar)) continue;
-            bool hit = false;
+            uint32_t hits = 0;
             for (uint32_t k = 0; k < 8 && k < cnt; k++) {
                 uint64_t o = 0, vt = 0;
                 if (!rd64(ar + (uint64_t)k * 8, o) || !object_ptr(img, o)) continue;
                 if (!rd64(o, vt) || !looks_like_vtable(img, vt)) continue;
-                hit = true;
-                break;
+                hits++;
             }
-            if (!hit) continue;
+            if (hits < 2) continue;
             a.arr_off = a_off[ai];
             a.count_off = c_off[ci];
             a.cap_off = (c_off[ci] == 0xc) ? 8u : (c_off[ci] + 4u);
@@ -262,10 +261,10 @@ bool live_home(const Image &img, uint64_t &home, uint32_t &state, uint64_t &cur)
     cur = 0;
     const LiveAnchors &a = anchors_for(img);
     if (!a.ok) return false;
-    if (!rd64(a.home_slot, home) || !home) return false;
+    if (!rd64(a.home_slot, home) || !object_ptr(img, home)) return false;
     rd32(home + a.state_off, state);
     rd64(home + a.current_off, cur);
-    return true;
+    return object_ptr(img, cur);
 }
 
 bool live_chain(const Image &img, uint64_t &home_slot_rva, uint32_t &state_off,
