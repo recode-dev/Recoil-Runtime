@@ -612,11 +612,7 @@ uint32_t nl_kind(uint32_t vt)
         std::map<uint32_t, std::string>::const_iterator ai = g_asset.find(vt);
         if (ai != g_asset.end())
         {
-            const std::string &a = ai->second;
-            if (a.find(".csv") != std::string::npos || a.find("csv_logic") != std::string::npos)
-                kind = NLK_ASSET;
-            else
-                kind = kind_of_text(a);
+            kind = kind_of_text(ai->second);
         }
     }
     g_kind[vt] = kind;
