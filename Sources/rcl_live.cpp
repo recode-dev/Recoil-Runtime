@@ -619,6 +619,7 @@ static void dump_getters(const Image &img, uint64_t vptr, int first, int last, c
 
 static bool g_bc_nl_ready = false;
 static bool bc_keep_all();
+static const char *bc_class_label(const Image &img, uint64_t vt, char *buf, size_t cap);
 
 static void dump_object(const Image &img, uint64_t o, int idx, bool full)
 {
@@ -629,6 +630,16 @@ static void dump_object(const Image &img, uint64_t o, int idx, bool full)
     if (g_bc_nl_ready && in_image(img, vt) && !bc_keep_all() &&
         !nl_kind_keep(nl_kind((uint32_t)(vt - img.base))))
         return;
+    static std::map<uint64_t, std::string> lcache;
+    std::map<uint64_t, std::string>::iterator li = lcache.find(vt);
+    if (li == lcache.end())
+    {
+        char tmp[192];
+        bc_class_label(img, vt, tmp, sizeof tmp);
+        li = lcache.insert(std::make_pair(vt, std::string(tmp))).first;
+    }
+    char vptxt[256];
+    snprintf(vptxt, sizeof vptxt, "%s(%s)", li->second.c_str(), p);
     uint32_t x = 0, y = 0, z = 0, own = 0, team = 0;
     uint8_t dead = 0;
     rd32(o + 0x30, x);
@@ -654,11 +665,11 @@ static void dump_object(const Image &img, uint64_t o, int idx, bool full)
     if (!full)
     {
         RCL_LOGLN("  [%2d] 0x%llx vt=%s x=%d y=%d z=%d own=%d team=%d dead=%u %s", idx,
-                  (unsigned long long)o, p, (int)x, (int)y, (int)z, (int)own, (int)team,
+                  (unsigned long long)o, vptxt, (int)x, (int)y, (int)z, (int)own, (int)team,
                   (unsigned)dead, vals);
         return;
     }
-    RCL_LOGLN("  [%2d] 0x%llx vt=%s", idx, (unsigned long long)o, p);
+    RCL_LOGLN("  [%2d] 0x%llx vt=%s", idx, (unsigned long long)o, vptxt);
     if (vals[0])
         RCL_LOGLN("       getters: %s", vals);
     for (int i = 0; i + 3 < 16; i += 4)
