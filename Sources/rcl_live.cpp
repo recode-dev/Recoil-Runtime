@@ -2569,7 +2569,7 @@ static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std
     {
         std::map<uint32_t, std::string>::const_iterator lb = lbl.find(it->first);
         fprintf(f, "| %s | %u | `0x%llx` |\n",
-                lb == g_bc_lbl.end() ? "-" : lb->second.c_str(), it->second,
+                lb == lbl.end() ? "-" : lb->second.c_str(), it->second,
                 (unsigned long long)first[it->first]);
     }
 #else
@@ -3410,16 +3410,6 @@ static void bc_write_offsets(const Image &img)
         }
         if (!added)
             break;
-    }
-
-    uint32_t per_split[NLK_KIND_MAX + 1][2] = {{0}};
-    uint32_t known = 0;
-    for (size_t c = 0; c < cls.size(); c++)
-    {
-        const bool kk = bc_class_known(lbl[cls[c].first].c_str());
-        per_split[kind_of[cls[c].first]][kk ? 0 : 1]++;
-        if (kk)
-            known++;
     }
 
     bc_write_one(img, root, cls, kind_of, lbl, src_of);
