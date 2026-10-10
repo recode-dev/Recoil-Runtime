@@ -3091,9 +3091,11 @@ void write_symbols(const Image &img, const std::vector<ClassTable> &tables, cons
         if (c) snprintf(nm, sizeof nm, "%s", c);
         else if (fam) snprintf(nm, sizeof nm, "~%s", fam);
         else snprintf(nm, sizeof nm, "vt_%x", tables[i].start);
+        const char *srcv = c ? "named" : (fam ? "family" : "address");
+        std::map<uint32_t, const char *>::iterator si = g_table_src.find(tables[i].start);
+        if (c && si != g_table_src.end()) srcv = si->second;
         fprintf(f, "table\t%#x\t0x%llx\t%s\t%s\t%u\n", tables[i].start,
-                0x100000000ULL + (uint64_t)tables[i].start, nm,
-                c ? "named" : (fam ? "family" : "address"), tables[i].slots);
+                0x100000000ULL + (uint64_t)tables[i].start, nm, srcv, tables[i].slots);
     }
     if (g_fs) {
         for (size_t i = 0; i < g_fs->v.size(); i++) {
