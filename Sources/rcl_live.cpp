@@ -2,6 +2,7 @@
 #include <map>
 #include <vector>
 #include "rcl_log.h"
+#include "rcl_alert.h"
 #include "rcl_classdump.h"
 
 #include <stdio.h>
@@ -894,6 +895,7 @@ void bc_open(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr) {
             (unsigned long long)img.base, (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize), state,
             (unsigned long long)cur, (unsigned long long)mgr);
     fprintf(g_bc_f, "# battle capture (Recoil-Runtime)\n");
+    alert_show("Recoil", "Бой начался — захват включён");
     fprintf(g_bc_f, "image_base=0x%llx vmsize=0x%llx state=%u cur=0x%llx mgr=0x%llx\n",
             (unsigned long long)img.base, (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize),
             state, (unsigned long long)cur, (unsigned long long)mgr);
@@ -954,6 +956,12 @@ void bc_close(void) {
     }
     fprintf(g_bc_f, "# battle end poll=%llu classes=%u objects=%u fields=%u accessors=%u\n",
             (unsigned long long)g_bc_tick, g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors);
+    {
+        char msg[256];
+        snprintf(msg, sizeof msg, "Бой закончился\nклассов: %u\nполей: %u\nаксессоров: %u", g_bc_classes, g_bc_fields,
+                 g_bc_accessors);
+        alert_show("Recoil", msg);
+    }
     fflush(g_bc_f);
     g_bc_active = false;
 }
