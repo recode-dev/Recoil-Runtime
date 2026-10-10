@@ -93,6 +93,12 @@ static bool plausible_ptr(const Image &img, uint64_t v) {
     return !in_image(img, v);
 }
 
+static bool object_ptr(const Image &img, uint64_t v) {
+    (void)img;
+    if (v < 0x100000000ULL || v >= 0x8000000000ULL) return false;
+    return (v & 0x7ULL) == 0;
+}
+
 static bool looks_like_vtable(const Image &img, uint64_t v) {
     if (!in_image(img, v)) return false;
     uint64_t f0 = 0, f1 = 0;
@@ -104,7 +110,7 @@ static bool manager_fields(const Image &img, uint64_t mgr, LiveAnchors &a, uint6
                            uint32_t &n) {
     static const uint32_t a_off[] = {0, 8, 0x10, 0x18, 0x20, 0x28, 0x30};
     static const uint32_t c_off[] = {0xc, 0x8, 0x10, 0x4, 0x14, 0x18, 0x1c};
-    if (!plausible_ptr(img, mgr)) return false;
+    if (!object_ptr(img, mgr)) return false;
     for (size_t ci = 0; ci < sizeof(c_off) / sizeof(c_off[0]); ci++) {
         uint32_t cnt = 0;
         if (!rd32(mgr + c_off[ci], cnt)) continue;
@@ -112,10 +118,16 @@ static bool manager_fields(const Image &img, uint64_t mgr, LiveAnchors &a, uint6
         for (size_t ai = 0; ai < sizeof(a_off) / sizeof(a_off[0]); ai++) {
             uint64_t ar = 0;
             if (!rd64(mgr + a_off[ai], ar)) continue;
-            if (!plausible_ptr(img, ar)) continue;
-            uint64_t o = 0, vt = 0;
-            if (!rd64(ar, o) || !plausible_ptr(img, o)) continue;
-            if (!rd64(o, vt) || !looks_like_vtable(img, vt)) continue;
+            if (!object_ptr(img, ar)) continue;
+            bool hit = false;
+            for (uint32_t k = 0; k < 8 && k < cnt; k++) {
+                uint64_t o = 0, vt = 0;
+                if (!rd64(ar + (uint64_t)k * 8, o) || !object_ptr(img, o)) continue;
+                if (!rd64(o, vt) || !looks_like_vtable(img, vt)) continue;
+                hit = true;
+                break;
+            }
+            if (!hit) continue;
             a.arr_off = a_off[ai];
             a.count_off = c_off[ci];
             a.cap_off = (c_off[ci] == 0xc) ? 8u : (c_off[ci] + 4u);
