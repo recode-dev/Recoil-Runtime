@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <set>
 
@@ -618,7 +619,6 @@ static void dump_getters(const Image &img, uint64_t vptr, int first, int last, c
 }
 
 static bool g_bc_nl_ready = false;
-static bool bc_keep_all();
 static const char *bc_class_label(const Image &img, uint64_t vt, char *buf, size_t cap);
 
 static void dump_object(const Image &img, uint64_t o, int idx, bool full)
@@ -627,9 +627,6 @@ static void dump_object(const Image &img, uint64_t o, int idx, bool full)
     char p[64];
     rd64(o, vt);
     fmt_ptr(img, vt, p, sizeof p);
-    if (g_bc_nl_ready && in_image(img, vt) && !bc_keep_all() &&
-        !nl_kind_keep(nl_kind((uint32_t)(vt - img.base))))
-        return;
     static std::map<uint64_t, std::string> lcache;
     std::map<uint64_t, std::string>::iterator li = lcache.find(vt);
     if (li == lcache.end())
@@ -1807,45 +1804,25 @@ static void bc_collect(const Image &img, uint64_t cur, uint64_t mgr)
         bc_walk(img, mgr, 6, 2048);
 }
 
-static bool bc_keep_all()
+static uint32_t kind_lookup(const std::map<uint32_t, uint32_t> &m, uint32_t id)
 {
-    static int v = -1;
-    if (v < 0)
-        v = env_u64("RCL_ALL_CLASSES", 0) ? 1 : 0;
-    return v == 1;
+    std::map<uint32_t, uint32_t>::const_iterator it = m.find(id);
+    return (it == m.end()) ? (uint32_t)NLK_UNKNOWN : it->second;
 }
 
-static void bc_write_offsets(const Image &img)
+static void bc_write_kind(const Image &img, uint32_t kd, const char *dir,
+                          const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                          const std::map<uint32_t, uint32_t> &kind_of)
 {
-    const char *dir = bc_dir();
     char path[1200];
-    std::vector<std::pair<uint32_t, uint64_t>> cls;
-    bc_class_order(cls);
-
-    std::map<uint32_t, bool> keep;
-    uint32_t kept = 0;
-    uint32_t dropUi = 0;
-    uint32_t dropAsset = 0;
-    uint32_t dropAudio = 0;
-    uint32_t dropUnk = 0;
+    const char *kname = nl_kind_name(kd);
+    uint32_t nk = 0;
     for (size_t c = 0; c < cls.size(); c++)
-    {
-        const uint32_t kind = nl_kind((uint32_t)(cls[c].second - img.base));
-        const bool kp = bc_keep_all() || nl_kind_keep(kind);
-        keep[cls[c].first] = kp;
-        if (kp)
-            kept++;
-        else if (kind == NLK_UI)
-            dropUi++;
-        else if (kind == NLK_ASSET)
-            dropAsset++;
-        else if (kind == NLK_AUDIO)
-            dropAudio++;
-        else
-            dropUnk++;
-    }
-
-    snprintf(path, sizeof path, "%s/battle-offsets.tsv.md", dir);
+        if (kind_lookup(kind_of, cls[c].first) == kd)
+            nk++;
+    snprintf(path, sizeof path, "%s/%s", dir, kname);
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/%s/battle-offsets.tsv.md", dir, kname);
     FILE *f = fopen(path, "w");
     if (f)
     {
@@ -1862,7 +1839,7 @@ static void bc_write_offsets(const Image &img)
         {
             const uint32_t id = cls[c].first;
             const uint64_t vt = cls[c].second;
-            if (!keep[id])
+            if (kind_lookup(kind_of, id) != kd)
                 continue;
             char label[128];
             bc_class_label(img, vt, label, sizeof label);
@@ -1898,7 +1875,7 @@ static void bc_write_offsets(const Image &img)
             {
                 if (g_bc_ref[r].pcls != id)
                     continue;
-                if (!keep[g_bc_ref[r].ccls])
+                if (kind_lookup(kind_of, g_bc_ref[r].ccls) != kd)
                     continue;
                 char cl[128];
                 bc_label_of(img, g_bc_ref[r].ccls, cl, sizeof cl);
@@ -1910,7 +1887,7 @@ static void bc_write_offsets(const Image &img)
             {
                 if (g_bc_arr[r].pcls != id)
                     continue;
-                if (!keep[g_bc_arr[r].ccls])
+                if (kind_lookup(kind_of, g_bc_arr[r].ccls) != kd)
                     continue;
                 char cl[128];
                 char hint[32];
@@ -1936,7 +1913,7 @@ static void bc_write_offsets(const Image &img)
         {
             if (g_bc_arr[r].pcls != kBcRootCls)
                 continue;
-            if (!keep[g_bc_arr[r].ccls])
+            if (kind_lookup(kind_of, g_bc_arr[r].ccls) != kd)
                 continue;
             char cl[128];
             bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
@@ -1958,12 +1935,7 @@ static void bc_write_offsets(const Image &img)
         fprintf(f, "- state `%u`, scene `0x%llx`, players `0x%llx`, count `%u`, polls `%llu`\n",
                 g_bc_state, (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players,
                 g_bc_pcount, (unsigned long long)g_bc_tick);
-        fprintf(f,
-                "- classes `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
-                "member refs `%u`, arrays `%u`, globals `%u`\n\n",
-                g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors,
-                (uint32_t)g_bc_access.size(), (uint32_t)g_bc_ref.size(), (uint32_t)g_bc_arr.size(),
-                (uint32_t)g_bc_cell.size());
+        fprintf(f, "- folder `%s`: `%u` of `%zu` classes\n\n", kname, nk, cls.size());
         std::map<uint32_t, std::string> lbl;
         for (size_t c = 0; c < cls.size(); c++)
         {
@@ -1971,11 +1943,6 @@ static void bc_write_offsets(const Image &img)
             bc_class_label(img, cls[c].second, lb, sizeof lb);
             lbl[cls[c].first] = lb;
         }
-        fprintf(f,
-                "- logic filter: kept `%u` of `%zu` classes (dropped ui `%u`, asset `%u`, "
-                "audio `%u`, unknown `%u`)%s\n\n",
-                kept, cls.size(), dropUi, dropAsset, dropAudio, dropUnk,
-                bc_keep_all() ? " `RCL_ALL_CLASSES` set" : "");
         for (int pass = 0; pass < 6; pass++)
         {
             uint32_t added = 0;
@@ -2003,7 +1970,7 @@ static void bc_write_offsets(const Image &img)
         {
             const uint32_t id = cls[c].first;
             const uint64_t vt = cls[c].second;
-            if (!keep[id])
+            if (kind_lookup(kind_of, id) != kd)
                 continue;
             char label[192];
             snprintf(label, sizeof label, "%s", lbl[id].c_str());
@@ -2073,7 +2040,7 @@ static void bc_write_offsets(const Image &img)
             {
                 if (g_bc_ref[r].pcls != id)
                     continue;
-                if (!keep[g_bc_ref[r].ccls])
+                if (kind_lookup(kind_of, g_bc_ref[r].ccls) != kd)
                     continue;
                 if (!anyRef)
                 {
@@ -2091,7 +2058,7 @@ static void bc_write_offsets(const Image &img)
             {
                 if (g_bc_arr[r].pcls != id)
                     continue;
-                if (!keep[g_bc_arr[r].ccls])
+                if (kind_lookup(kind_of, g_bc_arr[r].ccls) != kd)
                     continue;
                 if (!anyArr)
                 {
@@ -2155,6 +2122,44 @@ static void bc_write_offsets(const Image &img)
         fclose(f);
         RCL_LOGLN("[battle] offsets md written to %s", path);
     }
+}
+
+static void bc_write_offsets(const Image &img)
+{
+    const char *dir = bc_dir();
+    std::vector<std::pair<uint32_t, uint64_t>> cls;
+    bc_class_order(cls);
+
+    std::map<uint32_t, uint32_t> kind_of;
+    uint32_t per_kind[NLK_KIND_MAX + 1] = {0, 0, 0, 0, 0};
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t kind = nl_kind((uint32_t)(cls[c].second - img.base));
+        kind_of[cls[c].first] = kind;
+        per_kind[kind]++;
+    }
+    for (uint32_t kd = 0; kd <= NLK_KIND_MAX; kd++)
+    {
+        if (per_kind[kd])
+            bc_write_kind(img, kd, dir, cls, kind_of);
+    }
+
+    char path[1200];
+    snprintf(path, sizeof path, "%s/battle-offsets-INDEX.md", dir);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# battle offsets, one folder per class kind\n\n");
+    fprintf(f, "| folder | classes |\n|--------|---------|\n");
+    for (uint32_t kd = 0; kd <= NLK_KIND_MAX; kd++)
+        fprintf(f, "| `%s` | %u |\n", nl_kind_name(kd), per_kind[kd]);
+    fprintf(f,
+            "\nclasses `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
+            "member refs `%u`, arrays `%u`, globals `%u`\n",
+            g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors, (uint32_t)g_bc_access.size(),
+            (uint32_t)g_bc_ref.size(), (uint32_t)g_bc_arr.size(), (uint32_t)g_bc_cell.size());
+    fclose(f);
+    RCL_LOGLN("[battle] offsets index written to %s", path);
 }
 
 void bc_close(void)

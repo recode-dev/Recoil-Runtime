@@ -374,15 +374,9 @@ uint32_t kind_of_text(const std::string &s)
                                          "_debris", "_spark", "_lobby_", "_ulti",    "_atk",
                                          "_def",   "_idle",  "_walk",   "_run",      "_hit",
                                          "_ground", "_wall"};
-    static const char *const kCosmetic[] = {"pin",     "icon",    "badge",   "spray",  "emote",
-                                           "skin",    "frame",   "banner",  "sticker", "namecolor",
-                                           "gift",    "shop",    "market",  "mastery", "quest",
-                                           "rank",    "season",  "pass",    "offer",  "bundle",
-                                           "alliance", "club",   "friend",  "profile", "music",
-                                           "font",    "locale",  "string",  "theme",  "chat",
-                                           "stream",  "mail",    "trophy",  "reward", "unlock",
-                                           "tutorial", "currency"};
-    if (has_any(h, kCosmetic, sizeof kCosmetic / sizeof kCosmetic[0]))
+    static const char *const kAssetPath[] = {".glb",  ".sctx", ".tex",     ".png", ".pvr",
+                                             ".ktx",  ".sc",   "sc3d/",    "sc/",  "effects/"};
+    if (has_any(h, kAssetPath, sizeof kAssetPath / sizeof kAssetPath[0]))
     {
         return NLK_ASSET;
     }
@@ -569,11 +563,6 @@ void nl_stats(uint32_t hits[NL_SRC_MAX + 1])
     {
         hits[i] = g_hits[i];
     }
-}
-
-bool nl_kind_keep(uint32_t kind)
-{
-    return kind == NLK_LOGIC || kind == NLK_UNKNOWN;
 }
 
 uint32_t nl_kind(uint32_t vt)

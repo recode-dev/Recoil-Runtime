@@ -39,8 +39,6 @@ enum NlKind
     NLK_KIND_MAX = NLK_AUDIO
 };
 
-bool nl_kind_keep(uint32_t kind);
-
 uint32_t nl_kind(uint32_t vt);
 
 const char *nl_kind_name(uint32_t kind);
