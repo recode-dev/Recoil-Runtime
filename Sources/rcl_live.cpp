@@ -975,14 +975,28 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
         uint64_t seen[8];
         uint32_t seenN = 0;
         uint32_t distinct = 0;
+        uint32_t coordObjs = 0;
         uint32_t i = 0;
         for (i = 0; i < n && i < 128; i++) {
             uint64_t obj = 0;
             uint64_t vt = 0;
+            uint64_t words[64];
             uint32_t k = 0;
             int dup = 0;
+            int hasCoord = 0;
             if (!bc_read(arr + (uint64_t)i * 8, &obj, 8) || !obj) continue;
             if (!bc_read(obj, &vt, 8) || !vt) continue;
+            if (bc_read(obj, words, sizeof words)) {
+                for (k = 0; k < 64; k++) {
+                    uint32_t lo = (uint32_t)words[k];
+                    uint32_t hi = (uint32_t)(words[k] >> 32);
+                    if (lo >= 200u && lo <= 40000u && hi >= 200u && hi <= 40000u) {
+                        hasCoord = 1;
+                        break;
+                    }
+                }
+            }
+            if (hasCoord) coordObjs++;
             for (k = 0; k < seenN; k++) {
                 if (seen[k] == vt) {
                     dup = 1;
@@ -992,11 +1006,11 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             if (!dup && seenN < 8) seen[seenN++] = vt;
         }
         distinct = seenN;
-        inBattle = (n >= 8 && distinct >= 2);
+        inBattle = (coordObjs >= 2);
     g_bc_last_n = n;
         if ((g_bc_tick % 10) == 0) {
-            fprintf(g_bc_f, "poll %llu state=%u cur=0x%llx mgr=0x%llx n=%u vt=%u live=%d classes=%u fields=%u\n",
-                    (unsigned long long)g_bc_tick, state, (unsigned long long)cur, (unsigned long long)mgr, n, distinct,
+            fprintf(g_bc_f, "poll %llu state=%u cur=0x%llx mgr=0x%llx n=%u vt=%u coord=%u live=%d classes=%u fields=%u\n",
+                    (unsigned long long)g_bc_tick, state, (unsigned long long)cur, (unsigned long long)mgr, n, distinct, coordObjs,
                     inBattle ? 1 : 0, g_bc_classes, g_bc_fields);
             fflush(g_bc_f);
         }
