@@ -14,6 +14,10 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/thread_act.h>
+
+extern "C" int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
+                                      unsigned long long size, unsigned long long out,
+                                      unsigned long long *got);
 #include <pthread.h>
 #include <unistd.h>
 #endif
@@ -67,8 +71,7 @@ uint32_t table_for_rva(uint32_t rva) {
 
 bool rdmem(uint64_t va, void *dst, size_t n) {
     unsigned long long got = 0;
-    if (mach_vm_read_overwrite(mach_task_self_, va, n, (unsigned long long)(uintptr_t)dst, &got) !=
-        KERN_SUCCESS)
+    if (mach_vm_read_overwrite(mach_task_self_, va, n, (unsigned long long)(uintptr_t)dst, &got) != 0)
         return false;
     return got == n;
 }
