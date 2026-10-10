@@ -1442,21 +1442,6 @@ static void bc_class_order(std::vector<std::pair<uint32_t, uint64_t>> &out)
     std::sort(out.begin(), out.end());
 }
 
-static uint32_t bc_class_methods(const Image &img, uint64_t vt, uint64_t *rvas, uint32_t cap)
-{
-    uint32_t k = 0;
-    for (k = 0; k < cap; k++)
-    {
-        uint64_t w = 0;
-        if (!bc_read(vt + (uint64_t)k * 8, &w, 8) || !w)
-            break;
-        if (!in_image(img, w))
-            break;
-        rvas[k] = w;
-    }
-    return k;
-}
-
 static const char *bc_label_of(const Image &img, uint32_t id, char *buf, size_t cap)
 {
     if (id == kBcRootCls)
@@ -1479,16 +1464,6 @@ static const char *bc_label_of(const Image &img, uint32_t id, char *buf, size_t 
         return buf;
     }
     return bc_class_label(img, vt, buf, cap);
-}
-
-static uint64_t bc_vt_of(uint32_t id)
-{
-    for (std::map<uint64_t, uint32_t>::iterator it = g_bc_vt.begin(); it != g_bc_vt.end(); ++it)
-    {
-        if (it->second == id)
-            return it->first;
-    }
-    return 0;
 }
 
 static uint32_t bc_class_id(const Image &img, uint64_t vt)
@@ -1940,27 +1915,6 @@ static const char *bc_method_name(const Image &img, uint32_t rva)
     return (tn && *tn) ? tn : nm;
 }
 
-static uint32_t kind_lookup(const std::map<uint32_t, uint32_t> &m, uint32_t id)
-{
-    std::map<uint32_t, uint32_t>::const_iterator it = m.find(id);
-    return (it == m.end()) ? (uint32_t)NLK_UNKNOWN : it->second;
-}
-
-static void bc_safe_name(char *out, size_t cap, const char *in)
-{
-    size_t n = 0;
-    for (const char *p = in; *p && n + 1 < cap; p++)
-    {
-        const char c = *p;
-        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
-        out[n++] = ok ? c : '_';
-    }
-    out[n] = 0;
-    if (!n)
-        snprintf(out, cap, "unnamed");
-}
-
 static bool bc_class_known(const char *label)
 {
     return strncmp(label, "vt_", 3) != 0 && strcmp(label, "unknown") != 0;
@@ -2094,28 +2048,6 @@ static const char *bc_type_name(const char *label)
     return bc_class_known(label) ? "string" : "vt";
 }
 
-struct BcClassRow
-{
-    uint32_t id;
-    uint32_t methods;
-    uint32_t named;
-    uint32_t fields;
-    uint32_t refs;
-    uint32_t arrays;
-    uint32_t globals;
-    uint32_t code;
-};
-
-static bool bc_row_better(const BcClassRow &a, const BcClassRow &b)
-{
-    if (a.named != b.named)
-        return a.named > b.named;
-    if (a.methods != b.methods)
-        return a.methods > b.methods;
-    if (a.fields != b.fields)
-        return a.fields > b.fields;
-    return a.id < b.id;
-}
 
 struct BcSem
 {
