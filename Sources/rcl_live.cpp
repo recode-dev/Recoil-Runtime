@@ -171,6 +171,28 @@ static uint64_t env_u64(const char *name, uint64_t def) {
     return strtoull(v, nullptr, 0);
 }
 
+static bool gsm_candidate(const Image &img, uint64_t home, LiveAnchors &a, uint32_t state_max, bool need_cur) {
+    uint32_t st = 0;
+    uint64_t cur = 0;
+    uint8_t flag = 0;
+    if (!object_ptr(img, home)) return false;
+    if (!rd32(home + 0x50, st) || st > state_max) return false;
+    if (state_max == 8u && st != 0 && st != 2 && st != 4 && st != 5 && st != 6 && st != 8) return false;
+    if (!rd64(home + 0x48, cur) || !rd8(home + 0x70, flag) || flag > 1) return false;
+    if (!cur && need_cur) return false;
+    if (cur) {
+        uint64_t vt = 0;
+        if (!plausible_ptr(img, cur)) return false;
+        if (!rd64(cur, vt) || !looks_like_vtable(img, vt)) return false;
+    }
+    a.state_off = 0x50;
+    a.current_off = 0x48;
+    a.home = home;
+    a.cur = cur;
+    a.ok = true;
+    return true;
+}
+
 static bool discover_live(const Image &img, LiveAnchors &a) {
     a = LiveAnchors();
     if (!img.ok()) return false;
@@ -185,47 +207,34 @@ static bool discover_live(const Image &img, LiveAnchors &a) {
         dn = 1;
     }
 
-    for (int d = 0; d < dn && !a.ok; d++) {
-        for (uint64_t va = dlo[d]; va + 8 <= dhi[d]; va += 8) {
-            uint64_t home = 0;
-            if (!rd64(va, home) || !plausible_ptr(img, home)) continue;
-            for (uint32_t c = 0; c <= 0x200; c += 8) {
-                uint64_t cur = 0;
-                if (!rd64(home + c, cur) || !plausible_ptr(img, cur)) continue;
-                uint64_t vt = 0;
-                if (!rd64(cur, vt) || !looks_like_vtable(img, vt)) continue;
+    for (int pass = 0; pass < 2 && !a.ok; pass++) {
+        const uint32_t state_max = pass == 0 ? 8u : 31u;
+        const bool need_cur = pass == 0;
+        for (int d = 0; d < dn && !a.ok; d++) {
+            for (uint64_t va = dlo[d]; va + 8 <= dhi[d]; va += 8) {
+                uint64_t home = 0;
+                if (!rd64(va, home) || !plausible_ptr(img, home)) continue;
                 LiveAnchors cand;
-                cand.current_off = c;
-                if (!client_probe(img, cur, cand)) continue;
+                if (!gsm_candidate(img, home, cand, state_max, need_cur)) continue;
                 cand.home_slot = va;
-                cand.home = home;
-                cand.cur = cur;
-                cand.ok = true;
                 a = cand;
                 break;
             }
-            if (a.ok) break;
         }
     }
 
     if (!a.ok) return false;
 
-    uint32_t st = 0;
-    for (uint32_t s = a.current_off + 4; s <= a.current_off + 0x40; s += 4) {
-        uint32_t v = 0;
-        if (!rd32(a.home + s, v)) continue;
-        if (v <= 31) { st = s; break; }
-    }
-    if (st) a.state_off = st;
-
-    for (uint32_t s = 0x8; s <= 0x100; s += 8) {
-        if (s == a.mgr_off) continue;
-        uint64_t p = 0;
-        if (!rd64(a.cur + s, p)) continue;
-        if (!plausible_ptr(img, p)) continue;
-        uint64_t vt = 0;
-        if (!rd64(p, vt)) continue;
-        if (looks_like_vtable(img, vt)) { a.input_off = s; break; }
+    if (a.cur) {
+        for (uint32_t s = 0x8; s <= 0x100; s += 8) {
+            if (s == a.mgr_off) continue;
+            uint64_t p = 0;
+            if (!rd64(a.cur + s, p)) continue;
+            if (!plausible_ptr(img, p)) continue;
+            uint64_t vt = 0;
+            if (!rd64(p, vt)) continue;
+            if (looks_like_vtable(img, vt)) { a.input_off = s; break; }
+        }
     }
     return true;
 }
@@ -1238,6 +1247,7 @@ void battle_capture_autostart(const Image &img)
         }
     }
     std::thread([]() {
+        uint32_t mgr_off = 0;
         for (;;) {
             const LiveAnchors &a = anchors_for(g_bc_img);
             uint64_t home = 0;
@@ -1246,15 +1256,21 @@ void battle_capture_autostart(const Image &img)
             uint64_t arr = 0;
             uint32_t state = 0;
             uint32_t n = 0;
-            if (rd64(a.home_slot, home) && home && object_ptr(g_bc_img, home)) {
+            if (a.ok && rd64(a.home_slot, home) && home && object_ptr(g_bc_img, home)) {
                 rd32(home + a.state_off, state);
-                if (rd64(home + a.current_off, cur) && cur && object_ptr(g_bc_img, cur)) {
+                if (!rd64(home + a.current_off, cur) || !object_ptr(g_bc_img, cur)) cur = 0;
+            } else {
+                home = 0;
+            }
+            if (state == 5 && cur) {
+                if (!mgr_off) {
                     LiveAnchors probe = a;
-                    rd64(cur + a.mgr_off, mgr);
-                    if (!manager_fields(g_bc_img, mgr, probe, arr, n)) {
-                        n = 0;
-                    }
+                    mgr_off = client_probe(g_bc_img, cur, probe) ? probe.mgr_off : a.mgr_off;
                 }
+                rd64(cur + mgr_off, mgr);
+                LiveAnchors probe = a;
+                probe.mgr_off = mgr_off;
+                if (!manager_fields(g_bc_img, mgr, probe, arr, n)) n = 0;
             }
             bc_poll(g_bc_img, state, cur, mgr, arr, n);
             usleep(100000);
