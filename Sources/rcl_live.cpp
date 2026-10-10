@@ -861,13 +861,38 @@ uint64_t bc_fp(const Image &img, uint64_t vtable) {
     return h;
 }
 
+const char *bc_dir(void) {
+    static char buf[1024];
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        snprintf(buf, sizeof buf, "%s/Documents", home);
+        return buf;
+    }
+    if (log_dir() && *log_dir()) return log_dir();
+    return "/tmp";
+}
+
+void bc_open_file(void) {
+    char path[1200];
+    if (g_bc_f) return;
+    snprintf(path, sizeof path, "%s/battle-capture-log.txt", bc_dir());
+    g_bc_f = fopen(path, "a");
+    if (!g_bc_f) {
+        snprintf(path, sizeof path, "/tmp/battle-capture-log.txt");
+        g_bc_f = fopen(path, "a");
+    }
+    if (!g_bc_f) return;
+    fprintf(g_bc_f, "# battle capture (Recoil-Runtime) opened, path=%s\n", path);
+    fflush(g_bc_f);
+}
+
 void bc_open(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr) {
-    const char *dir = log_dir();
-    char path[1024];
-    snprintf(path, sizeof path, "%s/battle-capture-log.txt", (dir && *dir) ? dir : ".");
-    g_bc_f = fopen(path, "w");
+    bc_open_file();
     if (!g_bc_f) return;
     g_bc_img = img;
+    fprintf(g_bc_f, "# battle start image_base=0x%llx vmsize=0x%llx state=%u cur=0x%llx mgr=0x%llx\n",
+            (unsigned long long)img.base, (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize), state,
+            (unsigned long long)cur, (unsigned long long)mgr);
     fprintf(g_bc_f, "# battle capture (Recoil-Runtime)\n");
     fprintf(g_bc_f, "image_base=0x%llx vmsize=0x%llx state=%u cur=0x%llx mgr=0x%llx\n",
             (unsigned long long)img.base, (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize),
@@ -921,25 +946,31 @@ void bc_code_pass(const Image &img) {
 void bc_close(void) {
     if (!g_bc_f) {
         g_bc_active = false;
-        g_bc_done = true;
         return;
     }
-    if (!g_bc_code) {
+    if (!g_bc_code && g_bc_classes > 0) {
         g_bc_code = true;
         bc_code_pass(g_bc_img);
     }
-    fprintf(g_bc_f, "# summary classes=%u objects=%u fields=%u accessors=%u ticks=%llu\n", g_bc_classes, g_bc_objects,
-            g_bc_fields, g_bc_accessors, (unsigned long long)g_bc_tick);
-    fclose(g_bc_f);
-    g_bc_f = nullptr;
+    fprintf(g_bc_f, "# battle end poll=%llu classes=%u objects=%u fields=%u accessors=%u\n",
+            (unsigned long long)g_bc_tick, g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors);
+    fflush(g_bc_f);
     g_bc_active = false;
-    g_bc_done = true;
 }
 
 void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint64_t arr, uint32_t n) {
-    bool inBattle = (state == 5 && cur != 0);
+    bool inBattle = false;
+    bc_open_file();
+    if (!g_bc_f) return;
+    inBattle = (state == 5 && cur != 0) || (n >= 2);
+    if ((g_bc_tick % 5) == 0) {
+        fprintf(g_bc_f, "poll %llu state=%u cur=0x%llx mgr=0x%llx n=%u live=%d classes=%u fields=%u\n",
+                (unsigned long long)g_bc_tick, state, (unsigned long long)cur, (unsigned long long)mgr, n,
+                inBattle ? 1 : 0, g_bc_classes, g_bc_fields);
+        fflush(g_bc_f);
+    }
     if (inBattle) {
-        if (!g_bc_active && !g_bc_done) {
+        if (!g_bc_active) {
             g_bc_active = true;
             bc_open(img, state, cur, mgr);
         }
@@ -948,7 +979,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
         g_bc_quiet++;
         if (g_bc_quiet >= 10) bc_close();
     }
-    if (!g_bc_active || !g_bc_f) return;
+    if (!g_bc_active) return;
     g_bc_tick++;
     for (uint32_t i = 0; i < n && i < 256; i++) {
         uint64_t obj = 0;
@@ -988,6 +1019,11 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
         bc_code_pass(img);
     }
     if ((g_bc_tick % 10) == 0) fflush(g_bc_f);
+}
+
+void battle_capture_open(void)
+{
+    bc_open_file();
 }
 
 void live_session(const Image &img, const Seeds &s) {

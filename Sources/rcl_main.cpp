@@ -166,6 +166,7 @@ static void open_log_anywhere() {
 
     for (int i = 0; i < n; i++) {
         log_open(cands[i]);
+        battle_capture_open();
         if (log_is_open()) { RCL_LOGLN("[log] %s", cands[i]); return; }
     }
 }
