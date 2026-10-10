@@ -170,16 +170,46 @@ static void open_log_anywhere() {
     }
 }
 
-static void run_once(const Image &img, const std::string &why) {
+static Image g_live_img;
+static Seeds g_live_seeds;
+static bool g_live_started = false;
+
+static void *live_worker(void *) {
+    g_live_started = true;
+    for (;;) {
+        live_session(g_live_img, g_live_seeds);
+        sleep(5);
+    }
+    return nullptr;
+}
+
+static void run_pass(const Image &img, const std::string &why, int pass) {
     const Seeds s = Seeds::discover(img);
-    log_image_list();
-    RCL_LOGLN("[target image] %s", why.c_str());
-    RCL_LOGLN("[target base] 0x%llx text_vmsize 0x%llx image_vmsize 0x%llx",
-              (unsigned long long)img.base, (unsigned long long)img.vmsize,
-              (unsigned long long)img.image_vmsize);
+    if (pass == 0) {
+        log_image_list();
+        RCL_LOGLN("[target image] %s", why.c_str());
+        RCL_LOGLN("[target base] 0x%llx text_vmsize 0x%llx image_vmsize 0x%llx",
+                  (unsigned long long)img.base, (unsigned long long)img.vmsize,
+                  (unsigned long long)img.image_vmsize);
+    } else {
+        RCL_LOGLN("");
+        RCL_LOGLN("[pass %d] base 0x%llx images %u", pass, (unsigned long long)img.base,
+                  _dyld_image_count());
+    }
+    set_skip_bundle(pass > 0);
     report_run(img, s);
-    live_session(img, s);
-    log_close();
+    set_skip_bundle(false);
+    if (pass > 0) return;
+    if (g_live_started) return;
+    if ((int)env_u64("RCL_RESCAN_SEC", 20) <= 0) {
+        live_session(img, s);
+        return;
+    }
+    g_live_img = img;
+    g_live_seeds = s;
+    pthread_t lt;
+    if (pthread_create(&lt, nullptr, live_worker, nullptr) == 0) pthread_detach(lt);
+    else live_session(img, s);
 }
 
 static void *waiter(void *) {
@@ -208,8 +238,20 @@ static void *waiter(void *) {
                 log_close();
                 return nullptr;
             }
-            run_once(img, why);
-            return nullptr;
+            run_pass(img, why, 0);
+            const int secs = (int)env_u64("RCL_RESCAN_SEC", 20);
+            if (secs <= 0) {
+                log_close();
+                return nullptr;
+            }
+            for (int pass = 1;; pass++) {
+                sleep((unsigned)secs);
+                std::vector<Loaded> again;
+                Image i2;
+                std::string w2;
+                if (!pick_image(i2, w2, again)) continue;
+                run_pass(i2, w2, pass);
+            }
         }
         if (i % 20 == 19)
             RCL_LOGLN("[wait] %.0fs, images %u", (i + 1) * step_ms / 1000.0, _dyld_image_count());

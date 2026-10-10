@@ -2683,7 +2683,12 @@ static bool bundle_copy(const char *src, const char *dst) {
     return true;
 }
 
+static bool g_skip_bundle = false;
+
+void set_skip_bundle(bool skip) { g_skip_bundle = skip; }
+
 void write_all_bundle() {
+    if (g_skip_bundle) return;
     const char *mode = getenv("RCL_DOCS");
     if (mode && *mode == '0') return;
 

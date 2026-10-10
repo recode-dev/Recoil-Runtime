@@ -18,6 +18,8 @@ CI does it on `macos-14` and uploads `RecoilRuntime.dylib`; on a `v*` tag it als
 3. Everything lands in a single `Dumps` folder inside the guest container: `$HOME/Documents/Dumps`.
    Fallbacks: `RCL_DUMPS_DIR`, `RCL_DOCS_DIR`, `RCL_REPORTS_DIR`, `$RCL_LOG_DIR/Dumps`, `/var/mobile/Documents/Dumps`.
    The log file goes there too unless `RCL_LOG_DIR` is set; `RCL_STDERR=1` mirrors to stderr.
+   The whole pass repeats every `RCL_RESCAN_SEC` seconds (default `20`, `0` = single pass) while the
+   live sampler keeps running, so the dump keeps growing as the game progresses.
 
 ## No hardcoded offsets
 
