@@ -15,8 +15,9 @@ CI does it on `macos-14` and uploads `RecoilRuntime.dylib`; on a `v*` tag it als
 
 1. Open the app's settings, Tweaks, add `RecoilRuntime.dylib`.
 2. Launch the game. The dylib waits for the guest image (`RCL_WAIT_SEC`, default 60s).
-3. Log lands in `$HOME/Documents` inside the guest container (fallbacks: `$HOME`, `/var/mobile/Documents`, `/tmp`).
-   `RCL_LOG_DIR` forces the directory, `RCL_STDERR=1` mirrors to stderr.
+3. Everything lands in a single `Dumps` folder inside the guest container: `$HOME/Documents/Dumps`.
+   Fallbacks: `RCL_DUMPS_DIR`, `RCL_DOCS_DIR`, `RCL_REPORTS_DIR`, `$RCL_LOG_DIR/Dumps`, `/var/mobile/Documents/Dumps`.
+   The log file goes there too unless `RCL_LOG_DIR` is set; `RCL_STDERR=1` mirrors to stderr.
 
 ## No hardcoded offsets
 
@@ -39,7 +40,8 @@ If discovery picks the wrong function, override it: `RCL_PROPGET_RVA`, `RCL_COLN
 - `[property sites]` - `field <- property ids`, from `mov w1,#id ; bl <getter> ; str[b] w0,[xN,#field]`.
 - `[column names]` - the data schema's column-name strings and the address each was loaded from.
 - `[own-character byte flags]` - bytes on `getBattle()+0x28` read as booleans by gameplay.
-- `Documents/RecoilDump/` - one `.md` per class, `Unknown/`, `_missing.md`, `_live/`, `_diag.md`.
+- `Dumps/` - one `.md` per class, `Unknown/`, `_missing.md`, `_live/`, `_diag.md`, the `_*.md`/`_*.tsv`
+  reports, `cache/`, and the flat `All/` copy of every document.
 
 ## Limits
 

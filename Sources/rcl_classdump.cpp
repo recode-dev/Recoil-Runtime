@@ -376,34 +376,35 @@ std::vector<ClassTable> scan_class_tables(const Image &img, ScanStats *st) {
 }
 
 
-namespace {
-
-const char *dump_root() {
+const char *dumps_root() {
     static char root[512];
-    const char *env = getenv("RCL_DOCS_DIR");
-    const char *rd = getenv("RCL_LOG_DIR");
-    const char *home = getenv("HOME");
-    if (env && *env) snprintf(root, sizeof root, "%s", env);
-    else if (rd && *rd) snprintf(root, sizeof root, "%s/RecoilDump", rd);
-    else if (home && *home) snprintf(root, sizeof root, "%s/Documents/RecoilDump", home);
-    else snprintf(root, sizeof root, "%s", "/var/mobile/Documents/RecoilDump");
-    return root;
-}
-
-const char *diag_root() {
-    static char root[512];
-    const char *env = getenv("RCL_REPORTS_DIR");
+    const char *e = getenv("RCL_DUMPS_DIR");
     const char *d = getenv("RCL_DOCS_DIR");
+    const char *rp = getenv("RCL_REPORTS_DIR");
     const char *rd = getenv("RCL_LOG_DIR");
     const char *home = getenv("HOME");
-    if (env && *env) snprintf(root, sizeof root, "%s", env);
-    else if (d && *d) snprintf(root, sizeof root, "%s_reports", d);
-    else if (rd && *rd) snprintf(root, sizeof root, "%s/RecoilReports", rd);
-    else if (home && *home) snprintf(root, sizeof root, "%s/Documents/RecoilReports", home);
-    else snprintf(root, sizeof root, "%s", "/var/mobile/Documents/RecoilReports");
+    if (e && *e) snprintf(root, sizeof root, "%s", e);
+    else if (d && *d) snprintf(root, sizeof root, "%s", d);
+    else if (rp && *rp) snprintf(root, sizeof root, "%s", rp);
+    else if (home && *home) snprintf(root, sizeof root, "%s/Documents/Dumps", home);
+    else if (rd && *rd) snprintf(root, sizeof root, "%s/Dumps", rd);
+    else snprintf(root, sizeof root, "%s", "/var/mobile/Documents/Dumps");
+    if (root[0] != '/') return root;
+    for (char *p = root + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        mkdir(root, 0755);
+        *p = '/';
+    }
     mkdir(root, 0755);
     return root;
 }
+
+namespace {
+
+const char *dump_root() { return dumps_root(); }
+
+const char *diag_root() { return dumps_root(); }
 
 struct LiveArg {
     Image img;

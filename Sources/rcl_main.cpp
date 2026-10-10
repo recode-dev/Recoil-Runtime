@@ -3,6 +3,7 @@
 #include "rcl_log.h"
 #include "rcl_ident.h"
 #include "rcl_live.h"
+#include "rcl_classdump.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -154,9 +155,10 @@ static void open_log_anywhere() {
     const char *h = getenv("HOME");
     if (h) { snprintf(home, sizeof home, "%s", h); snprintf(home_docs, sizeof home_docs, "%s/Documents", h); }
 
-    const char *cands[5];
+    const char *cands[6];
     int n = 0;
     if (env && *env) cands[n++] = env;
+    cands[n++] = dumps_root();
     if (home_docs[0]) cands[n++] = home_docs;
     if (home[0]) cands[n++] = home;
     cands[n++] = "/var/mobile/Documents";
