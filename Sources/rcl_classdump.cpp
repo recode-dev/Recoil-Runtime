@@ -783,6 +783,27 @@ void write_globals(const std::vector<GlobalHit> &hits, const Image &img, const c
                 (unsigned long long)h.object, where, h.vt, cl, g);
     }
     fclose(f);
+
+    snprintf(path, sizeof path, "%s/_globals.tsv", root);
+    f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "cell_rva\tobject_ptr\twhere\tclass_table\tclass\tname_guess\n");
+    for (const GlobalHit &h : hits) {
+        char cl[128];
+        class_label(h.vt, cl, sizeof cl);
+        const char *g = "-";
+        if (strstr(cl, "BattleScreen")) g = "StageInstanceGlobalPtr-like";
+        else if (strstr(cl, "MessageManager")) g = "MessageManager_instance";
+        else if (strstr(cl, "AllianceManager")) g = "AllianceManager_instance";
+        else if (strstr(cl, "LogicDataTables")) g = "LogicDataTables_tableArray";
+        else if (strstr(cl, "FramerateManager")) g = "FramerateManager_targetFps";
+        else if (strstr(cl, "Screen")) g = "Screen_*Global";
+        const uint64_t span = img.image_vmsize ? img.image_vmsize : img.vmsize;
+        const char *where = (h.object >= img.base && h.object - img.base < span) ? "image" : "heap";
+        fprintf(f, "%#x\t0x%llx\t%s\t%#x\t%s\t%s\n", h.cell, (unsigned long long)h.object, where,
+                h.vt, cl, g);
+    }
+    fclose(f);
 }
 
 void write_anchors_extra(const std::vector<ClassTable> &tables, const char *root) {

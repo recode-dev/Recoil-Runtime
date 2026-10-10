@@ -1452,6 +1452,7 @@ void deep_globals(const Image &img, const MachInsight &mi, const FnStarts &fs,
         }
     }
     fclose(f);
+    if (!st.globals) remove(path);
     RCL_LOGLN("[deep] globals: %u, with a class: %u", st.globals, st.globals_named);
 }
 
