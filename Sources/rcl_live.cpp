@@ -1160,7 +1160,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             if (changed) movedInPlayers++;
         }
     }
-    inBattle = (players != 0 && movedInPlayers >= 2);
+    inBattle = (state == 5 && cur != 0);
     g_bc_players = players;
     g_bc_pcount = pCount;
     g_bc_state = state;
