@@ -2124,6 +2124,8 @@ struct BcSem
     uint32_t changes;
     uint32_t bchg;
     uint32_t lchg;
+    uint64_t first_tick;
+    uint64_t last_tick;
     int64_t last;
     double dmin;
     double dmax;
@@ -2160,6 +2162,9 @@ static void bc_sem_note(uint32_t id, uint32_t off, int kind, uint64_t value)
                 s.bchg++;
             else
                 s.lchg++;
+            if (!s.first_tick)
+                s.first_tick = g_bc_tick;
+            s.last_tick = g_bc_tick;
         }
         s.last = (int64_t)value;
         if ((int64_t)value < s.imin)
@@ -2521,9 +2526,14 @@ static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std
 {
 #if defined(__APPLE__)
     std::map<uint64_t, uint32_t> vtout;
+    std::map<uint32_t, uint64_t> id2vt;
     for (std::map<uint64_t, uint32_t>::const_iterator it = g_bc_vt.begin(); it != g_bc_vt.end();
          ++it)
+    {
         vtout[it->first] = it->second;
+        if (id2vt.find(it->second) == id2vt.end())
+            id2vt[it->second] = it->first;
+    }
     if (vtout.empty())
     {
         fprintf(f, "- no known class table yet\n");
@@ -2534,6 +2544,8 @@ static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std
     const uint64_t cap = 384ull * 1024ull * 1024ull;
     std::map<uint32_t, uint32_t> inst;
     std::map<uint32_t, uint64_t> first;
+    std::map<uint32_t, uint64_t> gap;
+    std::map<uint32_t, uint64_t> prevaddr;
     unsigned int info[8];
     unsigned int cnt = 8;
     unsigned int obj = 0;
@@ -2558,19 +2570,36 @@ static void bc_heap_pass(const Image &img, FILE *f, const std::map<uint32_t, std
                 inst[it->second]++;
                 if (first.find(it->second) == first.end())
                     first[it->second] = o;
+                std::map<uint32_t, uint64_t>::iterator pv = prevaddr.find(it->second);
+                if (pv != prevaddr.end() && o > pv->second)
+                {
+                    const uint64_t d = o - pv->second;
+                    if (d >= 16 && (gap.find(it->second) == gap.end() || d < gap[it->second]))
+                        gap[it->second] = d;
+                }
+                prevaddr[it->second] = o;
             }
         }
         addr += size;
     }
-    fprintf(f, "- heap pass scanned `%llu` bytes of writable memory\n\n",
-            (unsigned long long)scanned);
-    fprintf(f, "| class | instances | first object |\n|-------|----------:|-------------:|\n");
-    for (std::map<uint32_t, uint32_t>::iterator it = inst.begin(); it != inst.end(); ++it)
+    fprintf(f, "- heap pass scanned `%llu` bytes of writable memory, `%zu` classes held\n\n",
+            (unsigned long long)scanned, inst.size());
+    std::vector<std::pair<uint32_t, uint32_t>> order(inst.begin(), inst.end());
+    std::sort(order.begin(), order.end(),
+              [](const std::pair<uint32_t, uint32_t> &a, const std::pair<uint32_t, uint32_t> &b)
+              { return a.second > b.second; });
+    fprintf(f, "| class | instances | smallest gap | first object | table |\n|-------|----------:|"
+               "-------------:|-------------:|------:|\n");
+    for (size_t i = 0; i < order.size(); i++)
     {
-        std::map<uint32_t, std::string>::const_iterator lb = lbl.find(it->first);
-        fprintf(f, "| %s | %u | `0x%llx` |\n",
-                lb == lbl.end() ? "-" : lb->second.c_str(), it->second,
-                (unsigned long long)first[it->first]);
+        const uint32_t id = order[i].first;
+        std::map<uint32_t, std::string>::const_iterator lb = lbl.find(id);
+        std::map<uint32_t, uint64_t>::const_iterator vt = id2vt.find(id);
+        std::map<uint32_t, uint64_t>::const_iterator gp = gap.find(id);
+        fprintf(f, "| %s | %u | `0x%llx` | `0x%llx` | `0x%llx` |\n",
+                lb == lbl.end() ? "-" : lb->second.c_str(), order[i].second,
+                (unsigned long long)(gp == gap.end() ? 0 : gp->second), (unsigned long long)first[id],
+                (unsigned long long)(vt == id2vt.end() ? 0 : vt->second - img.base));
     }
 #else
     (void)img;
@@ -2980,16 +3009,32 @@ static void bc_write_one(const Image &img, const char *root,
                 per_split[kd][1], per_kind[kd]);
     fprintf(f, "| **total** | **%u** | **%u** | **%zu** |\n\n", known,
             (uint32_t)cls.size() - known, cls.size());
-    fprintf(f, "| id | class | type | kind | source | shared | vtable rva | search key |\n");
-    fprintf(f, "|---:|-------|------|------|--------|-------:|-----------:|------------|\n");
+    fprintf(f, "| id | class | type | kind | source | shared | signals | vtable rva | search key |\n");
+    fprintf(f, "|---:|-------|------|------|--------|-------:|--------:|-----------:|------------|\n");
     for (size_t c = 0; c < cls.size(); c++)
     {
         const uint32_t id = cls[c].first;
         const std::string &lb = lbl.find(id)->second;
         std::map<uint32_t, int>::const_iterator si = src_of.find(id);
-        fprintf(f, "| %u | `%s` | %s | `%s` | %s | %u | `0x%llx` | `%s` |\n", id, lb.c_str(),
+        uint32_t sig = 0;
+        if (bc_class_named(lb.c_str()))
+            sig++;
+        if (g_bc_vtref.find((uint32_t)(cls[c].second - img.base)) != g_bc_vtref.end())
+            sig++;
+        for (std::map<uint64_t, BcSem>::const_iterator it = g_bc_sem.begin(); it != g_bc_sem.end();
+             ++it)
+        {
+            if ((uint32_t)(it->first >> 32) == id)
+            {
+                sig++;
+                break;
+            }
+        }
+        if (refs.find(id) != refs.end())
+            sig++;
+        fprintf(f, "| %u | `%s` | %s | `%s` | %s | %u | %u | `0x%llx` | `%s` |\n", id, lb.c_str(),
                 bc_type_name(lb.c_str()), nl_kind_name(kind_of.find(id)->second),
-                bc_src_name(si == src_of.end() ? -1 : si->second), share[lb],
+                bc_src_name(si == src_of.end() ? -1 : si->second), share[lb], sig,
                 (unsigned long long)(cls[c].second - img.base), bc_search_key(lb.c_str()));
     }
 
@@ -3086,9 +3131,9 @@ static void bc_write_one(const Image &img, const char *root,
                 continue;
             if (!shown)
             {
-                fprintf(f, "#### fields\n\n| off | kind | reads | changes | battle | lobby | min | "
-                           "max | guess | sample |\n|-----|------|------:|--------:|-------:|"
-                           "------:|-----|-----|-------|--------|\n");
+                fprintf(f, "#### fields\n\n| off | kind | reads | changes | battle | lobby | first | "
+                           "last | min | max | guess | sample |\n|-----|------|------:|--------:|"
+                           "-------:|------:|------:|-----:|-----|-----|-------|--------|\n");
             }
             shown++;
             const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
@@ -3120,9 +3165,12 @@ static void bc_write_one(const Image &img, const char *root,
                 extra[100] = 0;
             if (sm.bchg && !sm.lchg)
                 snprintf(extra + strlen(extra), (sizeof extra) - strlen(extra), " battle-only");
-            fprintf(f, "| `0x%x` | %s | %u | %u | %u | %u | %lld | %lld | %s | `0x%llx` %s |\n", off,
-                    bc_kind_name(sm.kind), sm.reads, sm.changes, sm.bchg, sm.lchg,
-                    (long long)sm.imin, (long long)sm.imax, guess, (unsigned long long)val, extra);
+            fprintf(f, "| `0x%x` | %s | %u | %u | %u | %u | %llu | %llu | %lld | %lld | %s | "
+                       "`0x%llx` %s |\n",
+                    off, bc_kind_name(sm.kind), sm.reads, sm.changes, sm.bchg, sm.lchg,
+                    (unsigned long long)sm.first_tick, (unsigned long long)sm.last_tick,
+                    (long long)sm.imin,
+                    (long long)sm.imax, guess, (unsigned long long)val, extra);
         }
         if (shown)
             fprintf(f, "\n");
@@ -3342,6 +3390,8 @@ static void bc_write_one(const Image &img, const char *root,
 #if defined(__APPLE__)
     fprintf(f, "\n## objc classes of this image\n\n");
     objc_dump(f, img.base, img.image_vmsize ? img.image_vmsize : img.vmsize);
+    fprintf(f, "\n## defaults and files\n\n");
+    objc_defaults_dump(f);
 #endif
 
     fprintf(f, "\n## method tables of this binary\n\n");
@@ -3388,6 +3438,43 @@ static void bc_write_offsets(const Image &img)
         per_kind[kind_of[id]]++;
     }
     bc_db_apply(img, cls, lbl);
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t id = cls[c].first;
+        std::string &lb = lbl[id];
+        if (bc_class_named(lb.c_str()) || g_bc_data_names.empty())
+            continue;
+        uint32_t slots[32];
+        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 32);
+        char hit[128];
+        hit[0] = 0;
+        for (uint32_t sl = 0; sl < n && !hit[0]; sl++)
+        {
+            char strs[4][96];
+            const uint32_t got = bc_strings_of(img, slots[sl], strs, 4, 256);
+            for (uint32_t k = 0; k < got; k++)
+            {
+                if (g_bc_data_names.find(strs[k]) == g_bc_data_names.end())
+                    continue;
+                snprintf(hit, sizeof hit, "%s", strs[k]);
+                break;
+            }
+        }
+        if (hit[0])
+        {
+            char clean[128];
+            size_t o2 = 0;
+            for (const char *q = hit; *q && o2 + 1 < sizeof clean; q++)
+            {
+                if ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+                    (*q >= '0' && *q <= '9'))
+                    clean[o2++] = *q;
+            }
+            clean[o2] = 0;
+            if (o2 >= 4)
+                lb = std::string("data/") + clean;
+        }
+    }
     for (int pass = 0; pass < 6; pass++)
     {
         uint32_t added = 0;

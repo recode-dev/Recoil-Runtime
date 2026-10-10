@@ -64,3 +64,49 @@ void objc_dump(FILE *f, uint64_t base, uint64_t vmsize)
 }
 
 } // namespace rcl
+
+namespace rcl
+{
+
+void objc_defaults_dump(FILE *f)
+{
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSDictionary *all = [d dictionaryRepresentation];
+    fprintf(f, "| key | value |\n|-----|-------|\n");
+    unsigned int shown = 0;
+    for (id k in all)
+    {
+        if (shown++ > 200)
+            break;
+        NSString *key = [k description];
+        NSString *val = [[all objectForKey:k] description];
+        if (!key || !val)
+        {
+            continue;
+        }
+        fprintf(f, "| %s | %s |\n", [key UTF8String], [[val substringToIndex:val.length > 60 ? 60 : val.length] UTF8String]);
+    }
+    fprintf(f, "\n- `%u` defaults keys\n\n", shown);
+    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (dirs.count == 0)
+    {
+        return;
+    }
+    NSString *docs = [dirs firstObject];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *files = [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:docs]
+                       includingPropertiesForKeys:nil
+                                          options:NSDirectoryEnumerationSkipsHiddenFiles
+                                            error:nil];
+    fprintf(f, "| file |\n|------|\n");
+    unsigned int n = 0;
+    for (NSURL *u in files)
+    {
+        if (n++ > 300)
+            break;
+        fprintf(f, "| %s |\n", [[u path] UTF8String]);
+    }
+    fprintf(f, "\n- `%u` files under Documents\n", n);
+}
+
+} // namespace rcl
