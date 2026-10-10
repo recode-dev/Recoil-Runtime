@@ -146,97 +146,97 @@ static bool manager_fields(const Image &img, uint64_t mgr, LiveAnchors &a, uint6
     return false;
 }
 
-static bool client_probe(const Image &img, uint64_t cur, LiveAnchors &a) {
-    static const uint32_t m_off[] = {0x28, 0x20, 0x30, 0x18, 0x38, 0x40, 0x10, 0x48,
-                                     0x50, 0x8,  0x60, 0x68, 0x70, 0x78, 0x80};
-    if (!plausible_ptr(img, cur)) return false;
-    for (size_t i = 0; i < sizeof(m_off) / sizeof(m_off[0]); i++) {
-        uint64_t mgr = 0;
-        if (!rd64(cur + m_off[i], mgr)) continue;
-        uint64_t arr = 0;
-        uint32_t n = 0;
-        LiveAnchors probe = a;
-        if (manager_fields(img, mgr, probe, arr, n)) {
-            a = probe;
-            a.mgr_off = m_off[i];
-            return true;
-        }
-    }
-    return false;
-}
-
 static uint64_t env_u64(const char *name, uint64_t def) {
     const char *v = getenv(name);
     if (!v || !*v) return def;
     return strtoull(v, nullptr, 0);
 }
 
-static bool gsm_candidate(const Image &img, uint64_t home, LiveAnchors &a, uint32_t state_max, bool need_cur) {
-    uint32_t st = 0;
-    uint64_t cur = 0;
-    uint8_t flag = 0;
-    if (!object_ptr(img, home)) return false;
-    if (!rd32(home + 0x50, st) || st > state_max) return false;
-    if (state_max == 8u && st != 0 && st != 2 && st != 4 && st != 5 && st != 6 && st != 8) return false;
-    if (!rd64(home + 0x48, cur) || !rd8(home + 0x70, flag) || flag > 1) return false;
-    if (!cur && need_cur) return false;
-    if (cur) {
-        uint64_t vt = 0;
-        if (!plausible_ptr(img, cur)) return false;
-        if (!rd64(cur, vt) || !looks_like_vtable(img, vt)) return false;
+static bool gsm_slots_from_code(const Image &img, uint64_t *out, int cap, int &count) {
+    count = 0;
+    uint64_t lo = 0, hi = 0;
+    if (!macho_text_range(img, lo, hi)) return false;
+    static const uint32_t is_state[4] = {0xB9405008u, 0x6B08003Fu, 0x1A9F17E0u, 0xD65F03C0u};
+    uint64_t dlo[64], dhi[64];
+    int dn = 0;
+    if (!macho_data_ranges(img, dlo, dhi, 64, dn)) return false;
+    uint64_t fn = 0;
+    for (uint64_t at = lo; at + 16 <= hi; at += 4) {
+        uint32_t w0 = 0;
+        if (!img.u32(at, w0) || w0 != is_state[0]) continue;
+        uint32_t w1 = 0, w2 = 0, w3 = 0;
+        if (!img.u32(at + 4, w1) || !img.u32(at + 8, w2) || !img.u32(at + 12, w3)) break;
+        if (w1 != is_state[1] || w2 != is_state[2] || w3 != is_state[3]) continue;
+        fn = at;
+        break;
     }
-    a.state_off = 0x50;
-    a.current_off = 0x48;
-    a.home = home;
-    a.cur = cur;
-    a.ok = true;
-    return true;
+    if (!fn) return false;
+    for (uint64_t at = lo; at + 4 <= hi; at += 4) {
+        uint32_t w = 0;
+        if (!img.u32(at, w)) break;
+        if ((w & 0xFC000000u) != 0x94000000u) continue;
+        int32_t imm = (int32_t)(w & 0x03FFFFFFu);
+        if (imm & 0x02000000) imm -= 0x04000000;
+        if (at + (int64_t)imm * 4 != fn) continue;
+        uint64_t gi = 0;
+        for (int k = 1; k <= 12; k++) {
+            if (at < (uint64_t)k * 4) break;
+            uint64_t q = at - (uint64_t)k * 4;
+            if (q < lo) break;
+            uint32_t p = 0;
+            if (!img.u32(q, p)) break;
+            if ((p & 0xFC000000u) != 0x94000000u) continue;
+            int32_t pi = (int32_t)(p & 0x03FFFFFFu);
+            if (pi & 0x02000000) pi -= 0x04000000;
+            gi = q + (int64_t)pi * 4;
+            break;
+        }
+        if (!gi || gi < lo || gi + 8 > hi) continue;
+        uint32_t a0 = 0, a1 = 0;
+        if (!img.u32(gi, a0) || !img.u32(gi + 4, a1)) continue;
+        if ((a0 & 0x9F000000u) != 0x90000000u) continue;
+        if ((a1 & 0xFFC00000u) != 0xF9400000u) continue;
+        if ((a1 & 0x1Fu) != 0 || ((a1 >> 5) & 0x1Fu) != (a0 & 0x1Fu)) continue;
+        int64_t immlo = (int64_t)((a0 >> 29) & 3u);
+        int64_t immhi = (int64_t)((a0 >> 5) & 0x7FFFFu);
+        if (immhi & 0x40000) immhi -= 0x80000;
+        const uint64_t page = (gi & ~0xFFFull) + ((uint64_t)((immhi << 2) | immlo) << 12);
+        const uint64_t va = page + (uint64_t)((a1 >> 10) & 0xFFFu) * 8;
+        bool inside = false;
+        for (int d = 0; d < dn; d++) {
+            if (va >= dlo[d] && va + 8 <= dhi[d]) inside = true;
+        }
+        if (!inside) continue;
+        bool dup = false;
+        for (int i = 0; i < count; i++) {
+            if (out[i] == va) dup = true;
+        }
+        if (dup || count >= cap) continue;
+        out[count++] = va;
+    }
+    return count > 0;
 }
 
 static bool discover_live(const Image &img, LiveAnchors &a) {
     a = LiveAnchors();
     if (!img.ok()) return false;
-
-    uint64_t dlo[64], dhi[64];
-    int dn = 0;
-    if (!macho_data_ranges(img, dlo, dhi, 64, dn)) {
-        uint64_t tlo = 0, thi = 0;
-        text_span(img, tlo, thi);
-        dlo[0] = thi;
-        dhi[0] = img.base + (img.image_vmsize ? img.image_vmsize : img.vmsize);
-        dn = 1;
+    uint64_t slots[8];
+    int ns = 0;
+    if (!gsm_slots_from_code(img, slots, 8, ns)) return false;
+    for (int i = 0; i < ns; i++) {
+        uint64_t obj = 0;
+        uint32_t st = 0;
+        uint64_t scene = 0;
+        if (!rd64(slots[i], obj) || !object_ptr(img, obj)) continue;
+        if (!rd32(obj + 0x50, st) || st > 31) continue;
+        rd64(obj + 0x48, scene);
+        a.home_slot = slots[i];
+        a.home = obj;
+        a.cur = scene;
+        a.ok = true;
+        return true;
     }
-
-    for (int pass = 0; pass < 2 && !a.ok; pass++) {
-        const uint32_t state_max = pass == 0 ? 8u : 31u;
-        const bool need_cur = pass == 0;
-        for (int d = 0; d < dn && !a.ok; d++) {
-            for (uint64_t va = dlo[d]; va + 8 <= dhi[d]; va += 8) {
-                uint64_t home = 0;
-                if (!rd64(va, home) || !plausible_ptr(img, home)) continue;
-                LiveAnchors cand;
-                if (!gsm_candidate(img, home, cand, state_max, need_cur)) continue;
-                cand.home_slot = va;
-                a = cand;
-                break;
-            }
-        }
-    }
-
-    if (!a.ok) return false;
-
-    if (a.cur) {
-        for (uint32_t s = 0x8; s <= 0x100; s += 8) {
-            if (s == a.mgr_off) continue;
-            uint64_t p = 0;
-            if (!rd64(a.cur + s, p)) continue;
-            if (!plausible_ptr(img, p)) continue;
-            uint64_t vt = 0;
-            if (!rd64(p, vt)) continue;
-            if (looks_like_vtable(img, vt)) { a.input_off = s; break; }
-        }
-    }
-    return true;
+    return false;
 }
 
 static uint64_t g_la_base = 0;
@@ -1112,14 +1112,12 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
         }
     }
     for (i = 0; i < 160; i++) g_bc_prev[i] = i < nextN ? next[i] : BcPos{0, 0, 0, 0, 0};
-    {
-        uint64_t cand[4];
+    if (state == 5) {
+        uint64_t cand[2];
         uint32_t ci2 = 0;
-        cand[0] = cur;
-        cand[1] = mgr;
-        cand[2] = cur + 0x10;
-        cand[3] = mgr + 0x10;
-        for (ci2 = 0; ci2 < 4 && !players; ci2++) {
+        cand[0] = mgr;
+        cand[1] = cur;
+        for (ci2 = 0; ci2 < 2 && !players; ci2++) {
             if (bc_container(cand[ci2], &pArr, &pCount, &pCap)) players = cand[ci2];
         }
     }
@@ -1247,32 +1245,31 @@ void battle_capture_autostart(const Image &img)
         }
     }
     std::thread([]() {
-        uint32_t mgr_off = 0;
         for (;;) {
             const LiveAnchors &a = anchors_for(g_bc_img);
-            uint64_t home = 0;
-            uint64_t cur = 0;
-            uint64_t mgr = 0;
+            uint64_t gsm = 0;
+            uint64_t scene = 0;
+            uint64_t client = 0;
             uint64_t arr = 0;
             uint32_t state = 0;
             uint32_t n = 0;
-            if (a.ok && rd64(a.home_slot, home) && home && object_ptr(g_bc_img, home)) {
-                rd32(home + a.state_off, state);
-                if (!rd64(home + a.current_off, cur) || !object_ptr(g_bc_img, cur)) cur = 0;
-            } else {
-                home = 0;
-            }
-            if (state == 5 && cur) {
-                if (!mgr_off) {
+            if (a.ok && rd64(a.home_slot, gsm) && gsm && object_ptr(g_bc_img, gsm)) {
+                rd32(gsm + a.state_off, state);
+                if (state == 5 && rd64(gsm + a.current_off, scene)) {
                     LiveAnchors probe = a;
-                    mgr_off = client_probe(g_bc_img, cur, probe) ? probe.mgr_off : a.mgr_off;
+                    if (scene && rd64(scene + a.mgr_off, client) && client) {
+                        if (!manager_fields(g_bc_img, client, probe, arr, n)) n = 0;
+                    } else {
+                        scene = 0;
+                        client = 0;
+                    }
+                } else {
+                    scene = 0;
                 }
-                rd64(cur + mgr_off, mgr);
-                LiveAnchors probe = a;
-                probe.mgr_off = mgr_off;
-                if (!manager_fields(g_bc_img, mgr, probe, arr, n)) n = 0;
+            } else {
+                gsm = 0;
             }
-            bc_poll(g_bc_img, state, cur, mgr, arr, n);
+            bc_poll(g_bc_img, state, scene, client, arr, n);
             usleep(100000);
         }
     }).detach();
