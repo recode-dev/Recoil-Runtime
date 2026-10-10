@@ -2947,7 +2947,26 @@ void write_class_tree(const Image &img, const std::vector<ClassTable> &tables,
 const char *rcl_table_label(uint32_t rva)
 {
     const char *n = name_of_table(rva);
-    return (n && *n) ? n : nullptr;
+    if (!n || !*n)
+        return nullptr;
+    static size_t seen = (size_t)-1;
+    static std::map<std::string, uint32_t> counts;
+    if (seen != g_table_class.size())
+    {
+        counts.clear();
+        for (std::map<uint32_t, std::string>::const_iterator it = g_table_class.begin();
+             it != g_table_class.end(); ++it)
+            counts[it->second]++;
+        seen = g_table_class.size();
+    }
+    std::map<std::string, uint32_t>::const_iterator c = counts.find(n);
+    if (c != counts.end() && c->second > 1)
+    {
+        static char buf[256];
+        snprintf(buf, sizeof buf, "%s@%x", n, rva);
+        return buf;
+    }
+    return n;
 }
 
 void dump_class_tree(const Image &img)
