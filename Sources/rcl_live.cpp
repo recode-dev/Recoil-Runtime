@@ -802,6 +802,7 @@ uint32_t g_bc_classes = 0;
 uint32_t g_bc_fields = 0;
 uint32_t g_bc_objects = 0;
 uint32_t g_bc_accessors = 0;
+uint32_t g_bc_last_n = 0;
 std::map<uint64_t, uint32_t> g_bc_vt;
 std::map<uint64_t, char> g_bc_slot;
 std::vector<uint64_t> g_bc_want;
@@ -896,7 +897,11 @@ void bc_open(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr) {
             (unsigned long long)img.base, (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize), state,
             (unsigned long long)cur, (unsigned long long)mgr);
     fprintf(g_bc_f, "# battle capture (Recoil-Runtime)\n");
-    alert_show("Recoil", "Бой начался — захват включён");
+    {
+        char msg[160];
+        snprintf(msg, sizeof msg, "Бой начался\nобъектов: %u", g_bc_last_n);
+        alert_show("Recoil", msg);
+    }
     fprintf(g_bc_f, "image_base=0x%llx vmsize=0x%llx state=%u cur=0x%llx mgr=0x%llx\n",
             (unsigned long long)img.base, (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize),
             state, (unsigned long long)cur, (unsigned long long)mgr);
@@ -957,12 +962,7 @@ void bc_close(void) {
     }
     fprintf(g_bc_f, "# battle end poll=%llu classes=%u objects=%u fields=%u accessors=%u\n",
             (unsigned long long)g_bc_tick, g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors);
-    {
-        char msg[256];
-        snprintf(msg, sizeof msg, "Бой закончился\nклассов: %u\nполей: %u\nаксессоров: %u", g_bc_classes, g_bc_fields,
-                 g_bc_accessors);
-        alert_show("Recoil", msg);
-    }
+
     fflush(g_bc_f);
     g_bc_active = false;
 }
@@ -971,12 +971,35 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     bool inBattle = false;
     bc_open_file();
     if (!g_bc_f) return;
-    inBattle = (state == 5 && cur != 0) || (n >= 2);
-    if ((g_bc_tick % 5) == 0) {
-        fprintf(g_bc_f, "poll %llu state=%u cur=0x%llx mgr=0x%llx n=%u live=%d classes=%u fields=%u\n",
-                (unsigned long long)g_bc_tick, state, (unsigned long long)cur, (unsigned long long)mgr, n,
-                inBattle ? 1 : 0, g_bc_classes, g_bc_fields);
-        fflush(g_bc_f);
+    {
+        uint64_t seen[8];
+        uint32_t seenN = 0;
+        uint32_t distinct = 0;
+        uint32_t i = 0;
+        for (i = 0; i < n && i < 128; i++) {
+            uint64_t obj = 0;
+            uint64_t vt = 0;
+            uint32_t k = 0;
+            int dup = 0;
+            if (!bc_read(arr + (uint64_t)i * 8, &obj, 8) || !obj) continue;
+            if (!bc_read(obj, &vt, 8) || !vt) continue;
+            for (k = 0; k < seenN; k++) {
+                if (seen[k] == vt) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup && seenN < 8) seen[seenN++] = vt;
+        }
+        distinct = seenN;
+        inBattle = (n >= 8 && distinct >= 2);
+    g_bc_last_n = n;
+        if ((g_bc_tick % 10) == 0) {
+            fprintf(g_bc_f, "poll %llu state=%u cur=0x%llx mgr=0x%llx n=%u vt=%u live=%d classes=%u fields=%u\n",
+                    (unsigned long long)g_bc_tick, state, (unsigned long long)cur, (unsigned long long)mgr, n, distinct,
+                    inBattle ? 1 : 0, g_bc_classes, g_bc_fields);
+            fflush(g_bc_f);
+        }
     }
     if (inBattle) {
         if (!g_bc_active) {
@@ -1069,7 +1092,6 @@ void battle_capture_autostart(const Image &img)
             fflush(g_bc_f);
         }
     }
-    alert_show("Recoil", "Захват боя запущен (ждёт бой)");
     std::thread([]() {
         for (;;) {
             const LiveAnchors &a = anchors_for(g_bc_img);
