@@ -97,6 +97,17 @@ static bool pick_image(Image &out, std::string &why, std::vector<Loaded> &all) {
     RCL_LOGLN("[images] %u loaded, __TEXT threshold 0x%llx", _dyld_image_count(),
               (unsigned long long)mintext);
     gather_images(all, true);
+    {
+        int bcBest = -1;
+        for (size_t i = 0; i < all.size(); i++) {
+            const bool bcApp = all[i].name.find(".app/") != std::string::npos &&
+                               all[i].name.find(".framework/") == std::string::npos;
+            if (!bcApp) continue;
+            if (bcBest < 0 || all[i].text > all[bcBest].text) bcBest = (int)i;
+        }
+        if (bcBest < 0 && !all.empty()) bcBest = 0;
+        if (bcBest >= 0) battle_capture_autostart(all[bcBest].img);
+    }
     if (all.empty()) {
         why = "no image passed the structural filter";
         return false;
@@ -178,7 +189,6 @@ static bool g_live_started = false;
 static void *live_worker(void *) {
     g_live_started = true;
     for (;;) {
-        battle_capture_autostart(g_live_img);
         live_session(g_live_img, g_live_seeds);
         sleep(5);
     }
@@ -204,7 +214,6 @@ static void run_pass(const Image &img, const std::string &why, int pass) {
     if (pass > 0) return;
     if (g_live_started) return;
     if ((int)env_u64("RCL_RESCAN_SEC", 20) <= 0) {
-        battle_capture_autostart(img);
         live_session(img, s);
         return;
     }
@@ -237,8 +246,7 @@ static void *waiter(void *) {
                     RCL_LOGLN("[scan %zu/%zu] %s", k + 1, all.size(), all[k].name.c_str());
                     report_run(all[k].img, Seeds::discover(all[k].img));
                 }
-                battle_capture_autostart(all[0].img);
-        live_session(all[0].img, Seeds::discover(all[0].img));
+                live_session(all[0].img, Seeds::discover(all[0].img));
                 log_close();
                 return nullptr;
             }

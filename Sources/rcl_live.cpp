@@ -1007,6 +1007,21 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
                 g_bc_want.push_back(vt);
                 fprintf(g_bc_f, "class %u vtable=0x%llx fp=0x%llx\n", id, (unsigned long long)(vt - img.base),
                         (unsigned long long)bc_fp(img, vt));
+                {
+                    uint64_t tlo = 0;
+                    uint64_t thi = 0;
+                    uint32_t slot = 0;
+                    int haveText = macho_text_range(img, tlo, thi) ? 1 : 0;
+                    for (slot = 0; slot < 64; slot++) {
+                        uint64_t w = 0;
+                        if (!bc_read(vt + (uint64_t)slot * 8, &w, 8) || w == 0) break;
+                        if (w < img.base || w - img.base >= img.vmsize) break;
+                        fprintf(g_bc_f, "method %u slot=%u rva=0x%llx%s\n", id, slot, (unsigned long long)(w - img.base),
+                                (haveText && (w < tlo || w >= thi)) ? " data" : "");
+                        g_bc_accessors++;
+                    }
+                    fflush(g_bc_f);
+                }
             } else {
                 id = it->second;
             }
