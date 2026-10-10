@@ -790,11 +790,6 @@ void live_dump(const Image &img, const Seeds &s, int snap) {
 }
 
 
-#define RCL_STATE_RVA 0x1123e58ULL
-#define RCL_STATE_ENUM_OFF 0x50ULL
-#define RCL_SCENE_OFF 0x48ULL
-#define RCL_STATE_BATTLE 5
-#define RCL_MODE_MANAGER_OFF 0x28ULL
 #define RCL_MGR_ARRAY_OFF 0x0ULL
 #define RCL_MGR_CAP_OFF 0x8ULL
 #define RCL_MGR_COUNT_OFF 0xcULL
@@ -992,6 +987,7 @@ struct BcPos
 };
 
 BcPos g_bc_prev[160];
+static uint64_t g_bc_pw[24][64];
 
 int bc_container(uint64_t base, uint64_t *arrOut, uint32_t *countOut, uint32_t *capOut)
 {
@@ -1002,7 +998,7 @@ int bc_container(uint64_t base, uint64_t *arrOut, uint32_t *countOut, uint32_t *
     if (!bc_read(base + RCL_MGR_ARRAY_OFF, &a, 8) || !a) return 0;
     if (!bc_read(base + RCL_MGR_CAP_OFF, &cap, 4)) return 0;
     if (!bc_read(base + RCL_MGR_COUNT_OFF, &cnt, 4)) return 0;
-    if (cnt == 0 || cnt > 64 || cap < cnt) return 0;
+    if (cnt < 2 || cnt > 24 || cap < cnt) return 0;
     if (a < 0x100000000ull || a > 0x800000000000ull) return 0;
     if (arrOut) *arrOut = a;
     if (countOut) *countOut = cnt;
@@ -1021,15 +1017,11 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     uint32_t moved = 0;
     uint32_t maxInst = 0;
     uint32_t strong = 0;
+    uint32_t movedInPlayers = 0;
     uint64_t players = 0;
     uint64_t pArr = 0;
     uint32_t pCount = 0;
     uint32_t pCap = 0;
-    uint64_t bcSlot = 0;
-    uint64_t bcScene = 0;
-    uint64_t bcClient = 0;
-    int32_t bcSt = -1;
-    int titanox = 0;
     uint32_t coordPerCls[32];
     uint64_t cls[32];
     uint32_t inst[32];
@@ -1141,25 +1133,6 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             if (inst[ci] >= 2 && inst[ci] <= 24 && coordPerCls[ci] >= 4) strong = 1;
         }
     }
-    if (bc_read(img.base + RCL_STATE_RVA, &bcSlot, 8) && bcSlot) {
-        bc_read(bcSlot + RCL_STATE_ENUM_OFF, &bcSt, 4);
-        if (bcSt == RCL_STATE_BATTLE) {
-            titanox = 1;
-            if (bc_read(bcSlot + RCL_SCENE_OFF, &bcScene, 8) && bcScene) {
-                if (bc_read(bcScene + RCL_MODE_MANAGER_OFF, &bcClient, 8) && bcClient) {
-                    uint64_t a2 = 0;
-                    uint32_t c2 = 0;
-                    uint32_t k2 = 0;
-                    if (bc_container(bcClient, &a2, &c2, &k2)) {
-                        players = bcClient;
-                        pArr = a2;
-                        pCount = c2;
-                        pCap = k2;
-                    }
-                }
-            }
-        }
-    }
     {
         uint64_t cand[4];
         uint32_t ci2 = 0;
@@ -1171,19 +1144,35 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             if (bc_container(cand[ci2], &pArr, &pCount, &pCap)) players = cand[ci2];
         }
     }
-    inBattle = (titanox || players != 0) || (strong || moved >= 2);
+    if (players) {
+        uint32_t e = 0;
+        for (e = 0; e < pCount && e < 24; e++) {
+            uint64_t obj = 0;
+            uint64_t words[64];
+            uint32_t k = 0;
+            int changed = 0;
+            if (!bc_read(pArr + (uint64_t)e * 8, &obj, 8) || !obj) continue;
+            if (!bc_read(obj, words, sizeof words)) continue;
+            for (k = 0; k < 64; k++) {
+                if (g_bc_pw[e][k] != 0 && g_bc_pw[e][k] != words[k]) changed = 1;
+                g_bc_pw[e][k] = words[k];
+            }
+            if (changed) movedInPlayers++;
+        }
+    }
+    inBattle = (players != 0 && movedInPlayers >= 2);
     g_bc_players = players;
     g_bc_pcount = pCount;
-    g_bc_state = titanox ? (uint32_t)bcSt : state;
-    g_bc_scene = bcScene ? bcScene : cur;
+    g_bc_state = state;
+    g_bc_scene = cur;
     g_bc_last_n = n;
     if ((g_bc_tick % 10) == 0) {
         fprintf(g_bc_f,
-                "poll %llu slot=0x%llx state=%u scene=0x%llx players=0x%llx count=%u n=%u coord=%u moved=%u inst=%u live=%d "
+                "poll %llu state=%u scene=0x%llx players=0x%llx count=%u moved=%u n=%u coord=%u inst=%u live=%d "
                 "classes=%u fields=%u\n",
-                (unsigned long long)g_bc_tick, (unsigned long long)(players ? (players - img.base) : 0), state,
-                (unsigned long long)(cur ? (cur - img.base) : 0), (unsigned long long)(players ? (players - img.base) : 0),
-                pCount, n, coordObjs, moved, maxInst, inBattle ? 1 : 0, g_bc_classes, g_bc_fields);
+                (unsigned long long)g_bc_tick, state, (unsigned long long)(cur ? (cur - img.base) : 0),
+                (unsigned long long)(players ? (players - img.base) : 0), pCount, movedInPlayers, n, coordObjs, maxInst,
+                inBattle ? 1 : 0, g_bc_classes, g_bc_fields);
         fflush(g_bc_f);
     }
     if (inBattle) {
