@@ -41,17 +41,16 @@ struct LiveAnchors {
 };
 
 static bool safe_read(uint64_t va, void *dst, size_t n) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(RCL_HOST_TEST)
     if (va == 0 || n == 0) return false;
     vm_size_t got = 0;
     kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)va, (vm_size_t)n,
                                          (vm_address_t)(uintptr_t)dst, &got);
     return kr == KERN_SUCCESS && got == (vm_size_t)n;
 #else
-    (void)va;
-    (void)dst;
-    (void)n;
-    return false;
+    if (va == 0 || n == 0) return false;
+    memcpy(dst, (const void *)(uintptr_t)va, n);
+    return true;
 #endif
 }
 
@@ -867,6 +866,28 @@ struct BcAccess {
 };
 std::vector<BcAccess> g_bc_access;
 
+struct BcRef {
+    uint32_t pcls;
+    uint32_t ccls;
+    uint32_t off;
+};
+
+struct BcArr {
+    uint32_t pcls;
+    uint32_t ccls;
+    uint32_t off;
+    uint32_t via;
+    uint32_t n;
+    uint32_t direct;
+};
+
+std::vector<BcRef> g_bc_ref;
+std::vector<BcArr> g_bc_arr;
+std::map<uint64_t, uint32_t> g_bc_obj;
+std::map<uint64_t, uint32_t> g_bc_cell;
+bool g_bc_roots = false;
+const uint32_t kBcRootCls = 0xFFFFFFFFu;
+
 bool bc_read(uint64_t va, void *dst, size_t n) {
 #if defined(__APPLE__)
     unsigned long long got = 0;
@@ -960,8 +981,7 @@ void bc_open(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr) {
     {
         char msg[160];
         snprintf(msg, sizeof msg, "Бой начался\nstate=%u count=%u\nscene=0x%llx\nplayers=0x%llx", g_bc_state, g_bc_pcount,
-                 (unsigned long long)(g_bc_scene ? (g_bc_scene - g_bc_img.base) : 0),
-                 (unsigned long long)(g_bc_players ? (g_bc_players - g_bc_img.base) : 0));
+                 (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players);
         alert_show("Recoil", msg);
     }
     fprintf(g_bc_f, "image_base=0x%llx vmsize=0x%llx state=%u cur=0x%llx mgr=0x%llx\n",
@@ -1073,6 +1093,252 @@ static uint32_t bc_class_methods(const Image &img, uint64_t vt, uint64_t *rvas, 
     return k;
 }
 
+static const char *bc_label_of(const Image &img, uint32_t id, char *buf, size_t cap) {
+    if (id == kBcRootCls) {
+        snprintf(buf, cap, "root");
+        return buf;
+    }
+    uint64_t vt = 0;
+    for (std::map<uint64_t, uint32_t>::iterator it = g_bc_vt.begin(); it != g_bc_vt.end(); ++it) {
+        if (it->second == id) {
+            vt = it->first;
+            break;
+        }
+    }
+    if (!vt) {
+        snprintf(buf, cap, "unknown");
+        return buf;
+    }
+    return bc_class_label(img, vt, buf, cap);
+}
+
+static uint64_t bc_vt_of(uint32_t id) {
+    for (std::map<uint64_t, uint32_t>::iterator it = g_bc_vt.begin(); it != g_bc_vt.end(); ++it) {
+        if (it->second == id) return it->first;
+    }
+    return 0;
+}
+
+static uint32_t bc_class_id(const Image &img, uint64_t vt) {
+    std::map<uint64_t, uint32_t>::iterator it = g_bc_vt.find(vt);
+    if (it != g_bc_vt.end()) return it->second;
+    const uint32_t id = g_bc_classes++;
+    g_bc_vt[vt] = id;
+    g_bc_want.push_back(vt);
+    char cls[128];
+    bc_class_label(img, vt, cls, sizeof cls);
+    fprintf(g_bc_f, "class %u %s vtable=0x%llx fp=0x%llx\n", id, cls,
+            (unsigned long long)(vt - img.base), (unsigned long long)bc_fp(img, vt));
+    uint64_t tlo = 0;
+    uint64_t thi = 0;
+    const int haveText = macho_text_range(img, tlo, thi) ? 1 : 0;
+    for (uint32_t slot = 0; slot < 64; slot++) {
+        uint64_t w = 0;
+        if (!bc_read(vt + (uint64_t)slot * 8, &w, 8) || w == 0) break;
+        if (w < img.base || w - img.base >= img.vmsize) break;
+        fprintf(g_bc_f, "method %u slot=%u rva=0x%llx%s\n", id, slot, (unsigned long long)(w - img.base),
+                (haveText && (w < tlo || w >= thi)) ? " data" : "");
+        g_bc_accessors++;
+    }
+    return id;
+}
+
+static void bc_note_fields(const Image &img, uint32_t id, const uint64_t *words) {
+    for (uint32_t k = 0; k < 64; k++) {
+        if (words[k] == 0) continue;
+        const uint64_t key = ((uint64_t)id << 32) | (uint64_t)(k * 8);
+        if (g_bc_slot.find(key) != g_bc_slot.end()) continue;
+        const int kind = bc_kind(img, words[k]);
+        g_bc_slot[key] = (char)kind;
+        g_bc_sample[key] = words[k];
+        g_bc_fields++;
+        fprintf(g_bc_f, "field %u off=0x%x kind=%s sample=0x%llx\n", id, k * 8, bc_kind_name(kind),
+                (unsigned long long)words[k]);
+    }
+}
+
+static uint32_t bc_note_object(const Image &img, uint64_t obj) {
+    uint64_t words[64];
+    if (!bc_read(obj, words, sizeof words)) return 0;
+    if (!vtable_valid(img, words[0])) return 0;
+    if (g_bc_obj.find(obj) != g_bc_obj.end()) return g_bc_obj[obj];
+    const uint32_t id = bc_class_id(img, words[0]);
+    g_bc_obj[obj] = id;
+    g_bc_objects++;
+    bc_note_fields(img, id, words);
+    return id;
+}
+
+static void bc_note_ref(uint32_t pcls, uint32_t ccls, uint32_t off) {
+    for (size_t i = 0; i < g_bc_ref.size(); i++) {
+        if (g_bc_ref[i].pcls == pcls && g_bc_ref[i].ccls == ccls && g_bc_ref[i].off == off) return;
+    }
+    if (g_bc_ref.size() >= 8192) return;
+    BcRef r;
+    r.pcls = pcls;
+    r.ccls = ccls;
+    r.off = off;
+    g_bc_ref.push_back(r);
+    fprintf(g_bc_f, "ref %u off=0x%x -> %u\n", pcls, off, ccls);
+}
+
+static void bc_note_arr(uint32_t pcls, uint32_t ccls, uint32_t off, uint32_t via, uint32_t n,
+                        uint32_t direct) {
+    for (size_t i = 0; i < g_bc_arr.size(); i++) {
+        if (g_bc_arr[i].pcls != pcls || g_bc_arr[i].via != via || g_bc_arr[i].off != off ||
+            g_bc_arr[i].ccls != ccls)
+            continue;
+        if (g_bc_arr[i].n < n) g_bc_arr[i].n = n;
+        return;
+    }
+    if (pcls == kBcRootCls) {
+        for (size_t i = 0; i < g_bc_arr.size(); i++) {
+            if (g_bc_arr[i].pcls == kBcRootCls) continue;
+            if (g_bc_arr[i].via != via || g_bc_arr[i].off != off || g_bc_arr[i].ccls != ccls)
+                continue;
+            if (g_bc_arr[i].n < n) g_bc_arr[i].n = n;
+            return;
+        }
+    }
+    if (g_bc_arr.size() >= 4096) return;
+    BcArr a;
+    a.pcls = pcls;
+    a.ccls = ccls;
+    a.off = off;
+    a.via = via;
+    a.n = n;
+    a.direct = direct;
+    g_bc_arr.push_back(a);
+    fprintf(g_bc_f, "array %u via=0x%x off=0x%x count=%u direct=%u -> %u\n", pcls, via, off, n, direct,
+            ccls);
+}
+
+static bool bc_heap_ptr(const Image &img, uint64_t v) {
+    if (v < 0x100000000ull || v >= 0x8000000000ull) return false;
+    if ((v & 7) != 0) return false;
+    return !in_image(img, v);
+}
+
+static uint32_t bc_array_len(const Image &img, uint64_t p, uint64_t &first) {
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < 64; k++) {
+        uint64_t e = 0;
+        if (!bc_read(p + (uint64_t)k * 8, &e, 8)) break;
+        if (!bc_heap_ptr(img, e)) break;
+        uint64_t vt = 0;
+        if (!bc_read(e, &vt, 8) || !vtable_valid(img, vt)) break;
+        if (!k) first = e;
+        n++;
+    }
+    return n;
+}
+
+struct BcNode {
+    uint64_t addr;
+    uint32_t pcls;
+    uint32_t off;
+    int depth;
+};
+
+static void bc_walk(const Image &img, uint64_t root, int maxDepth, int maxNodes) {
+    static BcNode q[8192];
+    int n = 0;
+    uint32_t walked = 0;
+    if (!root) return;
+    auto push = [&](uint64_t a, uint32_t pc, uint32_t off, int d) {
+        if (!bc_heap_ptr(img, a)) return;
+        for (int i = 0; i < n; i++) {
+            if (q[i].addr == a) return;
+        }
+        if (n >= maxNodes || n >= 8192) return;
+        q[n].addr = a;
+        q[n].pcls = pc;
+        q[n].off = off;
+        q[n].depth = d;
+        n++;
+    };
+    push(root, kBcRootCls, 0, 0);
+    for (int i = 0; i < n && walked < (uint32_t)maxNodes; i++) {
+        const BcNode nd = q[i];
+        if (g_bc_obj.find(nd.addr) != g_bc_obj.end()) continue;
+        uint64_t words[64];
+        if (!bc_read(nd.addr, words, sizeof words)) continue;
+        walked++;
+        const bool isObj = vtable_valid(img, words[0]);
+        uint32_t id = kBcRootCls;
+        if (isObj) {
+            id = bc_class_id(img, words[0]);
+            bc_note_object(img, nd.addr);
+        }
+        if (nd.depth >= maxDepth) continue;
+        for (uint32_t k = 0; k < 64; k++) {
+            const uint64_t w = words[k];
+            if (!bc_heap_ptr(img, w)) continue;
+            uint64_t wv = 0;
+            if (!bc_read(w, &wv, 8)) continue;
+            if (vtable_valid(img, wv)) {
+                const uint32_t cid = bc_class_id(img, wv);
+                if (isObj && k) bc_note_ref(id, cid, k * 8);
+                push(w, id, k * 8, nd.depth + 1);
+                continue;
+            }
+            uint64_t first = 0;
+            const uint32_t cnt = bc_array_len(img, w, first);
+            if (cnt < 2) {
+                push(w, isObj ? id : nd.pcls, k * 8, nd.depth + 1);
+                continue;
+            }
+            uint64_t fv = 0;
+            if (!bc_read(first, &fv, 8) || !vtable_valid(img, fv)) continue;
+            const uint32_t child = bc_class_id(img, fv);
+            bc_note_arr(isObj ? id : nd.pcls, child, k * 8, isObj ? 0 : nd.off, cnt, isObj ? 1 : 0);
+            for (uint32_t e = 0; e < cnt; e++) {
+                uint64_t el = 0;
+                if (!bc_read(w + (uint64_t)e * 8, &el, 8)) break;
+                push(el, child, k * 8, nd.depth + 1);
+            }
+        }
+    }
+}
+
+static void bc_scan_globals(const Image &img) {
+    uint64_t lo[64];
+    uint64_t hi[64];
+    int dn = 0;
+    if (!macho_data_ranges(img, lo, hi, 64, dn)) return;
+    std::vector<uint8_t> buf(65536);
+    for (int d = 0; d < dn; d++) {
+        for (uint64_t at = lo[d]; at + 8 <= hi[d]; at += buf.size()) {
+            uint64_t want = hi[d] - at;
+            if (want > buf.size()) want = buf.size();
+            want &= ~7ull;
+            if (!want || !bc_read(at, buf.data(), (size_t)want)) continue;
+            for (uint64_t p = 0; p + 8 <= want; p += 8) {
+                uint64_t w = 0;
+                memcpy(&w, buf.data() + (size_t)p, 8);
+                if (!bc_heap_ptr(img, w)) continue;
+                uint64_t vt = 0;
+                if (!bc_read(w, &vt, 8) || !vtable_valid(img, vt)) continue;
+                const uint64_t crva = at + p - img.base;
+                if (g_bc_cell.find(crva) != g_bc_cell.end()) continue;
+                const uint32_t id = bc_class_id(img, vt);
+                g_bc_cell[crva] = id;
+                fprintf(g_bc_f, "global 0x%llx -> %u\n", (unsigned long long)crva, id);
+                bc_walk(img, w, 1, 128);
+            }
+        }
+    }
+}
+
+static void bc_collect(const Image &img, uint64_t cur, uint64_t mgr) {
+    if (!g_bc_roots) {
+        g_bc_roots = true;
+        bc_scan_globals(img);
+    }
+    if (mgr) bc_walk(img, mgr, 6, 2048);
+    if (cur) bc_walk(img, cur, 6, 2048);
+}
+
 static void bc_write_offsets(const Image &img) {
     const char *dir = bc_dir();
     char path[1200];
@@ -1083,11 +1349,10 @@ static void bc_write_offsets(const Image &img) {
     FILE *f = fopen(path, "w");
     if (f) {
         fprintf(f, "# recoil battle offsets\n");
-        fprintf(f, "# image_base=0x%llx vmsize=0x%llx state=%u scene=+0x%llx players=+0x%llx count=%u tick=%llu\n",
+        fprintf(f, "# image_base=0x%llx vmsize=0x%llx state=%u scene=0x%llx players=0x%llx count=%u tick=%llu\n",
                 (unsigned long long)img.base, (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize),
-                g_bc_state, (unsigned long long)(g_bc_scene ? (g_bc_scene - img.base) : 0),
-                (unsigned long long)(g_bc_players ? (g_bc_players - img.base) : 0), g_bc_pcount,
-                (unsigned long long)g_bc_tick);
+                g_bc_state, (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players,
+                g_bc_pcount, (unsigned long long)g_bc_tick);
         fprintf(f, "kind\tclass_id\tclass\tslot\toff\thint\tvalue\trva\tname\n");
         for (size_t c = 0; c < cls.size(); c++) {
             const uint32_t id = cls[c].first;
@@ -1115,6 +1380,39 @@ static void bc_write_offsets(const Image &img) {
                 if (g_bc_access[a].cls != id) continue;
                 fprintf(f, "access\t%u\t%s\t\t\t\t\t0x%x\t\n", id, label, g_bc_access[a].rva);
             }
+            for (size_t r = 0; r < g_bc_ref.size(); r++) {
+                if (g_bc_ref[r].pcls != id) continue;
+                char cl[128];
+                bc_label_of(img, g_bc_ref[r].ccls, cl, sizeof cl);
+                fprintf(f, "ref\t%u\t%s\t%u\t0x%x\t->class\t%s\t0x%llx\t%s\n", id, label,
+                        g_bc_ref[r].ccls, g_bc_ref[r].off, cl,
+                        (unsigned long long)(bc_vt_of(g_bc_ref[r].ccls) - img.base), cl);
+            }
+            for (size_t r = 0; r < g_bc_arr.size(); r++) {
+                if (g_bc_arr[r].pcls != id) continue;
+                char cl[128];
+                char hint[32];
+                bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
+                if (g_bc_arr[r].direct) snprintf(hint, sizeof hint, "array");
+                else snprintf(hint, sizeof hint, "array-via=0x%x", g_bc_arr[r].via);
+                fprintf(f, "container\t%u\t%s\t%u\t0x%x\t%s\t%u\t0x%llx\t%s\n", id, label,
+                        g_bc_arr[r].ccls, g_bc_arr[r].off, hint, g_bc_arr[r].n,
+                        (unsigned long long)(bc_vt_of(g_bc_arr[r].ccls) - img.base), cl);
+            }
+            for (std::map<uint64_t, uint32_t>::iterator it = g_bc_cell.begin(); it != g_bc_cell.end();
+                 ++it) {
+                if (it->second != id) continue;
+                fprintf(f, "global\t%u\t%s\t\t\tcell\t\t0x%llx\t\n", id, label,
+                        (unsigned long long)it->first);
+            }
+        }
+        for (size_t r = 0; r < g_bc_arr.size(); r++) {
+            if (g_bc_arr[r].pcls != kBcRootCls) continue;
+            char cl[128];
+            bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
+            fprintf(f, "container\t\troot\t%u\t0x%x\tarray\t%u\t0x%llx\t%s\n", g_bc_arr[r].ccls,
+                    g_bc_arr[r].off, g_bc_arr[r].n,
+                    (unsigned long long)(bc_vt_of(g_bc_arr[r].ccls) - img.base), cl);
         }
         fclose(f);
         RCL_LOGLN("[battle] offsets tsv written to %s", path);
@@ -1126,12 +1424,13 @@ static void bc_write_offsets(const Image &img) {
         fprintf(f, "# Battle offsets (Recoil-Runtime)\n\n");
         fprintf(f, "- image base: `0x%llx`, vmsize `0x%llx`\n", (unsigned long long)img.base,
                 (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
-        fprintf(f, "- state `%u`, scene `+0x%llx`, players `+0x%llx`, count `%u`, polls `%llu`\n",
-                g_bc_state, (unsigned long long)(g_bc_scene ? (g_bc_scene - img.base) : 0),
-                (unsigned long long)(g_bc_players ? (g_bc_players - img.base) : 0), g_bc_pcount,
-                (unsigned long long)g_bc_tick);
-        fprintf(f, "- classes `%u`, fields `%u`, method slots `%u`, code refs `%u`\n\n",
-                g_bc_classes, g_bc_fields, g_bc_accessors, (uint32_t)g_bc_access.size());
+        fprintf(f, "- state `%u`, scene `0x%llx`, players `0x%llx`, count `%u`, polls `%llu`\n",
+                g_bc_state, (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players,
+                g_bc_pcount, (unsigned long long)g_bc_tick);
+        fprintf(f, "- classes `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
+                   "member refs `%u`, arrays `%u`, globals `%u`\n\n",
+                g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors, (uint32_t)g_bc_access.size(),
+                (uint32_t)g_bc_ref.size(), (uint32_t)g_bc_arr.size(), (uint32_t)g_bc_cell.size());
         for (size_t c = 0; c < cls.size(); c++) {
             const uint32_t id = cls[c].first;
             const uint64_t vt = cls[c].second;
@@ -1161,6 +1460,46 @@ static void bc_write_offsets(const Image &img) {
                         (unsigned long long)(sm != g_bc_sample.end() ? sm->second : 0));
             }
             fprintf(f, "\n");
+            bool anyRef = false;
+            for (size_t r = 0; r < g_bc_ref.size(); r++) {
+                if (g_bc_ref[r].pcls != id) continue;
+                if (!anyRef) {
+                    fprintf(f, "| member offset | -> class |\n|---:|---|\n");
+                    anyRef = true;
+                }
+                char cl[128];
+                bc_label_of(img, g_bc_ref[r].ccls, cl, sizeof cl);
+                fprintf(f, "| `0x%x` | %u %s |\n", g_bc_ref[r].off, g_bc_ref[r].ccls, cl);
+            }
+            if (anyRef) fprintf(f, "\n");
+            bool anyArr = false;
+            for (size_t r = 0; r < g_bc_arr.size(); r++) {
+                if (g_bc_arr[r].pcls != id) continue;
+                if (!anyArr) {
+                    fprintf(f, "| array offset | count | element class |\n|---:|---:|---|\n");
+                    anyArr = true;
+                }
+                char cl[128];
+                bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
+                if (g_bc_arr[r].direct)
+                    fprintf(f, "| `0x%x` | %u | %u %s |\n", g_bc_arr[r].off, g_bc_arr[r].n,
+                            g_bc_arr[r].ccls, cl);
+                else
+                    fprintf(f, "| `0x%x` via `0x%x` | %u | %u %s |\n", g_bc_arr[r].off,
+                            g_bc_arr[r].via, g_bc_arr[r].n, g_bc_arr[r].ccls, cl);
+            }
+            if (anyArr) fprintf(f, "\n");
+            bool anyGlob = false;
+            for (std::map<uint64_t, uint32_t>::iterator it = g_bc_cell.begin(); it != g_bc_cell.end();
+                 ++it) {
+                if (it->second != id) continue;
+                if (!anyGlob) {
+                    fprintf(f, "| global cell rva |\n|---:|\n");
+                    anyGlob = true;
+                }
+                fprintf(f, "| `0x%llx` |\n", (unsigned long long)it->first);
+            }
+            if (anyGlob) fprintf(f, "\n");
             bool any = false;
             for (size_t a = 0; a < g_bc_access.size(); a++) {
                 if (g_bc_access[a].cls != id) continue;
@@ -1173,6 +1512,13 @@ static void bc_write_offsets(const Image &img) {
                 fprintf(f, "`0x%x`", g_bc_access[a].rva);
             }
             if (any) fprintf(f, "\n\n");
+        }
+        for (size_t r = 0; r < g_bc_arr.size(); r++) {
+            if (g_bc_arr[r].pcls != kBcRootCls) continue;
+            char cl[128];
+            bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
+            fprintf(f, "## root container off `0x%x`, count %u\n\n- element class %u %s\n\n",
+                    g_bc_arr[r].off, g_bc_arr[r].n, g_bc_arr[r].ccls, cl);
         }
         fclose(f);
         RCL_LOGLN("[battle] offsets md written to %s", path);
@@ -1356,10 +1702,11 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     if ((g_bc_tick % 10) == 0) {
         fprintf(g_bc_f,
                 "poll %llu state=%u scene=0x%llx players=0x%llx count=%u moved=%u n=%u coord=%u inst=%u live=%d "
-                "classes=%u fields=%u\n",
+                "classes=%u objects=%u fields=%u arrays=%u globals=%u\n",
                 (unsigned long long)g_bc_tick, state, (unsigned long long)(cur ? (cur - img.base) : 0),
                 (unsigned long long)(players ? (players - img.base) : 0), pCount, movedInPlayers, n, coordObjs, maxInst,
-                inBattle ? 1 : 0, g_bc_classes, g_bc_fields);
+                inBattle ? 1 : 0, g_bc_classes, g_bc_objects, g_bc_fields, (uint32_t)g_bc_arr.size(),
+                (uint32_t)g_bc_cell.size());
         fflush(g_bc_f);
     }
     if (inBattle) {
@@ -1374,59 +1721,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     }
     if (!g_bc_active) return;
     g_bc_tick++;
-    for (i = 0; i < n && i < 256; i++) {
-        uint64_t obj = 0;
-        uint64_t vt = 0;
-        uint64_t words[64];
-        uint32_t id = 0;
-        if (!bc_read(arr + (uint64_t)i * 8, &obj, 8) || !obj) continue;
-        if (!bc_read(obj, &vt, 8) || !vt) continue;
-        if (!bc_read(obj, words, sizeof words)) continue;
-        g_bc_objects++;
-        {
-            std::map<uint64_t, uint32_t>::iterator it = g_bc_vt.find(vt);
-            if (it == g_bc_vt.end()) {
-                id = g_bc_classes++;
-                g_bc_vt[vt] = id;
-                g_bc_want.push_back(vt);
-                {
-                    char cls[128];
-                    bc_class_label(img, vt, cls, sizeof cls);
-                    fprintf(g_bc_f, "class %u %s vtable=0x%llx fp=0x%llx\n", id, cls,
-                            (unsigned long long)(vt - img.base), (unsigned long long)bc_fp(img, vt));
-                }
-                {
-                    uint64_t tlo = 0;
-                    uint64_t thi = 0;
-                    uint32_t slot = 0;
-                    int haveText = macho_text_range(img, tlo, thi) ? 1 : 0;
-                    for (slot = 0; slot < 64; slot++) {
-                        uint64_t w = 0;
-                        if (!bc_read(vt + (uint64_t)slot * 8, &w, 8) || w == 0) break;
-                        if (w < img.base || w - img.base >= img.vmsize) break;
-                        fprintf(g_bc_f, "method %u slot=%u rva=0x%llx%s\n", id, slot, (unsigned long long)(w - img.base),
-                                (haveText && (w < tlo || w >= thi)) ? " data" : "");
-                        g_bc_accessors++;
-                    }
-                    fflush(g_bc_f);
-                }
-            } else {
-                id = it->second;
-            }
-        }
-        for (uint32_t k = 0; k < 64; k++) {
-            uint64_t key = ((uint64_t)id << 32) | (uint64_t)(k * 8);
-            int kind = 0;
-            if (words[k] == 0) continue;
-            if (g_bc_slot.find(key) != g_bc_slot.end()) continue;
-            kind = bc_kind(img, words[k]);
-            g_bc_slot[key] = (char)kind;
-            g_bc_sample[key] = words[k];
-            g_bc_fields++;
-            fprintf(g_bc_f, "field %u off=0x%x kind=%s sample=0x%llx\n", id, k * 8, bc_kind_name(kind),
-                    (unsigned long long)words[k]);
-        }
-    }
+    if (g_bc_tick == 1 || (g_bc_tick % 120) == 0) bc_collect(img, cur, mgr);
     if (!g_bc_code && g_bc_tick >= 30) {
         g_bc_code = true;
         bc_code_pass(img);
@@ -1477,7 +1772,17 @@ void battle_capture_autostart(const Image &img)
                 if (state == 5 && rd64(gsm + a.current_off, scene)) {
                     LiveAnchors probe = a;
                     if (scene && rd64(scene + a.mgr_off, client) && client) {
-                        if (!manager_fields(g_bc_img, client, probe, arr, n)) n = 0;
+                        uint64_t carr = 0;
+                        uint32_t cnt = 0;
+                        uint32_t cap = 0;
+                        if (bc_container(client, &carr, &cnt, &cap) ||
+                            bc_container(scene, &carr, &cnt, &cap)) {
+                            arr = carr;
+                            n = cnt;
+                        } else if (!manager_fields(g_bc_img, client, probe, arr, n)) {
+                            arr = 0;
+                            n = 0;
+                        }
                     } else {
                         scene = 0;
                         client = 0;
