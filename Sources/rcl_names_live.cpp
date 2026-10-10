@@ -27,6 +27,7 @@ std::map<uint32_t, uint32_t> g_inst;
 std::map<uint32_t, uint32_t> g_inst_score;
 uint32_t g_hits[NL_SRC_MAX + 1] = {0, 0, 0, 0, 0, 0, 0};
 std::map<uint32_t, std::string> g_asset;
+std::map<uint32_t, uint32_t> g_kind;
 
 const uint32_t kSigDfMax = 3;
 const uint32_t kSigMinLen = 4;
@@ -322,6 +323,76 @@ void asset_take(uint32_t vt, const std::vector<std::string> &refs)
     g_asset[vt] = *pick;
 }
 
+std::string lower_ascii(const std::string &s)
+{
+    std::string r = s;
+    for (size_t i = 0; i < r.size(); i++)
+    {
+        if (r[i] >= 'A' && r[i] <= 'Z')
+        {
+            r[i] = (char)(r[i] - 'A' + 'a');
+        }
+    }
+    return r;
+}
+
+bool has_any(const std::string &h, const char *const *marks, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        if (h.find(marks[i]) != std::string::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t kind_of_text(const std::string &s)
+{
+    if (s.empty())
+    {
+        return NLK_UNKNOWN;
+    }
+    const std::string h = lower_ascii(s);
+    static const char *const kLogic[] = {"csv_logic", "logic", "battle",     "charac", "player",
+                                        "projectile", "tile",  "avatar",      "gamemodel", "game/",
+                                        "network",    "input", "joystick",    "camera", "scid",
+                                        "csv"};
+    static const char *const kAudio[] = {"sound", ".wav",  ".mp3",    ".m4a",  ".ogg",
+                                        "music", "sfx",   "audio",   "bgm",   "ambient",
+                                        "voice", "speaker"};
+    static const char *const kUi[] = {"ui_",     "/ui",    "ui.sc",    "popup",  "movieclip",
+                                      "timeline", "gui",    "button_",  "icon_",  "tid_",
+                                      "_txt",     "screen", "menu",     "popover", "stream",
+                                      "tooltip",  "banner", "slider",   "textfield", "label"};
+    static const char *const kAsset[] = {".glb",   ".sctx",  ".sc",     ".tex",      ".png",
+                                         ".pvr",   ".ktx",   "sc3d/",   "sc/",       "effects",
+                                         "particle", "trail", "explo",  "smoke",     "decal",
+                                         "material", "shader", "anim",  "album_",    "_red",
+                                         "_blue",  "_green", "_spawn",  "_impact",   "_ripple",
+                                         "_debris", "_spark", "_lobby_", "_ulti",    "_atk",
+                                         "_def",   "_idle",  "_walk",   "_run",      "_hit",
+                                         "_ground", "_wall"};
+    if (has_any(h, kLogic, sizeof kLogic / sizeof kLogic[0]))
+    {
+        return NLK_LOGIC;
+    }
+    if (has_any(h, kAudio, sizeof kAudio / sizeof kAudio[0]))
+    {
+        return NLK_AUDIO;
+    }
+    if (has_any(h, kUi, sizeof kUi / sizeof kUi[0]))
+    {
+        return NLK_UI;
+    }
+    if (has_any(h, kAsset, sizeof kAsset / sizeof kAsset[0]))
+    {
+        return NLK_ASSET;
+    }
+    return NLK_UNKNOWN;
+}
+
 void nl_observe(uint32_t vt, const char *const *strs, uint32_t n)
 {
     if (!g_ready && g_read)
@@ -484,6 +555,71 @@ void nl_stats(uint32_t hits[NL_SRC_MAX + 1])
     for (uint32_t i = 0; i <= NL_SRC_MAX; i++)
     {
         hits[i] = g_hits[i];
+    }
+}
+
+bool nl_kind_keep(uint32_t kind)
+{
+    return kind == NLK_LOGIC || kind == NLK_UNKNOWN;
+}
+
+uint32_t nl_kind(uint32_t vt)
+{
+    std::map<uint32_t, uint32_t>::const_iterator it = g_kind.find(vt);
+    if (it != g_kind.end())
+    {
+        return it->second;
+    }
+    uint32_t kind = NLK_UNKNOWN;
+    uint32_t idx = 0;
+    bool have = false;
+    std::map<uint32_t, uint32_t>::const_iterator di = g_doc_vt.find(vt);
+    if (di != g_doc_vt.end())
+    {
+        idx = di->second;
+        have = true;
+    }
+    else
+    {
+        std::map<uint32_t, uint32_t>::const_iterator ii = g_inst.find(vt);
+        if (ii != g_inst.end())
+        {
+            idx = ii->second;
+            have = true;
+        }
+    }
+    if (have)
+    {
+        char lb[256];
+        label_of(idx, lb, sizeof lb);
+        kind = kind_of_text(lb);
+    }
+    if (kind == NLK_UNKNOWN)
+    {
+        std::map<uint32_t, std::string>::const_iterator ai = g_asset.find(vt);
+        if (ai != g_asset.end())
+        {
+            kind = kind_of_text(ai->second);
+        }
+    }
+    g_kind[vt] = kind;
+    return kind;
+}
+
+const char *nl_kind_name(uint32_t kind)
+{
+    switch (kind)
+    {
+    case NLK_LOGIC:
+        return "logic";
+    case NLK_UI:
+        return "ui";
+    case NLK_ASSET:
+        return "asset";
+    case NLK_AUDIO:
+        return "audio";
+    default:
+        return "unknown";
     }
 }
 

@@ -1038,7 +1038,7 @@ void write_globals(const std::vector<GlobalHit> &hits, const Image &img, const c
     }
     fclose(f);
 
-    snprintf(path, sizeof path, "%s/_globals.tsv", root);
+    snprintf(path, sizeof path, "%s/_globals.tsv.md", root);
     f = fopen(path, "w");
     if (!f)
         return;
@@ -2036,12 +2036,17 @@ void external_align(const char *root)
     FILE *f = fopen(path, "w");
     if (!f)
         return;
-    snprintf(path, sizeof path, "%s/names.txt", root);
+    snprintf(path, sizeof path, "%s/names.txt.md", root);
     FILE *in = fopen(path, "r");
+    if (!in)
+    {
+        snprintf(path, sizeof path, "%s/names.txt", root);
+        in = fopen(path, "r");
+    }
     fprintf(f, "# external class list aligned to the memory order of the tables\n\n");
     if (!in)
     {
-        fprintf(f, "no `names.txt` in `%s` - one class name per line enables this stage\n", root);
+        fprintf(f, "no `names.txt.md` in `%s` - one class name per line enables this stage\n", root);
         fclose(f);
         return;
     }
@@ -2542,7 +2547,7 @@ uint32_t name_from_shape_cache(const std::vector<ClassTable> &tables, const char
     char path[1024];
     snprintf(path, sizeof path, "%s/cache", root);
     mkdir(path, 0755);
-    snprintf(path, sizeof path, "%s/cache/shapes.tsv", root);
+    snprintf(path, sizeof path, "%s/cache/shapes.tsv.md", root);
 
     std::map<std::string, std::string> known;
     std::set<std::string> ambiguous;
@@ -3387,12 +3392,8 @@ void write_class_docs(const Image &img)
 
 static bool bundle_ext_ok(const char *name)
 {
-    size_t n = strlen(name);
-    if (n > 4 && strcmp(name + n - 4, ".tsv") == 0)
-        return true;
-    if (n > 3 && strcmp(name + n - 3, ".md") == 0)
-        return true;
-    return false;
+    const size_t n = strlen(name);
+    return n > 3 && strcmp(name + n - 3, ".md") == 0;
 }
 
 static bool bundle_copy(const char *src, const char *dst)
@@ -3923,7 +3924,7 @@ void write_symbols(const Image &img, const std::vector<ClassTable> &tables, cons
     char path[1024];
     char nm[192];
     char sh[64];
-    snprintf(path, sizeof path, "%s/_symbols.tsv", root);
+    snprintf(path, sizeof path, "%s/_symbols.tsv.md", root);
     FILE *f = fopen(path, "w");
     if (!f)
         return;
@@ -3973,7 +3974,7 @@ void write_symbols(const Image &img, const std::vector<ClassTable> &tables, cons
     FILE *a = fopen(path, "w");
     snprintf(sh, sizeof sh, "%s/_symbols.py", root);
     FILE *b = fopen(sh, "w");
-    snprintf(sh, sizeof sh, "%s/_symbols.txt", root);
+    snprintf(sh, sizeof sh, "%s/_symbols.txt.md", root);
     FILE *c2 = fopen(sh, "w");
     std::set<uint32_t> emitted2;
     if (a)

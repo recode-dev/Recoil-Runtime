@@ -1332,7 +1332,7 @@ void deep_fieldmap(const Image &img, const MachInsight &mi, const FnStarts &fs, 
     st.loaders = (uint32_t)per_loader.size();
 
     char path[1024];
-    snprintf(path, sizeof path, "%s/_fieldmap.tsv", root);
+    snprintf(path, sizeof path, "%s/_fieldmap.tsv.md", root);
     FILE *f = fopen(path, "w");
     if (f)
     {
@@ -1554,7 +1554,7 @@ void deep_accessors(const Image &img, const MachInsight &mi, const FnStarts &fs,
     static const char *kKind[] = {"", "load", "load-fp", "load-sx", "store", "store-fp"};
 
     char path[1024];
-    snprintf(path, sizeof path, "%s/_accessors.tsv", root);
+    snprintf(path, sizeof path, "%s/_accessors.tsv.md", root);
     FILE *f = fopen(path, "w");
     if (f)
     {
@@ -1660,7 +1660,7 @@ void deep_functions(const Image &img, const MachInsight &mi, const FnStarts &fs,
     st.func_total = (uint32_t)fs.v.size();
 
     char path[1024];
-    snprintf(path, sizeof path, "%s/_functions.tsv", root);
+    snprintf(path, sizeof path, "%s/_functions.tsv.md", root);
     FILE *f = fopen(path, "w");
     if (f)
         fprintf(f, "rva\tsize\tkind\tdetail\tstrings\tcalls\toffsets\tslot\twhole\n");
@@ -1806,7 +1806,7 @@ void deep_export(const Image &img, const MachInsight &mi, const FnStarts &fs,
     std::map<uint32_t, std::string> props;
     char path[1024];
 
-    snprintf(path, sizeof path, "%s/_funcprops.tsv", root);
+    snprintf(path, sizeof path, "%s/_funcprops.tsv.md", root);
     FILE *f = fopen(path, "w");
     if (f)
     {
@@ -1922,7 +1922,7 @@ void deep_export(const Image &img, const MachInsight &mi, const FnStarts &fs,
         fclose(f);
     }
 
-    snprintf(path, sizeof path, "%s/_tables.tsv", root);
+    snprintf(path, sizeof path, "%s/_tables.tsv.md", root);
     f = fopen(path, "w");
     if (f)
     {
@@ -1952,7 +1952,7 @@ void deep_export(const Image &img, const MachInsight &mi, const FnStarts &fs,
         fclose(f);
     }
 
-    snprintf(path, sizeof path, "%s/_strings.tsv", root);
+    snprintf(path, sizeof path, "%s/_strings.tsv.md", root);
     f = fopen(path, "w");
     if (f)
     {
@@ -2045,7 +2045,7 @@ void deep_globals(const Image &img, const MachInsight &mi, const FnStarts &fs,
     }
 
     char path[1024];
-    snprintf(path, sizeof path, "%s/_globals_deep.tsv", root);
+    snprintf(path, sizeof path, "%s/_globals_deep.tsv.md", root);
     FILE *f = fopen(path, "w");
     if (!f)
         return;
@@ -2575,9 +2575,9 @@ void deep_fingerprints(const Image &img, const MachInsight &mi, const FnStarts &
                        std::map<uint32_t, std::string> &carried, DeepStats &st)
 {
     char path[1024];
-    snprintf(path, sizeof path, "%s/_fingerprints.tsv", root);
+    snprintf(path, sizeof path, "%s/_fingerprints.tsv.md", root);
     char prev[1200];
-    snprintf(prev, sizeof prev, "%s/_fingerprints.prev.tsv", root);
+    snprintf(prev, sizeof prev, "%s/_fingerprints.prev.tsv.md", root);
 
     std::map<uint64_t, std::string> old_by_fp;
     FILE *p = fopen(prev, "r");
@@ -2674,7 +2674,7 @@ void deep_cache_load(const char *root, const char *uuid, std::map<uint32_t, std:
     char path[1024];
     snprintf(path, sizeof path, "%s/cache", root);
     mkpath(path);
-    snprintf(path, sizeof path, "%s/cache/%s.tsv", root, uuid);
+    snprintf(path, sizeof path, "%s/cache/%s.tsv.md", root, uuid);
     FILE *f = fopen(path, "r");
     if (!f)
         return;
@@ -2702,7 +2702,7 @@ void deep_cache_save(const char *root, const char *uuid,
     char path[1024];
     snprintf(path, sizeof path, "%s/cache", root);
     mkpath(path);
-    snprintf(path, sizeof path, "%s/cache/%s.tsv", root, uuid);
+    snprintf(path, sizeof path, "%s/cache/%s.tsv.md", root, uuid);
     FILE *f = fopen(path, "w");
     if (!f)
         return;

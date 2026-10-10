@@ -1791,12 +1791,43 @@ static void bc_collect(const Image &img, uint64_t cur, uint64_t mgr)
         bc_walk(img, mgr, 6, 2048);
 }
 
+static bool bc_keep_all()
+{
+    static int v = -1;
+    if (v < 0)
+        v = env_u64("RCL_ALL_CLASSES", 0) ? 1 : 0;
+    return v == 1;
+}
+
 static void bc_write_offsets(const Image &img)
 {
     const char *dir = bc_dir();
     char path[1200];
     std::vector<std::pair<uint32_t, uint64_t>> cls;
     bc_class_order(cls);
+
+    std::map<uint32_t, bool> keep;
+    uint32_t kept = 0;
+    uint32_t dropUi = 0;
+    uint32_t dropAsset = 0;
+    uint32_t dropAudio = 0;
+    uint32_t dropUnk = 0;
+    for (size_t c = 0; c < cls.size(); c++)
+    {
+        const uint32_t kind = nl_kind((uint32_t)(cls[c].second - img.base));
+        const bool kp = bc_keep_all() || nl_kind_keep(kind);
+        keep[cls[c].first] = kp;
+        if (kp)
+            kept++;
+        else if (kind == NLK_UI)
+            dropUi++;
+        else if (kind == NLK_ASSET)
+            dropAsset++;
+        else if (kind == NLK_AUDIO)
+            dropAudio++;
+        else
+            dropUnk++;
+    }
 
     snprintf(path, sizeof path, "%s/battle-offsets.tsv.md", dir);
     FILE *f = fopen(path, "w");
@@ -1815,6 +1846,8 @@ static void bc_write_offsets(const Image &img)
         {
             const uint32_t id = cls[c].first;
             const uint64_t vt = cls[c].second;
+            if (!keep[id])
+                continue;
             char label[128];
             bc_class_label(img, vt, label, sizeof label);
             fprintf(f, "class\t%u\t%s\t\t\t\t0x%llx\t0x%llx\t%s\n", id, label,
@@ -1849,6 +1882,8 @@ static void bc_write_offsets(const Image &img)
             {
                 if (g_bc_ref[r].pcls != id)
                     continue;
+                if (!keep[g_bc_ref[r].ccls])
+                    continue;
                 char cl[128];
                 bc_label_of(img, g_bc_ref[r].ccls, cl, sizeof cl);
                 fprintf(f, "ref\t%u\t%s\t%u\t0x%x\t->class\t%s\t0x%llx\t%s\n", id, label,
@@ -1858,6 +1893,8 @@ static void bc_write_offsets(const Image &img)
             for (size_t r = 0; r < g_bc_arr.size(); r++)
             {
                 if (g_bc_arr[r].pcls != id)
+                    continue;
+                if (!keep[g_bc_arr[r].ccls])
                     continue;
                 char cl[128];
                 char hint[32];
@@ -1882,6 +1919,8 @@ static void bc_write_offsets(const Image &img)
         for (size_t r = 0; r < g_bc_arr.size(); r++)
         {
             if (g_bc_arr[r].pcls != kBcRootCls)
+                continue;
+            if (!keep[g_bc_arr[r].ccls])
                 continue;
             char cl[128];
             bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
@@ -1916,6 +1955,11 @@ static void bc_write_offsets(const Image &img)
             bc_class_label(img, cls[c].second, lb, sizeof lb);
             lbl[cls[c].first] = lb;
         }
+        fprintf(f,
+                "- logic filter: kept `%u` of `%zu` classes (dropped ui `%u`, asset `%u`, "
+                "audio `%u`, unknown `%u`)%s\n\n",
+                kept, cls.size(), dropUi, dropAsset, dropAudio, dropUnk,
+                bc_keep_all() ? " `RCL_ALL_CLASSES` set" : "");
         for (int pass = 0; pass < 6; pass++)
         {
             uint32_t added = 0;
@@ -1943,6 +1987,8 @@ static void bc_write_offsets(const Image &img)
         {
             const uint32_t id = cls[c].first;
             const uint64_t vt = cls[c].second;
+            if (!keep[id])
+                continue;
             char label[192];
             snprintf(label, sizeof label, "%s", lbl[id].c_str());
             fprintf(f, "## class %u: %s\n\n", id, label);
@@ -2011,6 +2057,8 @@ static void bc_write_offsets(const Image &img)
             {
                 if (g_bc_ref[r].pcls != id)
                     continue;
+                if (!keep[g_bc_ref[r].ccls])
+                    continue;
                 if (!anyRef)
                 {
                     fprintf(f, "| member offset | -> class |\n|---:|---|\n");
@@ -2026,6 +2074,8 @@ static void bc_write_offsets(const Image &img)
             for (size_t r = 0; r < g_bc_arr.size(); r++)
             {
                 if (g_bc_arr[r].pcls != id)
+                    continue;
+                if (!keep[g_bc_arr[r].ccls])
                     continue;
                 if (!anyArr)
                 {

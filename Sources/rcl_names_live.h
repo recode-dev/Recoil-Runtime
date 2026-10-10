@@ -29,4 +29,20 @@ const char *nl_label(uint32_t vt, const uint32_t *slots, uint32_t nslots, char *
 
 void nl_stats(uint32_t hits[NL_SRC_MAX + 1]);
 
+enum NlKind
+{
+    NLK_UNKNOWN = 0,
+    NLK_LOGIC = 1,
+    NLK_UI = 2,
+    NLK_ASSET = 3,
+    NLK_AUDIO = 4,
+    NLK_KIND_MAX = NLK_AUDIO
+};
+
+bool nl_kind_keep(uint32_t kind);
+
+uint32_t nl_kind(uint32_t vt);
+
+const char *nl_kind_name(uint32_t kind);
+
 } // namespace rcl

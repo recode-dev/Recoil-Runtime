@@ -21,7 +21,7 @@ void log_open(const char *dir)
     time_t t = time(nullptr);
     struct tm tmv;
     localtime_r(&t, &tmv);
-    snprintf(g_path, sizeof g_path, "%s/recoil-runtime-%04d%02d%02d-%02d%02d%02d.log", d,
+    snprintf(g_path, sizeof g_path, "%s/recoil-runtime-%04d%02d%02d-%02d%02d%02d.log.md", d,
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     snprintf(g_dir, sizeof g_dir, "%s", d);
     g_fd = open(g_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
