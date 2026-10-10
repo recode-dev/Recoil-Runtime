@@ -790,6 +790,10 @@ void live_dump(const Image &img, const Seeds &s, int snap) {
 }
 
 
+#define RCL_MGR_ARRAY_OFF 0x0ULL
+#define RCL_MGR_CAP_OFF 0x8ULL
+#define RCL_MGR_COUNT_OFF 0xcULL
+
 // ---- battle capture -------------------------------------------------------
 Image g_bc_img;
 FILE *g_bc_f = nullptr;
@@ -803,6 +807,10 @@ uint32_t g_bc_fields = 0;
 uint32_t g_bc_objects = 0;
 uint32_t g_bc_accessors = 0;
 uint32_t g_bc_last_n = 0;
+uint64_t g_bc_players = 0;
+uint32_t g_bc_pcount = 0;
+uint32_t g_bc_state = 0;
+uint64_t g_bc_scene = 0;
 std::map<uint64_t, uint32_t> g_bc_vt;
 std::map<uint64_t, char> g_bc_slot;
 std::vector<uint64_t> g_bc_want;
@@ -899,7 +907,9 @@ void bc_open(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr) {
     fprintf(g_bc_f, "# battle capture (Recoil-Runtime)\n");
     {
         char msg[160];
-        snprintf(msg, sizeof msg, "Бой начался\nобъектов: %u", g_bc_last_n);
+        snprintf(msg, sizeof msg, "Бой начался\nstate=%u count=%u\nscene=0x%llx\nplayers=0x%llx", g_bc_state, g_bc_pcount,
+                 (unsigned long long)(g_bc_scene ? (g_bc_scene - g_bc_img.base) : 0),
+                 (unsigned long long)(g_bc_players ? (g_bc_players - g_bc_img.base) : 0));
         alert_show("Recoil", msg);
     }
     fprintf(g_bc_f, "image_base=0x%llx vmsize=0x%llx state=%u cur=0x%llx mgr=0x%llx\n",
@@ -978,6 +988,23 @@ struct BcPos
 
 BcPos g_bc_prev[160];
 
+int bc_container(uint64_t base, uint64_t *arrOut, uint32_t *countOut, uint32_t *capOut)
+{
+    uint64_t a = 0;
+    uint32_t cap = 0;
+    uint32_t cnt = 0;
+    if (!base) return 0;
+    if (!bc_read(base + RCL_MGR_ARRAY_OFF, &a, 8) || !a) return 0;
+    if (!bc_read(base + RCL_MGR_CAP_OFF, &cap, 4)) return 0;
+    if (!bc_read(base + RCL_MGR_COUNT_OFF, &cnt, 4)) return 0;
+    if (cnt == 0 || cnt > 64 || cap < cnt) return 0;
+    if (a < 0x100000000ull || a > 0x800000000000ull) return 0;
+    if (arrOut) *arrOut = a;
+    if (countOut) *countOut = cnt;
+    if (capOut) *capOut = cap;
+    return 1;
+}
+
 void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint64_t arr, uint32_t n)
 {
     BcPos next[160];
@@ -989,6 +1016,10 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     uint32_t moved = 0;
     uint32_t maxInst = 0;
     uint32_t strong = 0;
+    uint64_t players = 0;
+    uint64_t pArr = 0;
+    uint32_t pCount = 0;
+    uint32_t pCap = 0;
     uint32_t coordPerCls[32];
     uint64_t cls[32];
     uint32_t inst[32];
@@ -1100,12 +1131,30 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             if (inst[ci] >= 2 && inst[ci] <= 24 && coordPerCls[ci] >= 4) strong = 1;
         }
     }
-    inBattle = (strong || moved >= 2);
+    {
+        uint64_t cand[4];
+        uint32_t ci2 = 0;
+        cand[0] = cur;
+        cand[1] = mgr;
+        cand[2] = cur + 0x10;
+        cand[3] = mgr + 0x10;
+        for (ci2 = 0; ci2 < 4 && !players; ci2++) {
+            if (bc_container(cand[ci2], &pArr, &pCount, &pCap)) players = cand[ci2];
+        }
+    }
+    inBattle = (players != 0) || (strong || moved >= 2);
+    g_bc_players = players;
+    g_bc_pcount = pCount;
+    g_bc_state = state;
+    g_bc_scene = cur;
     g_bc_last_n = n;
     if ((g_bc_tick % 10) == 0) {
-        fprintf(g_bc_f, "poll %llu state=%u n=%u coord=%u moved=%u inst=%u players=%d live=%d classes=%u fields=%u\n",
-                (unsigned long long)g_bc_tick, state, n, coordObjs, moved, maxInst, strong ? 1 : 0, inBattle ? 1 : 0,
-                g_bc_classes, g_bc_fields);
+        fprintf(g_bc_f,
+                "poll %llu slot=0x%llx state=%u scene=0x%llx players=0x%llx count=%u n=%u coord=%u moved=%u inst=%u live=%d "
+                "classes=%u fields=%u\n",
+                (unsigned long long)g_bc_tick, (unsigned long long)(players ? (players - img.base) : 0), state,
+                (unsigned long long)(cur ? (cur - img.base) : 0), (unsigned long long)(players ? (players - img.base) : 0),
+                pCount, n, coordObjs, moved, maxInst, inBattle ? 1 : 0, g_bc_classes, g_bc_fields);
         fflush(g_bc_f);
     }
     if (inBattle) {
