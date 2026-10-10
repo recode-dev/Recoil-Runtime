@@ -311,9 +311,13 @@ std::vector<ClassTable> scan_loose(const Image &img, const Layout &L, ScanStats 
     return out;
 }
 
+static Layout g_last_layout;
+
+const Layout &last_layout() { return g_last_layout; }
+
 std::vector<ClassTable> scan_class_tables(const Image &img, ScanStats *st) {
     std::vector<ClassTable> out;
-    Layout L;
+    Layout &L = g_last_layout;
     layout(img, L);
     if (st) {
         st->hdr_ok = L.hdr;
@@ -2699,41 +2703,314 @@ static bool bundle_copy(const char *src, const char *dst) {
     return true;
 }
 
-void write_symbols(const std::vector<ClassTable> &tables, const char *root) {
+static uint32_t sym_insn(const Image &img, uint64_t va) {
+    uint32_t w = 0;
+    if (!at(img, va, &w, sizeof w)) return 0;
+    return w;
+}
+
+static uint32_t sym_slot_rva(const Image &img, uint64_t raw) {
+    if (!raw) return 0;
+    uint64_t lim = img.image_vmsize ? img.image_vmsize : img.vmsize;
+    uint64_t t = raw & 0xFFFFFFFFFULL;
+    if (t >= 0x100000000ULL && t - 0x100000000ULL < lim) return (uint32_t)(t - 0x100000000ULL);
+    if (t >= raw && t > 0x4000 && t < lim) return (uint32_t)t;
+    return 0;
+}
+
+static bool sym_ident(const char *s, size_t n) {
+    if (n < 5 || n > 48) return false;
+    if (s[0] < 'A' || s[0] > 'Z') return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_')
+            continue;
+        return false;
+    }
+    return true;
+}
+
+static uint32_t table_slot_rva(const Image &img, const ClassTable &t, uint32_t i) {
+    uint64_t raw = 0;
+    if (i >= t.slots) return 0;
+    if (!at(img, img.base + t.start + (uint64_t)i * 8, &raw, 8)) return 0;
+    return sym_slot_rva(img, raw);
+}
+
+void shape_name_for(const Image &img, uint32_t rva, char *out, size_t cap) {
+    uint64_t va = img.base + rva;
+    uint32_t i0 = sym_insn(img, va), i1 = sym_insn(img, va + 4), i2 = sym_insn(img, va + 8);
+    unsigned o12 = (unsigned)(((i0 >> 10) & 0xFFFu) * 4u);
+    unsigned o8 = (unsigned)(((i0 >> 10) & 0xFFFu) * 8u);
+    if (i1 == 0xD65F03C0u) {
+        if ((i0 & 0xFFC00000u) == 0xB9400000u && (i0 & 0x1Fu) == 0 && ((i0 >> 5) & 0x1Fu) == 0) {
+            snprintf(out, cap, "get_%x", o12);
+            return;
+        }
+        if ((i0 & 0xFFC00000u) == 0xF9400000u && (i0 & 0x1Fu) == 0 && ((i0 >> 5) & 0x1Fu) == 0) {
+            snprintf(out, cap, "getptr_%x", o8);
+            return;
+        }
+        if ((i0 & 0xFFC00000u) == 0xB9000000u && (i0 & 0x1Fu) == 1 && ((i0 >> 5) & 0x1Fu) == 0) {
+            snprintf(out, cap, "set_%x", o12);
+            return;
+        }
+        if ((i0 & 0xFFC00000u) == 0xF9000000u && (i0 & 0x1Fu) == 1 && ((i0 >> 5) & 0x1Fu) == 0) {
+            snprintf(out, cap, "setptr_%x", o8);
+            return;
+        }
+        if ((i0 & 0xFFC00000u) == 0x39400000u && (i0 & 0x1Fu) == 0 && ((i0 >> 5) & 0x1Fu) == 0) {
+            snprintf(out, cap, "getb_%x", (unsigned)((i0 >> 10) & 0xFFFu));
+            return;
+        }
+        if ((i0 & 0xFFC00000u) == 0x39000000u && (i0 & 0x1Fu) == 1 && ((i0 >> 5) & 0x1Fu) == 0) {
+            snprintf(out, cap, "setb_%x", (unsigned)((i0 >> 10) & 0xFFFu));
+            return;
+        }
+    }
+    if ((i0 & 0x9F000000u) == 0x90000000u && (i1 & 0xFF800000u) == 0x91000000u &&
+        i2 == 0xD65F03C0u && (i1 & 0x1Fu) == 0 && ((i1 >> 5) & 0x1Fu) == 0) {
+        snprintf(out, cap, "getInstance");
+        return;
+    }
+    if ((i0 & 0xFF800000u) == 0xA9000000u || (i0 & 0xFF800000u) == 0xA9800000u ||
+        (i0 & 0xFF800000u) == 0xA8000000u || (i0 & 0x3E000000u) == 0x28000000u) {
+        snprintf(out, cap, "ctor_%x", o12);
+        return;
+    }
+    snprintf(out, cap, "-");
+}
+
+static uint32_t symbolize_with(const Image &img, const Layout &L,
+                               const std::vector<ClassTable> &tables) {
+    uint32_t added = 0;
+    std::set<uint32_t> tset;
+    for (size_t i = 0; i < tables.size(); i++) tset.insert(tables[i].start);
+
+    for (int di = 0; di < L.data_n; di++) {
+        uint64_t s = L.data[di].start, e = L.data[di].end;
+        if (e <= s) continue;
+        for (uint64_t va = (s + 7) & ~7ULL; va + 16 <= e; va += 8) {
+            uint64_t q0 = 0, q1 = 0;
+            if (!at(img, va, &q0, 8) || !at(img, va + 8, &q1, 8)) break;
+            uint32_t r0 = sym_slot_rva(img, q0), r1 = sym_slot_rva(img, q1);
+            if (!r0 || !r1) continue;
+            uint32_t trva = 0, srva = 0;
+            if (tset.count(r0) && !tset.count(r1)) {
+                trva = r0;
+                srva = r1;
+            } else if (tset.count(r1) && !tset.count(r0)) {
+                trva = r1;
+                srva = r0;
+            } else {
+                continue;
+            }
+            if (name_of_table(trva)) continue;
+            char buf[96];
+            if (!at(img, img.base + srva, buf, sizeof buf - 1)) continue;
+            buf[sizeof buf - 1] = 0;
+            size_t ln = strnlen(buf, sizeof buf - 1);
+            if (!sym_ident(buf, ln)) continue;
+            g_table_class[trva] = std::string(buf, ln);
+            g_table_src[trva] = "registry";
+            added++;
+        }
+    }
+
+    {
+        std::map<std::string, std::vector<size_t> > groups;
+        for (size_t i = 0; i < tables.size(); i++) {
+            if (tables[i].slots < 4) continue;
+            uint32_t s0 = table_slot_rva(img, tables[i], 0), s1 = table_slot_rva(img, tables[i], 1);
+            uint32_t s2 = table_slot_rva(img, tables[i], 2), s3 = table_slot_rva(img, tables[i], 3);
+            if (!s0 || !s1 || !s2 || !s3) continue;
+            char key[64];
+            snprintf(key, sizeof key, "%x_%x_%x_%x", s0, s1, s2, s3);
+            groups[key].push_back(i);
+        }
+        for (std::map<std::string, std::vector<size_t> >::iterator g = groups.begin();
+             g != groups.end(); ++g) {
+            if (g->second.size() < 2) continue;
+            size_t base = g->second.size();
+            uint32_t base_slots = 0xFFFFFFFFu;
+            for (size_t k = 0; k < g->second.size(); k++) {
+                const size_t idx = g->second[k];
+                if (!name_of_table(tables[idx].start)) continue;
+                if (tables[idx].slots >= base_slots) continue;
+                base_slots = tables[idx].slots;
+                base = idx;
+            }
+            if (base == g->second.size()) continue;
+            const char *bn = name_of_table(tables[base].start);
+            if (!bn) continue;
+            char bs[160];
+            snprintf(bs, sizeof bs, "%s", bn);
+            for (size_t k = 0; k < g->second.size(); k++) {
+                const size_t idx = g->second[k];
+                if (idx == base || name_of_table(tables[idx].start)) continue;
+                if (tables[idx].slots <= tables[base].slots) continue;
+                char nm[192];
+                snprintf(nm, sizeof nm, "%s_derived_%x", bs, tables[idx].start);
+                g_table_class[tables[idx].start] = std::string(nm);
+                g_table_src[tables[idx].start] = "hierarchy";
+                added++;
+            }
+        }
+    }
+
+    {
+        uint64_t last_str[4] = {0, 0, 0, 0};
+        uint64_t last_tbl[4] = {0, 0, 0, 0};
+        int age_str[4] = {99, 99, 99, 99};
+        int age_tbl[4] = {99, 99, 99, 99};
+        uint64_t adrp[32];
+        for (int r = 0; r < 32; r++) adrp[r] = 0;
+        for (uint64_t va = L.code_lo; va + 4 <= L.code_hi; va += 4) {
+            uint32_t w = sym_insn(img, va);
+            if (!w) break;
+            for (int k = 0; k < 4; k++) {
+                if (age_str[k] < 99) age_str[k]++;
+                if (age_tbl[k] < 99) age_tbl[k]++;
+            }
+            if ((w & 0x9F000000u) == 0x90000000u) {
+                int rd = w & 31;
+                int64_t off = (int64_t)((((w >> 5) & 0x7FFFFu) << 2) | ((w >> 29) & 3u));
+                off = (off << 43) >> 43;
+                adrp[rd] = (va & ~0xFFFULL) + ((uint64_t)off << 12);
+                continue;
+            }
+            if ((w & 0xFF800000u) == 0x91000000u) {
+                int rd = w & 31, rn = (w >> 5) & 31;
+                uint32_t imm = (w >> 10) & 0xFFFu;
+                if ((w >> 22) & 3u) imm <<= 12;
+                if (adrp[rn]) {
+                    uint64_t t = adrp[rn] + imm;
+                    uint32_t rva = sym_slot_rva(img, t);
+                    if (rva) {
+                        if (tset.count(rva)) {
+                            last_tbl[0] = last_tbl[1];
+                            last_tbl[1] = last_tbl[2];
+                            last_tbl[2] = last_tbl[3];
+                            last_tbl[3] = rva;
+                            age_tbl[3] = 0;
+                            age_tbl[0] = age_tbl[1];
+                            age_tbl[1] = age_tbl[2];
+                            age_tbl[2] = 0;
+                        } else {
+                            uint32_t drva = sym_slot_rva(img, adrp[rd]);
+                            if (!drva || (unsigned)(rva - drva) >= 0x400000u) {
+                                last_str[0] = last_str[1];
+                                last_str[1] = last_str[2];
+                                last_str[2] = last_str[3];
+                                last_str[3] = rva;
+                                age_str[3] = 0;
+                                age_str[0] = age_str[1];
+                                age_str[1] = age_str[2];
+                                age_str[2] = 0;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if ((w & 0xFC000000u) != 0x94000000u) continue;
+            for (int a = 0; a < 4; a++) {
+                if (age_str[a] > 24 || !last_str[a]) continue;
+                uint32_t srva = (uint32_t)last_str[a];
+                char buf[96];
+                if (!at(img, img.base + srva, buf, sizeof buf - 1)) continue;
+                buf[sizeof buf - 1] = 0;
+                size_t ln = strnlen(buf, sizeof buf - 1);
+                if (ln < 2 || ln > 40) continue;
+                for (int b = 0; b < 4; b++) {
+                    if (age_tbl[b] > 24 || !last_tbl[b]) continue;
+                    uint32_t trva = (uint32_t)last_tbl[b];
+                    if (name_of_table(trva)) continue;
+                    if (!sym_ident(buf, ln)) continue;
+                    g_table_class[trva] = std::string(buf, ln);
+                    g_table_src[trva] = "register";
+                    added++;
+                    age_tbl[b] = 99;
+                }
+            }
+        }
+    }
+    return added;
+}
+
+uint32_t symbolize_tables(const Image &img, const std::vector<ClassTable> &tables) {
+    return symbolize_with(img, g_last_layout, tables);
+}
+
+void write_symbols(const Image &img, const std::vector<ClassTable> &tables, const char *root) {
     char path[1024];
     char nm[192];
+    char sh[64];
     snprintf(path, sizeof path, "%s/_symbols.tsv", root);
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "rva\taddress\tname\tsource\tslots\n");
+    fprintf(f, "kind\trva\taddress\tname\tsource\tslots\n");
     for (size_t i = 0; i < tables.size(); i++) {
         const char *c = name_of_table(tables[i].start);
         const char *fam = c ? nullptr : family_of_table(tables[i].start);
         if (c) snprintf(nm, sizeof nm, "%s", c);
         else if (fam) snprintf(nm, sizeof nm, "~%s", fam);
         else snprintf(nm, sizeof nm, "vt_%x", tables[i].start);
-        fprintf(f, "%#x\t0x%llx\t%s\t%s\t%u\n", tables[i].start,
+        fprintf(f, "table\t%#x\t0x%llx\t%s\t%s\t%u\n", tables[i].start,
                 0x100000000ULL + (uint64_t)tables[i].start, nm,
                 c ? "named" : (fam ? "family" : "address"), tables[i].slots);
+    }
+    if (g_fs) {
+        for (size_t i = 0; i < g_fs->v.size(); i++) {
+            uint32_t rva = g_fs->v[i];
+            const char *kn = name_for_rva(rva);
+            const char *src = "string";
+            if (kn[0] == '-') {
+                shape_name_for(img, rva, sh, sizeof sh);
+                if (sh[0] == '-') continue;
+                kn = sh;
+                src = "shape";
+            }
+            fprintf(f, "func\t%#x\t0x%llx\t%s\t%s\t0\n", rva, 0x100000000ULL + (uint64_t)rva, kn,
+                    src);
+        }
     }
     fclose(f);
 
     snprintf(path, sizeof path, "%s/_symbols.idc", root);
-    f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "#include <idc.idc>\n\nstatic main() {\n");
+    FILE *a = fopen(path, "w");
+    snprintf(sh, sizeof sh, "%s/_symbols.py", root);
+    FILE *b = fopen(sh, "w");
+    snprintf(sh, sizeof sh, "%s/_symbols.txt", root);
+    FILE *c2 = fopen(sh, "w");
+    if (a) fprintf(a, "#include <idc.idc>\n\nstatic main() {\n");
+    if (b) fprintf(b, "from ghidra.program.model.symbol import SourceType\n\n"
+                      "def main():\n    st = currentProgram.getSymbolTable()\n"
+                      "    base = currentProgram.getImageBase()\n");
     for (size_t i = 0; i < tables.size(); i++) {
-        const char *c = name_of_table(tables[i].start);
-        const char *fam = c ? nullptr : family_of_table(tables[i].start);
-        if (!c && !fam) continue;
-        snprintf(nm, sizeof nm, "%s", c ? c : fam);
+        const char *cn = name_of_table(tables[i].start);
+        const char *fam = cn ? nullptr : family_of_table(tables[i].start);
+        if (!cn && !fam) continue;
+        snprintf(nm, sizeof nm, "%s", cn ? cn : fam);
         for (char *q = nm; *q; q++)
             if (*q == '~' || *q == ' ' || *q == ':' || *q == '-') *q = '_';
-        fprintf(f, "    MakeName(0x%llx, \"%s\");\n",
-                0x100000000ULL + (uint64_t)tables[i].start, nm);
+        const unsigned long long ad = 0x100000000ULL + (uint64_t)tables[i].start;
+        if (a) fprintf(a, "    MakeName(0x%llx, \"%s\");\n", ad, nm);
+        if (b)
+            fprintf(b, "    st.createLabel(base.add(0x%llx), \"%s\", SourceType.USER_DEFINED)\n",
+                    (unsigned long long)tables[i].start, nm);
+        if (c2) fprintf(c2, "%s 0x%llx\n", nm, ad);
     }
-    fprintf(f, "}\n");
-    fclose(f);
+    if (a) {
+        fprintf(a, "}\n");
+        fclose(a);
+    }
+    if (b) {
+        fprintf(b, "\nmain()\n");
+        fclose(b);
+    }
+    if (c2) fclose(c2);
 }
 
 static bool g_skip_bundle = false;

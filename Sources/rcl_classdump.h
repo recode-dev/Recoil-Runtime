@@ -42,7 +42,8 @@ std::vector<ClassTable> scan_class_tables(const Image &img, ScanStats *st = null
 void dump_class_tree(const Image &img);
 void write_class_docs(const Image &img);
 void write_all_bundle();
-void write_symbols(const std::vector<ClassTable> &tables, const char *root);
+void write_symbols(const Image &img, const std::vector<ClassTable> &tables, const char *root);
+uint32_t symbolize_tables(const Image &img, const std::vector<ClassTable> &tables);
 void set_skip_bundle(bool skip);
 const char *dumps_root();
 void live_docs_note(const Image &img, uint32_t state, int tick);
