@@ -2,6 +2,7 @@
 #include <thread>
 #include <map>
 #include <vector>
+#include <string>
 #include <algorithm>
 #include "rcl_log.h"
 #include "rcl_alert.h"
@@ -1015,33 +1016,30 @@ void bc_code_pass(const Image &img) {
     fflush(g_bc_f);
 }
 
-const char *doc_class_name(uint32_t vt);
-const char *name_of_table(uint32_t start);
-
 static const char *bc_class_label(const Image &img, uint64_t vt, char *buf, size_t cap) {
-    if (in_image(img, vt)) {
-        const uint32_t rva = (uint32_t)(vt - img.base);
-        const char *n = name_of_table(rva);
-        if (!n || !*n) n = doc_class_name(rva);
-        if (n && *n && strcmp(n, "-") != 0) {
-            snprintf(buf, cap, "%s", n);
-            return buf;
-        }
-    }
-    for (uint32_t slot = 0; slot < 12; slot++) {
+    std::map<std::string, int> freq;
+    for (uint32_t slot = 0; slot < 32; slot++) {
         uint64_t w = 0;
-        if (!bc_read(vt + (uint64_t)slot * 8, &w, 8) || !w || !in_text(img, w)) continue;
+        if (!bc_read(vt + (uint64_t)slot * 8, &w, 8) || !w || !in_image(img, w)) break;
         const char *nm = name_for_rva((uint32_t)(w - img.base));
         if (!nm || strcmp(nm, "-") == 0) continue;
         const char *sep = strstr(nm, "::");
         if (!sep || sep == nm) continue;
-        size_t len = (size_t)(sep - nm);
-        if (len >= cap) len = cap - 1;
-        memcpy(buf, nm, len);
-        buf[len] = 0;
+        freq[std::string(nm, (size_t)(sep - nm))]++;
+    }
+    const std::string *best = nullptr;
+    int bestn = 0;
+    for (std::map<std::string, int>::iterator it = freq.begin(); it != freq.end(); ++it) {
+        if (it->second > bestn) {
+            bestn = it->second;
+            best = &it->first;
+        }
+    }
+    if (!best) {
+        snprintf(buf, cap, "unknown");
         return buf;
     }
-    snprintf(buf, cap, "unknown");
+    snprintf(buf, cap, "%s", best->c_str());
     return buf;
 }
 
