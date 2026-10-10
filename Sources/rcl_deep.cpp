@@ -1399,7 +1399,7 @@ void deep_globals(const Image &img, const MachInsight &mi, const FnStarts &fs,
     }
 
     char path[1024];
-    snprintf(path, sizeof path, "%s/_globals.tsv", root);
+    snprintf(path, sizeof path, "%s/_globals_deep.tsv", root);
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "slot\tvalue\tkind\tclass\trefs\tfirst_fn\n");
