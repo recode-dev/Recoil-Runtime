@@ -2937,8 +2937,40 @@ static uint32_t symbolize_with(const Image &img, const Layout &L,
     return added;
 }
 
+static std::map<uint32_t, std::map<std::string, uint32_t> > g_heap_votes;
+
+void rcl_symbol_vote(uint32_t table_rva, const char *name, const char *source) {
+    (void)source;
+    if (!table_rva || !name || !*name) return;
+    if (!sym_ident(name, strlen(name))) return;
+    g_heap_votes[table_rva][std::string(name)]++;
+}
+
+static uint32_t apply_heap_votes() {
+    uint32_t added = 0;
+    for (std::map<uint32_t, std::map<std::string, uint32_t> >::iterator it = g_heap_votes.begin();
+         it != g_heap_votes.end(); ++it) {
+        if (name_of_table(it->first)) continue;
+        const std::string *best = nullptr;
+        uint32_t bestn = 0;
+        for (std::map<std::string, uint32_t>::iterator v = it->second.begin();
+             v != it->second.end(); ++v)
+            if (v->second > bestn) {
+                bestn = v->second;
+                best = &v->first;
+            }
+        if (!best || bestn < 2) continue;
+        g_table_class[it->first] = *best;
+        g_table_src[it->first] = "asset";
+        added++;
+    }
+    return added;
+}
+
 uint32_t symbolize_tables(const Image &img, const std::vector<ClassTable> &tables) {
-    return symbolize_with(img, g_last_layout, tables);
+    uint32_t n = symbolize_with(img, g_last_layout, tables);
+    n += apply_heap_votes();
+    return n;
 }
 
 void write_symbols(const Image &img, const std::vector<ClassTable> &tables, const char *root) {

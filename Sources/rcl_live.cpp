@@ -1,5 +1,6 @@
 #include "rcl_live.h"
 #include "rcl_log.h"
+#include "rcl_classdump.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -465,8 +466,26 @@ static void dump_object(const Image &img, uint64_t o, int idx, bool full) {
               (int)x, (int)y, (int)z, (int)own, (int)team, (unsigned)dead);
 }
 
+static bool live_ident(const Image &img, uint64_t va, char *out, size_t cap) {
+    if (va < img.base || va - img.base >= img.image_vmsize) return false;
+    size_t i = 0;
+    for (; i + 1 < cap; i++) {
+        uint8_t c = 0;
+        if (!rd8(va + i, c)) return false;
+        if (!c) break;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_'))
+            return false;
+        out[i] = (char)c;
+    }
+    if (i < 6) return false;
+    if (out[0] < 'A' || out[0] > 'Z') return false;
+    out[i] = 0;
+    return true;
+}
+
 static void dump_objects(const Image &img, uint64_t mgr, int objcap, int fullmax,
-                         const LiveAnchors &a) {
+                          const LiveAnchors &a) {
     uint64_t arr = 0;
     uint32_t n = 0, cap = 0;
     char p[64];
@@ -495,6 +514,17 @@ static void dump_objects(const Image &img, uint64_t mgr, int objcap, int fullmax
         uint64_t v = 0;
         rd64(o, v);
         if (!v) continue;
+        if (v >= img.base && v - img.base < img.image_vmsize) {
+            const uint32_t trva = (uint32_t)(v - img.base);
+            char id[64];
+            for (uint32_t k = 0; k < 32; k++) {
+                uint64_t q = 0;
+                if (!rd64(o + (uint64_t)k * 8, q)) break;
+                if (q < img.base || q - img.base >= img.image_vmsize) continue;
+                if (!live_ident(img, q, id, sizeof id)) continue;
+                rcl_symbol_vote(trva, id, "asset");
+            }
+        }
         int seen = 0;
         for (int q = 0; q < nvts; q++)
             if (vts[q] == v) seen = 1;
