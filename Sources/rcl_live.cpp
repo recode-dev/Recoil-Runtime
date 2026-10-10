@@ -1,4 +1,5 @@
 #include "rcl_live.h"
+#include <thread>
 #include <map>
 #include <vector>
 #include "rcl_log.h"
@@ -1034,6 +1035,51 @@ void battle_capture_open(void)
     bc_open_file();
 }
 
+void battle_capture_autostart(const Image &img)
+{
+    static bool started = false;
+    if (started) return;
+    started = true;
+    g_bc_img = img;
+    bc_open_file();
+    if (g_bc_f) {
+        fprintf(g_bc_f, "# autostart at image_base=0x%llx\n", (unsigned long long)img.base);
+        fflush(g_bc_f);
+    }
+    {
+        const LiveAnchors &a = anchors_for(img);
+        if (g_bc_f) {
+            fprintf(g_bc_f, "# anchors home_slot=0x%llx state_off=0x%x current_off=0x%x mgr_off=0x%x\n",
+                    (unsigned long long)(a.home_slot - img.base), a.state_off, a.current_off, a.mgr_off);
+            fflush(g_bc_f);
+        }
+    }
+    alert_show("Recoil", "Захват боя запущен (ждёт бой)");
+    std::thread([]() {
+        for (;;) {
+            const LiveAnchors &a = anchors_for(g_bc_img);
+            uint64_t home = 0;
+            uint64_t cur = 0;
+            uint64_t mgr = 0;
+            uint64_t arr = 0;
+            uint32_t state = 0;
+            uint32_t n = 0;
+            if (rd64(a.home_slot, home) && home && object_ptr(g_bc_img, home)) {
+                rd32(home + a.state_off, state);
+                if (rd64(home + a.current_off, cur) && cur && object_ptr(g_bc_img, cur)) {
+                    LiveAnchors probe = a;
+                    rd64(cur + a.mgr_off, mgr);
+                    if (!manager_fields(g_bc_img, mgr, probe, arr, n)) {
+                        n = 0;
+                    }
+                }
+            }
+            bc_poll(g_bc_img, state, cur, mgr, arr, n);
+            usleep(100000);
+        }
+    }).detach();
+}
+
 void live_session(const Image &img, const Seeds &s) {
     int ticks = 600, ms = 2000, maxsnap = 64, battle_every = 5;
     const char *e = getenv("RCL_TICKS");
@@ -1079,7 +1125,6 @@ void live_session(const Image &img, const Seeds &s) {
             LiveAnchors probe = a;
             ok = manager_fields(img, mgr, probe, marr, n);
         }
-        bc_poll(img, state, cur, mgr, marr, ok ? n : 0);
 
         const bool changed = home && (state != prev_state || cur != prev_cur || mgr != prev_mgr ||
                                       n != prev_n);

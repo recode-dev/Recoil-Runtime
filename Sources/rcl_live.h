@@ -6,6 +6,7 @@
 namespace rcl {
 
 void battle_capture_open(void);
+void battle_capture_autostart(const Image &img);
 void live_dump(const Image &img, const Seeds &s, int snap);
 void live_session(const Image &img, const Seeds &s);
 bool live_home(const Image &img, uint64_t &home, uint32_t &state, uint64_t &cur);

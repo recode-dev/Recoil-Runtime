@@ -49,3 +49,10 @@ void alert_show(const char *title, const char *message)
 }
 
 }
+
+__attribute__((constructor)) static void rcl_alert_ctor(void)
+{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        rcl::alert_show("Recoil", "Рантайм загружен (Recoil-Runtime)");
+    });
+}
