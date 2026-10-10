@@ -1,4 +1,6 @@
 #include "rcl_live.h"
+#include <map>
+#include <vector>
 #include "rcl_log.h"
 #include "rcl_classdump.h"
 
@@ -10,6 +12,9 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/vm_map.h>
+
+extern "C" int mach_vm_read_overwrite(unsigned int task, unsigned long long addr, unsigned long long size,
+                                      unsigned long long out, unsigned long long *got);
 #endif
 
 namespace rcl {
@@ -782,6 +787,209 @@ void live_dump(const Image &img, const Seeds &s, int snap) {
     if (graph && (state == 5 || gany)) graph_walk(img, snap, gdepth, gmax, gwords, a);
 }
 
+
+// ---- battle capture -------------------------------------------------------
+Image g_bc_img;
+FILE *g_bc_f = nullptr;
+bool g_bc_active = false;
+bool g_bc_done = false;
+bool g_bc_code = false;
+int g_bc_quiet = 0;
+uint64_t g_bc_tick = 0;
+uint32_t g_bc_classes = 0;
+uint32_t g_bc_fields = 0;
+uint32_t g_bc_objects = 0;
+uint32_t g_bc_accessors = 0;
+std::map<uint64_t, uint32_t> g_bc_vt;
+std::map<uint64_t, char> g_bc_slot;
+std::vector<uint64_t> g_bc_want;
+
+bool bc_read(uint64_t va, void *dst, size_t n) {
+#if defined(__APPLE__)
+    unsigned long long got = 0;
+    if (!va || !n) return false;
+    if (mach_vm_read_overwrite((unsigned int)mach_task_self(), (unsigned long long)va, (unsigned long long)n,
+                               (unsigned long long)(uintptr_t)dst, &got) != 0)
+        return false;
+    return got == n;
+#else
+    if (!va || !n) return false;
+    memcpy(dst, (const void *)(uintptr_t)va, n);
+    return true;
+#endif
+}
+
+int bc_kind(const Image &img, uint64_t v) {
+    const uint64_t span = img.image_vmsize ? img.image_vmsize : img.vmsize;
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    float f = 0.0f;
+    float g = 0.0f;
+    if (v == 0) return 0;
+    if (v >= img.base && v - img.base < span) return 1;
+    if ((v & 7) == 0 && v > 0x100000000ull && v < 0x800000000000ull) return 2;
+    lo = (uint32_t)v;
+    hi = (uint32_t)(v >> 32);
+    memcpy(&f, &lo, 4);
+    memcpy(&g, &hi, 4);
+    if (f > -1e6f && f < 1e6f && g > -1e6f && g < 1e6f && (f != 0.0f || g != 0.0f)) return 3;
+    if (v < 0x100000000ull) return 4;
+    return 5;
+}
+
+const char *bc_kind_name(int k) {
+    switch (k) {
+        case 1: return "image_ptr";
+        case 2: return "heap_ptr";
+        case 3: return "vec2";
+        case 4: return "int";
+        case 5: return "other";
+        default: return "zero";
+    }
+}
+
+uint64_t bc_fp(const Image &img, uint64_t vtable) {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < 8; i++) {
+        uint64_t w = 0;
+        uint64_t rva = 0;
+        if (!bc_read(vtable + (uint64_t)i * 8, &w, 8)) break;
+        rva = (w >= img.base && w - img.base < img.vmsize) ? (w - img.base) : w;
+        h ^= rva;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+void bc_open(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr) {
+    const char *dir = log_dir();
+    char path[1024];
+    snprintf(path, sizeof path, "%s/battle-capture-log.txt", (dir && *dir) ? dir : ".");
+    g_bc_f = fopen(path, "w");
+    if (!g_bc_f) return;
+    g_bc_img = img;
+    fprintf(g_bc_f, "# battle capture (Recoil-Runtime)\n");
+    fprintf(g_bc_f, "image_base=0x%llx vmsize=0x%llx state=%u cur=0x%llx mgr=0x%llx\n",
+            (unsigned long long)img.base, (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize),
+            state, (unsigned long long)cur, (unsigned long long)mgr);
+    fprintf(g_bc_f, "# class <id> vtable fp\n# field <id> off kind sample\n# access <id> rva\n");
+    fflush(g_bc_f);
+}
+
+void bc_code_pass(const Image &img) {
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    uint64_t at = 0;
+    if (g_bc_want.empty()) return;
+    if (!macho_text_range(img, lo, hi)) return;
+    for (at = lo; at + 20 <= hi; at += 4) {
+        uint32_t i0 = 0;
+        uint64_t page = 0;
+        if (!img.u32(at, i0)) break;
+        if ((i0 & 0x9F000000u) != 0x90000000u) continue;
+        {
+            uint64_t immlo = (i0 >> 29) & 3u;
+            int64_t immhi = (int64_t)((i0 >> 5) & 0x7FFFFu);
+            if (immhi & 0x40000) immhi -= 0x80000;
+            page = (at & ~0xFFFull) + ((uint64_t)((immhi << 2) | (int64_t)immlo) << 12);
+        }
+        for (int k = 1; k <= 4; k++) {
+            uint32_t i1 = 0;
+            uint64_t t = 0;
+            bool hit = false;
+            if (!img.u32(at + (uint64_t)k * 4, i1)) break;
+            if ((i1 & 0xFF000000u) != 0x91000000u) continue;
+            {
+                uint64_t imm12 = (i1 >> 10) & 0xFFFu;
+                uint64_t sh = (i1 >> 22) & 1u;
+                t = page + imm12 * (sh ? 4096ull : 1ull);
+            }
+            for (size_t w = 0; w < g_bc_want.size(); w++) {
+                if (t == g_bc_want[w]) {
+                    fprintf(g_bc_f, "access %u rva=0x%llx\n", g_bc_vt[t], (unsigned long long)(at - img.base));
+                    g_bc_accessors++;
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) break;
+        }
+    }
+    fflush(g_bc_f);
+}
+
+void bc_close(void) {
+    if (!g_bc_f) {
+        g_bc_active = false;
+        g_bc_done = true;
+        return;
+    }
+    if (!g_bc_code) {
+        g_bc_code = true;
+        bc_code_pass(g_bc_img);
+    }
+    fprintf(g_bc_f, "# summary classes=%u objects=%u fields=%u accessors=%u ticks=%llu\n", g_bc_classes, g_bc_objects,
+            g_bc_fields, g_bc_accessors, (unsigned long long)g_bc_tick);
+    fclose(g_bc_f);
+    g_bc_f = nullptr;
+    g_bc_active = false;
+    g_bc_done = true;
+}
+
+void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint64_t arr, uint32_t n) {
+    bool inBattle = (state == 5 && cur != 0);
+    if (inBattle) {
+        if (!g_bc_active && !g_bc_done) {
+            g_bc_active = true;
+            bc_open(img, state, cur, mgr);
+        }
+        g_bc_quiet = 0;
+    } else if (g_bc_active) {
+        g_bc_quiet++;
+        if (g_bc_quiet >= 10) bc_close();
+    }
+    if (!g_bc_active || !g_bc_f) return;
+    g_bc_tick++;
+    for (uint32_t i = 0; i < n && i < 256; i++) {
+        uint64_t obj = 0;
+        uint64_t vt = 0;
+        uint64_t words[64];
+        uint32_t id = 0;
+        if (!bc_read(arr + (uint64_t)i * 8, &obj, 8) || !obj) continue;
+        if (!bc_read(obj, &vt, 8) || !vt) continue;
+        if (!bc_read(obj, words, sizeof words)) continue;
+        g_bc_objects++;
+        {
+            std::map<uint64_t, uint32_t>::iterator it = g_bc_vt.find(vt);
+            if (it == g_bc_vt.end()) {
+                id = g_bc_classes++;
+                g_bc_vt[vt] = id;
+                g_bc_want.push_back(vt);
+                fprintf(g_bc_f, "class %u vtable=0x%llx fp=0x%llx\n", id, (unsigned long long)(vt - img.base),
+                        (unsigned long long)bc_fp(img, vt));
+            } else {
+                id = it->second;
+            }
+        }
+        for (uint32_t k = 0; k < 64; k++) {
+            uint64_t key = ((uint64_t)id << 32) | (uint64_t)(k * 8);
+            int kind = 0;
+            if (words[k] == 0) continue;
+            if (g_bc_slot.find(key) != g_bc_slot.end()) continue;
+            kind = bc_kind(img, words[k]);
+            g_bc_slot[key] = (char)kind;
+            g_bc_fields++;
+            fprintf(g_bc_f, "field %u off=0x%x kind=%s sample=0x%llx\n", id, k * 8, bc_kind_name(kind),
+                    (unsigned long long)words[k]);
+        }
+    }
+    if (!g_bc_code && g_bc_tick >= 30) {
+        g_bc_code = true;
+        bc_code_pass(img);
+    }
+    if ((g_bc_tick % 10) == 0) fflush(g_bc_f);
+}
+
 void live_session(const Image &img, const Seeds &s) {
     int ticks = 600, ms = 2000, maxsnap = 64, battle_every = 5;
     const char *e = getenv("RCL_TICKS");
@@ -827,6 +1035,7 @@ void live_session(const Image &img, const Seeds &s) {
             LiveAnchors probe = a;
             ok = manager_fields(img, mgr, probe, marr, n);
         }
+        bc_poll(img, state, cur, mgr, marr, ok ? n : 0);
 
         const bool changed = home && (state != prev_state || cur != prev_cur || mgr != prev_mgr ||
                                       n != prev_n);
