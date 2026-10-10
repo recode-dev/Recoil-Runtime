@@ -8,6 +8,7 @@
 #include "rcl_alert.h"
 #include "rcl_classdump.h"
 #include "rcl_names.h"
+#include "rcl_btnames.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1017,6 +1018,18 @@ void bc_code_pass(const Image &img) {
 }
 
 static const char *bc_class_label(const Image &img, uint64_t vt, char *buf, size_t cap) {
+    if (in_image(img, vt)) {
+        const uint32_t rva = (uint32_t)(vt - img.base);
+        const char *n = bt_class_name(rva);
+        if (n && *n) {
+            const char *c = bt_class_cat(rva);
+            if (c && *c)
+                snprintf(buf, cap, "%s/%s", c, n);
+            else
+                snprintf(buf, cap, "%s", n);
+            return buf;
+        }
+    }
     std::map<std::string, int> freq;
     for (uint32_t slot = 0; slot < 32; slot++) {
         uint64_t w = 0;
@@ -1376,8 +1389,12 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
                 id = g_bc_classes++;
                 g_bc_vt[vt] = id;
                 g_bc_want.push_back(vt);
-                fprintf(g_bc_f, "class %u vtable=0x%llx fp=0x%llx\n", id, (unsigned long long)(vt - img.base),
-                        (unsigned long long)bc_fp(img, vt));
+                {
+                    char cls[128];
+                    bc_class_label(img, vt, cls, sizeof cls);
+                    fprintf(g_bc_f, "class %u %s vtable=0x%llx fp=0x%llx\n", id, cls,
+                            (unsigned long long)(vt - img.base), (unsigned long long)bc_fp(img, vt));
+                }
                 {
                     uint64_t tlo = 0;
                     uint64_t thi = 0;
