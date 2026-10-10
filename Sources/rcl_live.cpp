@@ -617,12 +617,18 @@ static void dump_getters(const Image &img, uint64_t vptr, int first, int last, c
     }
 }
 
+static bool g_bc_nl_ready = false;
+static bool bc_keep_all();
+
 static void dump_object(const Image &img, uint64_t o, int idx, bool full)
 {
     uint64_t vt = 0;
     char p[64];
     rd64(o, vt);
     fmt_ptr(img, vt, p, sizeof p);
+    if (g_bc_nl_ready && in_image(img, vt) && !bc_keep_all() &&
+        !nl_kind_keep(nl_kind((uint32_t)(vt - img.base))))
+        return;
     uint32_t x = 0, y = 0, z = 0, own = 0, team = 0;
     uint8_t dead = 0;
     rd32(o + 0x30, x);
@@ -1353,11 +1359,10 @@ static bool bc_nl_read(void *ctx, uint64_t va, void *dst, size_t n)
 
 static const char *bc_class_label(const Image &img, uint64_t vt, char *buf, size_t cap)
 {
-    static bool nl_ready = false;
-    if (!nl_ready)
+    if (!g_bc_nl_ready)
     {
         nl_init(bc_nl_read, nullptr, img.base, img.base + img.vmsize);
-        nl_ready = true;
+        g_bc_nl_ready = true;
     }
     if (!in_image(img, vt))
     {
