@@ -1927,13 +1927,14 @@ static bool bc_class_known(const char *label)
     return strncmp(label, "vt_", 3) != 0 && strcmp(label, "unknown") != 0;
 }
 
-static void bc_class_dir(char *out, size_t cap, const char *root, uint32_t kd,
+static void bc_class_dir(char *out, size_t cap, const char *root, uint32_t kd, uint64_t vt,
                          const char *label)
 {
     char safe[192];
     bc_safe_name(safe, sizeof safe, label);
-    snprintf(out, cap, "%s/%s/%s/%s", root, bc_class_known(label) ? "known" : "unknown",
-             nl_kind_name(kd), safe);
+    const uint32_t rva = vt ? (uint32_t)vt : 0;
+    snprintf(out, cap, "%s/%s/%s/%s_%08x", root, bc_class_known(label) ? "known" : "unknown",
+             nl_kind_name(kd), safe, rva);
 }
 
 static void bc_mkdir_p(const char *path)
@@ -2163,6 +2164,7 @@ static void bc_write_classes(const Image &img, const char *root,
         r.code = 0;
         char cdir[900];
         bc_class_dir(cdir, sizeof cdir, root, kind_lookup(kind_of, r.id),
+                     bc_vt_of(r.id) - img.base,
                      lbl.find(r.id)->second.c_str());
         snprintf(path, sizeof path, "%s/offsets.tsv.md", cdir);
         FILE *in = fopen(path, "r");
@@ -2236,24 +2238,39 @@ static void bc_write_classes(const Image &img, const char *root,
                "hash, host), not a class name\n");
     fprintf(f, "- order: `named` desc, then slots, then fields; everything else is in "
                "`BattleDumpAll.md`\n\n");
+    std::map<std::string, uint32_t> share;
+    for (size_t i = 0; i < rows.size(); i++)
+        share[lbl.find(rows[i].id)->second]++;
+    uint32_t sharedRows = 0;
+    for (size_t i = 0; i < rows.size(); i++)
+    {
+        if (share[lbl.find(rows[i].id)->second] > 1)
+            sharedRows++;
+    }
+    fprintf(f, "- `shared` is how many classes carry the same label: a label the reference bundle "
+               "resolved from one method slot lands on every class that shares that slot, so a "
+               "`shared` over 1 means the name is a hint and the vtable rva is what tells them "
+               "apart.  Folders are unique either way - the rva is part of the name.\n");
+    fprintf(f, "- `%u` of `%zu` entries share their label with another class\n\n", sharedRows,
+            rows.size());
     fprintf(f, "| class | type | kind | vtable rva | slots | named | fields | refs | arrays | "
-               "globals | code | search key | folder |\n");
+               "globals | code | shared | search key | folder |\n");
     fprintf(f, "|-------|------|------|-----------:|------:|------:|-------:|-----:|-------:|"
-               "--------:|-----:|------------|--------|\n");
+               "--------:|-----:|-------:|------------|--------|\n");
     for (size_t i = 0; i < rows.size(); i++)
     {
         const uint32_t id = rows[i].id;
         const std::string &lb = lbl.find(id)->second;
         const uint32_t kd = kind_lookup(kind_of, id);
         char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kd, lb.c_str());
+        bc_class_dir(cdir, sizeof cdir, root, kd, bc_vt_of(id) - img.base, lb.c_str());
         fprintf(f,
-                "| %s | %s | `%s` | `0x%llx` | %u | %u | %u | %u | %u | %u | %u | `%s` | "
+                "| %s | %s | `%s` | `0x%llx` | %u | %u | %u | %u | %u | %u | %u | %u | `%s` | "
                 "`%s` |\n",
                 lb.c_str(), bc_type_name(lb.c_str()), nl_kind_name(kd),
                 (unsigned long long)(bc_vt_of(id) ? bc_vt_of(id) - img.base : 0),
                 rows[i].methods, rows[i].named, rows[i].fields, rows[i].refs, rows[i].arrays,
-                rows[i].globals, rows[i].code, bc_search_key(lb.c_str()), cdir);
+                rows[i].globals, rows[i].code, share[lb], bc_search_key(lb.c_str()), cdir);
     }
     fclose(f);
     RCL_LOGLN("[battle] class list written to %s", path);
@@ -2316,6 +2333,7 @@ static void bc_write_all(const Image &img, const char *root,
     {
         char cdir[900];
         bc_class_dir(cdir, sizeof cdir, root, kind_lookup(kind_of, cls[c].first),
+                     bc_vt_of(cls[c].first) - img.base,
                      lbl.find(cls[c].first)->second.c_str());
         snprintf(path, sizeof path, "%s/offsets.tsv.md", cdir);
         bc_all_rows(out, path);
@@ -2330,7 +2348,7 @@ static void bc_write_all(const Image &img, const char *root,
         const std::string &lb = lbl.find(id)->second;
         const uint32_t kd = kind_lookup(kind_of, id);
         char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kd, lb.c_str());
+        bc_class_dir(cdir, sizeof cdir, root, kd, bc_vt_of(id) - img.base, lb.c_str());
         fprintf(out, "| %u | `%s` | %s | %s | `%s` | %s |\n", id, nl_kind_name(kd),
                 bc_class_known(lb.c_str()) ? "known" : "unknown",
                 bc_type_name(lb.c_str()),
@@ -2344,7 +2362,7 @@ static void bc_write_all(const Image &img, const char *root,
         const std::string &lb = lbl.find(id)->second;
         const uint32_t kd = kind_lookup(kind_of, id);
         char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kd, lb.c_str());
+        bc_class_dir(cdir, sizeof cdir, root, kd, bc_vt_of(id) - img.base, lb.c_str());
         fprintf(out, "### %u. %s\n\n", id, lb.c_str());
         snprintf(path, sizeof path, "%s/offsets.md", cdir);
         bc_all_copy(out, path);
@@ -2370,7 +2388,7 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
         char label[192];
         snprintf(label, sizeof label, "%s", lbl.find(id)->second.c_str());
         char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kd, label);
+        bc_class_dir(cdir, sizeof cdir, root, kd, vt - img.base, label);
         bc_mkdir_p(cdir);
         snprintf(path, sizeof path, "%s/offsets.tsv.md", cdir);
         FILE *f = fopen(path, "w");
@@ -2738,7 +2756,7 @@ static void bc_write_offsets(const Image &img)
         const uint32_t id = cls[c].first;
         const std::string &lb = lbl.find(id)->second;
         char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kind_of[id], lb.c_str());
+        bc_class_dir(cdir, sizeof cdir, root, kind_of[id], bc_vt_of(id) - img.base, lb.c_str());
         fprintf(f, "| %u | `%s` | %s | %s | `%s` | `%s` | %s |\n", id, nl_kind_name(kind_of[id]),
                 bc_class_known(lb.c_str()) ? "known" : "unknown",
                 bc_type_name(lb.c_str()),
