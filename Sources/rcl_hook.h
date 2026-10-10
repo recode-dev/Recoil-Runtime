@@ -4,10 +4,11 @@
 
 #include <vector>
 
-namespace rcl {
+namespace rcl
+{
 
 struct ClassTable;
 
 bool runtime_trace_install(const Image &img, const std::vector<ClassTable> &tables);
 
-}
+} // namespace rcl

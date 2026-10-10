@@ -4,9 +4,11 @@
 
 #include <vector>
 
-namespace rcl {
+namespace rcl
+{
 
-struct ClassTable {
+struct ClassTable
+{
     uint32_t start = 0;
     uint32_t slots = 0;
     uint32_t named = 0;
@@ -14,13 +16,15 @@ struct ClassTable {
     const char *name = "";
 };
 
-struct SegInfo {
+struct SegInfo
+{
     char name[17];
     uint64_t start;
     uint64_t end;
 };
 
-struct ScanStats {
+struct ScanStats
+{
     int hdr_ok = 0;
     uint32_t magic = 0;
     uint32_t ncmds = 0;
@@ -51,4 +55,4 @@ const char *dumps_root();
 void live_docs_note(const Image &img, uint32_t state, int tick);
 void live_docs_flush(const Image &img);
 
-}
+} // namespace rcl

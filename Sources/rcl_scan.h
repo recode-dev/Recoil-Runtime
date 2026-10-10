@@ -10,11 +10,13 @@
 #include <string>
 #include <vector>
 
-namespace rcl {
+namespace rcl
+{
 
 uint64_t macho_image_size(const void *macho_header);
 
-struct Image {
+struct Image
+{
     uint64_t base = 0;
     uint64_t vmsize = 0;
     uint64_t image_vmsize = 0;
@@ -22,8 +24,12 @@ struct Image {
 
     bool (*read)(void *ctx, uint64_t va, void *dst, size_t n) = nullptr;
 
-    bool ok() const { return base != 0 && read != nullptr; }
-    bool u32(uint64_t va, uint32_t &out) const {
+    bool ok() const
+    {
+        return base != 0 && read != nullptr;
+    }
+    bool u32(uint64_t va, uint32_t &out) const
+    {
         return read && read(ctx, va, &out, 4);
     }
 
@@ -33,12 +39,14 @@ struct Image {
 bool macho_text_range(const Image &img, uint64_t &lo, uint64_t &hi);
 bool macho_data_ranges(const Image &img, uint64_t *lo, uint64_t *hi, int cap, int &count);
 
-struct AnchorHit {
+struct AnchorHit
+{
     uint64_t addr = 0;
     uint32_t score = 0;
 };
 
-struct Seeds {
+struct Seeds
+{
     uint64_t text_off = 0;
     uint64_t text_end_off = 0;
     uint64_t getbattle_off = 0;
@@ -54,7 +62,8 @@ struct Seeds {
     static Seeds discover(const Image &img);
 };
 
-struct PropSite {
+struct PropSite
+{
     uint32_t id = 0;
     uint32_t field = 0;
     uint8_t width = 0;
@@ -64,39 +73,45 @@ struct PropSite {
     bool id_from_movz = true;
 };
 
-struct ColumnSite {
+struct ColumnSite
+{
     std::string name;
     uint32_t slot = 0;
     uint64_t site = 0;
     uint64_t slot_va = 0;
 };
 
-struct ClassColumn {
+struct ClassColumn
+{
     std::string name;
     uint64_t slot_va = 0;
     uint32_t id = 0;
 };
 
-struct ClassColumns {
+struct ClassColumns
+{
     uint32_t start = 0;
     uint32_t cols = 0;
     const char *name = "";
     std::vector<ClassColumn> items;
 };
 
-struct ClassBoundary {
+struct ClassBoundary
+{
     uint32_t start = 0;
     uint32_t slots = 0;
     const char *name = "";
 };
 
-struct OwnFlag {
+struct OwnFlag
+{
     uint32_t off = 0;
     uint64_t fn = 0;
     const char *kind = "";
 };
 
-struct StoreDecoded {
+struct StoreDecoded
+{
     bool found = false;
     const char *kind = "";
     int64_t off = 0;
@@ -114,6 +129,6 @@ std::vector<OwnFlag> scan_own_char_flags(const Image &img, const Seeds &s);
 
 bool branch_target(const Image &img, uint64_t va, uint64_t &target);
 
-}
+} // namespace rcl
 
 #endif

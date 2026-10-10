@@ -3,7 +3,8 @@
 
 #include <stdarg.h>
 
-namespace rcl {
+namespace rcl
+{
 
 void log_open(const char *dir);
 bool log_is_open();
@@ -11,9 +12,14 @@ const char *log_dir();
 void log_close();
 void log_printf(const char *fmt, ...);
 
-}
+} // namespace rcl
 
 #define RCL_LOG(...) ::rcl::log_printf(__VA_ARGS__)
-#define RCL_LOGLN(...) do { ::rcl::log_printf(__VA_ARGS__); ::rcl::log_printf("\n"); } while (0)
+#define RCL_LOGLN(...)                                                                             \
+    do                                                                                             \
+    {                                                                                              \
+        ::rcl::log_printf(__VA_ARGS__);                                                            \
+        ::rcl::log_printf("\n");                                                                   \
+    } while (0)
 
 #endif

@@ -6,7 +6,8 @@
 #include <string>
 #include <vector>
 
-namespace rcl {
+namespace rcl
+{
 
 const uint32_t kLcSegment64 = 0x19u;
 const uint32_t kLcSymtab = 0x2u;
@@ -34,7 +35,8 @@ const uint16_t kPtrArm64eUserland = 9;
 const uint16_t kPtrArm64eUserland24 = 10;
 const uint16_t kPtrArm64eSharedCache = 11;
 
-struct SegFull {
+struct SegFull
+{
     char name[17];
     uint64_t vmaddr;
     uint64_t vmsize;
@@ -45,7 +47,8 @@ struct SegFull {
     uint32_t initprot;
 };
 
-struct SecRange {
+struct SecRange
+{
     char seg[17];
     char sect[17];
     uint64_t start;
@@ -53,7 +56,8 @@ struct SecRange {
     uint32_t flags;
 };
 
-struct MachInsight {
+struct MachInsight
+{
     bool ok = false;
     uint64_t slide = 0;
     uint32_t ncmds = 0;
@@ -85,7 +89,8 @@ struct MachInsight {
 };
 
 bool macho_insight(const Image &img, MachInsight &mi);
-bool section_range(const MachInsight &mi, const char *sect, const char *seg, uint64_t &lo, uint64_t &hi);
+bool section_range(const MachInsight &mi, const char *sect, const char *seg, uint64_t &lo,
+                   uint64_t &hi);
 void sections_named(const MachInsight &mi, const char *sect, std::vector<SecRange> &out);
 bool fileoff_to_va(const MachInsight &mi, uint64_t fileoff, uint64_t &va);
 bool va_inside_image(const MachInsight &mi, uint64_t va);
@@ -97,7 +102,8 @@ std::vector<SecRange> read_data_in_code(const Image &img, const MachInsight &mi)
 std::vector<uint32_t> read_unwind_starts(const Image &img, const MachInsight &mi);
 std::string build_version_text(const MachInsight &mi);
 
-struct FnStarts {
+struct FnStarts
+{
     std::vector<uint32_t> v;
     bool exact = false;
     bool from_function_starts = false;
@@ -116,6 +122,6 @@ bool entry_prologue(uint32_t w);
 bool leaf_getter_at(const Image &img, uint32_t rva);
 bool in_ranges(const std::vector<SecRange> &r, uint64_t va);
 
-}
+} // namespace rcl
 
 #endif

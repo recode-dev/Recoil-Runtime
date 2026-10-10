@@ -3,7 +3,8 @@
 
 #include "rcl_scan.h"
 
-namespace rcl {
+namespace rcl
+{
 
 void report_run(const Image &img, const Seeds &s);
 

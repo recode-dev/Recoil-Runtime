@@ -3,7 +3,8 @@
 
 #include "rcl_scan.h"
 
-namespace rcl {
+namespace rcl
+{
 
 void battle_capture_open(void);
 void battle_capture_autostart(const Image &img);
@@ -14,6 +15,6 @@ bool live_chain(const Image &img, uint64_t &home_slot_rva, uint32_t &state_off,
                 uint32_t &current_off, uint32_t &mgr_off, uint32_t &arr_off, uint32_t &cap_off,
                 uint32_t &count_off);
 
-}
+} // namespace rcl
 
 #endif

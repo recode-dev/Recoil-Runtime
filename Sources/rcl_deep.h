@@ -8,9 +8,11 @@
 #include <string>
 #include <vector>
 
-namespace rcl {
+namespace rcl
+{
 
-struct DeepStats {
+struct DeepStats
+{
     int fstarts_source = 0;
     uint32_t fstarts = 0;
     uint32_t fstarts_rejected = 0;
@@ -98,6 +100,6 @@ void write_deep_summary(const MachInsight &mi, const char *root, const DeepStats
 bool demangle_itanium(const char *m, std::string &out);
 const char *deep_ref_class(uint32_t vt);
 
-}
+} // namespace rcl
 
 #endif
