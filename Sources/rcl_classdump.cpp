@@ -2978,6 +2978,7 @@ static uint32_t symbolize_with(const Image &img, const Layout &L,
 
 static std::map<uint32_t, std::map<std::string, uint32_t> > g_heap_votes;
 static std::set<std::string> g_vocab;
+static std::map<std::string, const char *> g_vote_src;
 
 void rcl_symbol_vocab_add(const char *token) {
     if (!token || !*token) return;
@@ -3032,10 +3033,11 @@ static void vote_strings_in_fn(const Image &img, uint32_t rva, uint32_t trva) {
 }
 
 void rcl_symbol_vote(uint32_t table_rva, const char *name, const char *source) {
-    (void)source;
     if (!table_rva || !name || !*name) return;
     if (!sym_ident(name, strlen(name))) return;
-    g_heap_votes[table_rva][std::string(name)]++;
+    const std::string key(name);
+    g_heap_votes[table_rva][key]++;
+    if (source && *source) g_vote_src[key] = source;
 }
 
 static uint32_t apply_heap_votes() {
@@ -3053,7 +3055,8 @@ static uint32_t apply_heap_votes() {
             }
         if (!best || bestn < 2) continue;
         g_table_class[it->first] = *best;
-        g_table_src[it->first] = "asset";
+        std::map<std::string, const char *>::iterator vs = g_vote_src.find(*best);
+        g_table_src[it->first] = vs != g_vote_src.end() ? vs->second : "vote";
         added++;
     }
     if (!g_vocab.empty()) {
