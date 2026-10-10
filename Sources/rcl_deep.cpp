@@ -515,7 +515,7 @@ uint64_t img_slot(const Image &img, const MachInsight &mi, uint64_t slot, bool *
 uint32_t objc_ro_name(const Image &img, const MachInsight &mi, uint64_t class_va, uint64_t &ro_out) {
     ro_out = 0;
     bool ok = false;
-    uint64_t bits = img_slot(img, mi, class_va + 40, &ok);
+    uint64_t bits = img_slot(img, mi, class_va + 32, &ok);
     if (!ok) return 0;
     uint64_t ro = bits & ~7ULL;
     if (!va_inside_image(mi, ro)) return 0;

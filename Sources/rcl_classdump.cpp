@@ -1982,6 +1982,40 @@ uint32_t name_from_shape_cache(const std::vector<ClassTable> &tables, const char
     return named;
 }
 
+uint32_t name_tables_from_seed(const Image &img, const Layout &L,
+                               const std::vector<ClassTable> &tables) {
+    uint32_t hits = 0;
+    for (size_t i = 0; i < tables.size(); i++) {
+        if (name_of_table(tables[i].start)) continue;
+        std::map<std::string, uint32_t> votes;
+        uint32_t total = 0;
+        for (uint32_t s = 0; s < tables[i].slots; s++) {
+            uint64_t raw = 0;
+            uint32_t sr = 0;
+            if (!at(img, img.base + tables[i].start + (uint64_t)s * 8, &raw, sizeof(raw))) break;
+            if (!slot_at(img, raw, L.code_lo, L.code_hi, &sr, nullptr)) continue;
+            const char *nm = name_for_rva(sr);
+            if (nm[0] == '-') continue;
+            votes[std::string(class_of(nm))]++;
+            total++;
+        }
+        if (!total) continue;
+        std::string best;
+        uint32_t bestn = 0;
+        for (std::map<std::string, uint32_t>::const_iterator it = votes.begin(); it != votes.end();
+             ++it)
+            if (it->second > bestn) {
+                bestn = it->second;
+                best = it->first;
+            }
+        if (best.empty() || bestn * 2 < total) continue;
+        g_table_class[tables[i].start] = best;
+        g_table_src[tables[i].start] = "offline seed";
+        hits++;
+    }
+    return hits;
+}
+
 void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTable> &tables,
                    const char *dump) {
     const char *root = diag_root();
@@ -2048,7 +2082,7 @@ void run_deep_scan(const Image &img, const Layout &L, const std::vector<ClassTab
     name_tables_from_strings(img, strs, tables, fns);
     uint32_t method_named = 0;
     name_from_method_index(img, tables, &method_named, root);
-    uint32_t seeded = 0;
+    const uint32_t seeded = name_tables_from_seed(img, L, tables);
     uint32_t families = 0;
     cluster_families(img, tables, root, &families);
     const uint32_t shape_named = name_from_shape_cache(tables, root);
