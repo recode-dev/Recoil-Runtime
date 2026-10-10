@@ -1014,22 +1014,18 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     uint32_t j = 0;
     int inBattle = 0;
     uint32_t coordObjs = 0;
-    uint32_t moved = 0;
     uint32_t maxInst = 0;
-    uint32_t strong = 0;
     uint32_t movedInPlayers = 0;
     uint64_t players = 0;
     uint64_t pArr = 0;
     uint32_t pCount = 0;
     uint32_t pCap = 0;
-    uint32_t coordPerCls[32];
     uint64_t cls[32];
     uint32_t inst[32];
     uint32_t clsN = 0;
     bc_open_file();
     if (!g_bc_f) return;
     {
-        for (i = 0; i < 32; i++) coordPerCls[i] = 0;
         for (i = 0; i < n && i < 128; i++) {
             uint64_t obj = 0;
             uint64_t vt = 0;
@@ -1096,15 +1092,6 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             if (!found) continue;
             coordObjs++;
             if (instHere > maxInst) maxInst = instHere;
-            {
-                uint32_t ci = 0;
-                for (ci = 0; ci < clsN && ci < 32; ci++) {
-                    if (cls[ci] == vt) {
-                        coordPerCls[ci]++;
-                        break;
-                    }
-                }
-            }
             if (nextN < 160) {
                 next[nextN].obj = obj;
                 next[nextN].off = off;
@@ -1113,26 +1100,9 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
                 next[nextN].valid = 1;
                 nextN++;
             }
-            for (j = 0; j < 160; j++) {
-                int32_t dx = 0;
-                int32_t dy = 0;
-                if (!g_bc_prev[j].valid || g_bc_prev[j].obj != obj || g_bc_prev[j].off != off) continue;
-                dx = px - g_bc_prev[j].x;
-                dy = py - g_bc_prev[j].y;
-                if (dx < 0) dx = -dx;
-                if (dy < 0) dy = -dy;
-                if ((dx + dy) > 6 && instHere >= 2 && instHere <= 24) moved++;
-                break;
-            }
         }
     }
     for (i = 0; i < 160; i++) g_bc_prev[i] = i < nextN ? next[i] : BcPos{0, 0, 0, 0, 0};
-    {
-        uint32_t ci = 0;
-        for (ci = 0; ci < clsN && ci < 32; ci++) {
-            if (inst[ci] >= 2 && inst[ci] <= 24 && coordPerCls[ci] >= 4) strong = 1;
-        }
-    }
     {
         uint64_t cand[4];
         uint32_t ci2 = 0;
