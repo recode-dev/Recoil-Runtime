@@ -11,24 +11,24 @@ void alert_show(const char *title, const char *message)
     NSString *m = message ? [NSString stringWithUTF8String:message] : @"";
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *win = nil;
-        if (@available(iOS 13.0, *)) {
-            for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-                if (![sc isKindOfClass:[UIWindowScene class]]) {
-                    continue;
-                }
-                for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-                    if (w.isKeyWindow) {
-                        win = w;
-                        break;
-                    }
-                }
-                if (win) {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            UIWindowScene *ws = nil;
+            if (![sc isKindOfClass:[UIWindowScene class]]) {
+                continue;
+            }
+            ws = (UIWindowScene *)sc;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) {
+                    win = w;
                     break;
                 }
             }
-        }
-        if (!win) {
-            win = [UIApplication sharedApplication].keyWindow;
+            if (!win && ws.windows.count > 0) {
+                win = [ws.windows firstObject];
+            }
+            if (win) {
+                break;
+            }
         }
         if (!win) {
             return;
