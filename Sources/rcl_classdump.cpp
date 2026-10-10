@@ -313,8 +313,6 @@ std::vector<ClassTable> scan_loose(const Image &img, const Layout &L, ScanStats 
 
 static Layout g_last_layout;
 
-const Layout &last_layout() { return g_last_layout; }
-
 std::vector<ClassTable> scan_class_tables(const Image &img, ScanStats *st) {
     std::vector<ClassTable> out;
     Layout &L = g_last_layout;
