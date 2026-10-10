@@ -2858,6 +2858,8 @@ void write_observed(const Image &img, const char *root) {
         fclose(g);
     }
 
+    fclose(f);
+
     snprintf(path, sizeof path, "%s/_live/anchors.md", root);
     FILE *a = fopen(path, "w");
     if (!a) return;
