@@ -1104,6 +1104,12 @@ uint64_t g_bc_players = 0;
 uint32_t g_bc_pcount = 0;
 uint32_t g_bc_state = 0;
 uint64_t g_bc_scene = 0;
+uint32_t g_bc_open_state = 0;
+uint64_t g_bc_open_scene = 0;
+uint64_t g_bc_open_players = 0;
+uint32_t g_bc_open_count = 0;
+uint32_t g_bc_peak_count = 0;
+uint64_t g_bc_battle_polls = 0;
 std::map<uint64_t, uint32_t> g_bc_vt;
 std::map<uint64_t, char> g_bc_slot;
 std::map<uint64_t, uint64_t> g_bc_sample;
@@ -1284,6 +1290,12 @@ void bc_open(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr)
             (unsigned long long)img.base,
             (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize), state,
             (unsigned long long)cur, (unsigned long long)mgr);
+    g_bc_open_state = state;
+    g_bc_open_scene = g_bc_scene;
+    g_bc_open_players = g_bc_players;
+    g_bc_open_count = g_bc_pcount;
+    g_bc_peak_count = g_bc_pcount;
+    g_bc_battle_polls = 0;
     fprintf(g_bc_f, "# battle capture (Recoil-Runtime)\n");
     {
         char msg[160];
@@ -1945,7 +1957,7 @@ static void bc_all_copy(FILE *out, const char *path)
     while (fgets(line, sizeof line, in))
     {
         if (strncmp(line, "# Battle offsets", 16) == 0 || strncmp(line, "- image base", 12) == 0 ||
-            strncmp(line, "- state ", 8) == 0 || strncmp(line, "- folder ", 9) == 0 ||
+            strncmp(line, "- in battle", 11) == 0 || strncmp(line, "- folder ", 9) == 0 ||
             strncmp(line, "- class id ", 11) == 0 || strncmp(line, "- search key ", 13) == 0 ||
             strncmp(line, "## class ", 9) == 0)
             continue;
@@ -1996,9 +2008,32 @@ static void bc_all_rows(FILE *out, const char *path)
     fclose(in);
 }
 
+static void bc_battle_line(FILE *out)
+{
+    fprintf(out, "- captured in battle: state `%u`, scene `0x%llx`, players `0x%llx`, "
+                 "count `%u`, peak `%u`, battle polls `%llu`\n",
+            g_bc_open_state, (unsigned long long)g_bc_open_scene,
+            (unsigned long long)g_bc_open_players, g_bc_open_count, g_bc_peak_count,
+            (unsigned long long)g_bc_battle_polls);
+    if (g_bc_open_state != 5)
+        fprintf(out, "- warning: the capture never saw state 5, the battle was not latched\n");
+    else if (!g_bc_open_players)
+        fprintf(out, "- warning: no players container was seen while state was 5, the scene and "
+                     "anchor offsets may be off for this build\n");
+}
+
+static const char *bc_type_name(const char *label);
+
 static bool bc_class_named(const char *label)
 {
     return bc_class_known(label) && !bc_class_is_string(label);
+}
+
+static const char *bc_type_name(const char *label)
+{
+    if (bc_class_named(label))
+        return "name";
+    return bc_class_known(label) ? "string" : "vt";
 }
 
 static void bc_write_all(const Image &img, const char *root,
@@ -2024,12 +2059,12 @@ static void bc_write_all(const Image &img, const char *root,
 
     fprintf(out, "# BattleDump all\n\n");
     fprintf(out, "Everything the battle dump wrote, in one file: every class and every row.\n\n");
-    fprintf(out, "- image base `0x%llx`, vmsize `0x%llx`, state `%u`, scene `0x%llx`, "
-                "players `0x%llx`, count `%u`, polls `%llu`\n",
+    fprintf(out, "- image base `0x%llx`, vmsize `0x%llx`\n",
             (unsigned long long)img.base,
-            (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize), g_bc_state,
-            (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players, g_bc_pcount,
-            (unsigned long long)g_bc_tick);
+            (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
+    bc_battle_line(out);
+    fprintf(out, "- state when this file was written `%u`, total polls `%llu`\n",
+            g_bc_state, (unsigned long long)g_bc_tick);
     fprintf(out,
             "- classes `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
             "member refs `%u`, arrays `%u`, globals `%u`\n",
@@ -2075,8 +2110,7 @@ static void bc_write_all(const Image &img, const char *root,
         bc_class_dir(cdir, sizeof cdir, root, kd, lb.c_str());
         fprintf(out, "| %u | `%s` | %s | %s | `%s` | %s |\n", id, nl_kind_name(kd),
                 bc_class_known(lb.c_str()) ? "known" : "unknown",
-                bc_class_named(lb.c_str()) ? "name"
-                                          : (bc_class_known(lb.c_str()) ? "string" : "vt"),
+                bc_type_name(lb.c_str()),
                 cdir, lb.c_str());
     }
 
@@ -2121,12 +2155,14 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
         {
             fprintf(f, "# recoil battle offsets\n");
             fprintf(f,
-                    "# image_base=0x%llx vmsize=0x%llx state=%u scene=0x%llx players=0x%llx "
-                    "count=%u tick=%llu\n",
+                    "# image_base=0x%llx vmsize=0x%llx battle_state=%u battle_scene=0x%llx "
+                    "battle_players=0x%llx battle_count=%u battle_peak=%u battle_polls=%llu "
+                    "tick=%llu\n",
                     (unsigned long long)img.base,
                     (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize),
-                    g_bc_state, (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players,
-                    g_bc_pcount, (unsigned long long)g_bc_tick);
+                    g_bc_open_state, (unsigned long long)g_bc_open_scene,
+                    (unsigned long long)g_bc_open_players, g_bc_open_count, g_bc_peak_count,
+                    (unsigned long long)g_bc_battle_polls, (unsigned long long)g_bc_tick);
             fprintf(f, "kind\tclass_id\tclass\tslot\toff\thint\tvalue\trva\tname\n");
             fprintf(f, "class\t%u\t%s\t\t\t\t0x%llx\t0x%llx\t%s\n", id, label,
                     (unsigned long long)bc_fp(img, vt), (unsigned long long)(vt - img.base), label);
@@ -2209,15 +2245,12 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
             fprintf(f, "- image base: `0x%llx`, vmsize `0x%llx`\n",
                     (unsigned long long)img.base,
                     (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
-            fprintf(f,
-                    "- state `%u`, scene `0x%llx`, players `0x%llx`, count `%u`, polls `%llu`\n",
-                    g_bc_state, (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players,
-                    g_bc_pcount, (unsigned long long)g_bc_tick);
+            bc_battle_line(f);
             fprintf(f, "- folder `%s`, %s\n", nl_kind_name(kd),
                     bc_class_known(label) ? "known" : "unknown");
             fprintf(f, "- class id `%u`, vtable rva `0x%llx`, label `%s`, type `%s`\n", id,
                     (unsigned long long)(vt - img.base), label,
-                    bc_class_is_string(label) ? "string" : "name");
+                    bc_type_name(label));
             fprintf(f, "- search key `%s` (the part after the last `/` or `#`)\n\n",
                     bc_search_key(label));
             fprintf(f, "## class %u: %s\n\n", id, label);
@@ -2453,12 +2486,12 @@ static void bc_write_offsets(const Image &img)
     if (!f)
         return;
     fprintf(f, "# battle dump, one folder per class\n\n");
-    fprintf(f, "- image base `0x%llx`, vmsize `0x%llx`, state `%u`, scene `0x%llx`, "
-               "players `0x%llx`, count `%u`, polls `%llu`\n",
+    fprintf(f, "- image base `0x%llx`, vmsize `0x%llx`\n",
             (unsigned long long)img.base,
-            (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize), g_bc_state,
-            (unsigned long long)g_bc_scene, (unsigned long long)g_bc_players, g_bc_pcount,
-            (unsigned long long)g_bc_tick);
+            (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
+    bc_battle_line(f);
+    fprintf(f, "- state when this file was written `%u`, total polls `%llu`\n",
+            g_bc_state, (unsigned long long)g_bc_tick);
     fprintf(f,
             "- classes `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
             "member refs `%u`, arrays `%u`, globals `%u`\n\n",
@@ -2485,8 +2518,7 @@ static void bc_write_offsets(const Image &img)
         bc_class_dir(cdir, sizeof cdir, root, kind_of[id], lb.c_str());
         fprintf(f, "| %u | `%s` | %s | %s | `%s` | `%s` | %s |\n", id, nl_kind_name(kind_of[id]),
                 bc_class_known(lb.c_str()) ? "known" : "unknown",
-                bc_class_named(lb.c_str()) ? "name"
-                                           : (bc_class_known(lb.c_str()) ? "string" : "vt"),
+                bc_type_name(lb.c_str()),
                 bc_search_key(lb.c_str()), cdir, lb.c_str());
     }
     fclose(f);
@@ -2733,6 +2765,11 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             g_bc_active = true;
             bc_open(img, state, cur, mgr);
         }
+        g_bc_battle_polls++;
+        if (pCount > g_bc_peak_count)
+            g_bc_peak_count = pCount;
+        if (players && !g_bc_open_players)
+            g_bc_open_players = players;
         g_bc_quiet = 0;
     }
     else if (g_bc_active)
@@ -2744,8 +2781,17 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     if (!g_bc_active)
         return;
     g_bc_tick++;
-    if (g_bc_tick == 1 || (g_bc_tick % 120) == 0)
+    if (inBattle && (g_bc_tick == 1 || (g_bc_tick % 120) == 0))
+    {
+        fprintf(g_bc_f,
+                "# collect tick=%llu state=%u scene=0x%llx players=0x%llx count=%u "
+                "classes_before=%u\n",
+                (unsigned long long)g_bc_tick, state,
+                (unsigned long long)(cur ? (cur - img.base) : 0),
+                (unsigned long long)(players ? (players - img.base) : 0), pCount, g_bc_classes);
+        fflush(g_bc_f);
         bc_collect(img, cur, mgr);
+    }
     if (!g_bc_code && g_bc_tick >= 30)
     {
         g_bc_code = true;
