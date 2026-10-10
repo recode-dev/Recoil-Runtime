@@ -790,6 +790,11 @@ void live_dump(const Image &img, const Seeds &s, int snap) {
 }
 
 
+#define RCL_STATE_RVA 0x1123e58ULL
+#define RCL_STATE_ENUM_OFF 0x50ULL
+#define RCL_SCENE_OFF 0x48ULL
+#define RCL_STATE_BATTLE 5
+#define RCL_MODE_MANAGER_OFF 0x28ULL
 #define RCL_MGR_ARRAY_OFF 0x0ULL
 #define RCL_MGR_CAP_OFF 0x8ULL
 #define RCL_MGR_COUNT_OFF 0xcULL
@@ -1020,6 +1025,11 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     uint64_t pArr = 0;
     uint32_t pCount = 0;
     uint32_t pCap = 0;
+    uint64_t bcSlot = 0;
+    uint64_t bcScene = 0;
+    uint64_t bcClient = 0;
+    int32_t bcSt = -1;
+    int titanox = 0;
     uint32_t coordPerCls[32];
     uint64_t cls[32];
     uint32_t inst[32];
@@ -1131,6 +1141,25 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             if (inst[ci] >= 2 && inst[ci] <= 24 && coordPerCls[ci] >= 4) strong = 1;
         }
     }
+    if (bc_read(img.base + RCL_STATE_RVA, &bcSlot, 8) && bcSlot) {
+        bc_read(bcSlot + RCL_STATE_ENUM_OFF, &bcSt, 4);
+        if (bcSt == RCL_STATE_BATTLE) {
+            titanox = 1;
+            if (bc_read(bcSlot + RCL_SCENE_OFF, &bcScene, 8) && bcScene) {
+                if (bc_read(bcScene + RCL_MODE_MANAGER_OFF, &bcClient, 8) && bcClient) {
+                    uint64_t a2 = 0;
+                    uint32_t c2 = 0;
+                    uint32_t k2 = 0;
+                    if (bc_container(bcClient, &a2, &c2, &k2)) {
+                        players = bcClient;
+                        pArr = a2;
+                        pCount = c2;
+                        pCap = k2;
+                    }
+                }
+            }
+        }
+    }
     {
         uint64_t cand[4];
         uint32_t ci2 = 0;
@@ -1142,11 +1171,11 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
             if (bc_container(cand[ci2], &pArr, &pCount, &pCap)) players = cand[ci2];
         }
     }
-    inBattle = (players != 0) || (strong || moved >= 2);
+    inBattle = (titanox || players != 0) || (strong || moved >= 2);
     g_bc_players = players;
     g_bc_pcount = pCount;
-    g_bc_state = state;
-    g_bc_scene = cur;
+    g_bc_state = titanox ? (uint32_t)bcSt : state;
+    g_bc_scene = bcScene ? bcScene : cur;
     g_bc_last_n = n;
     if ((g_bc_tick % 10) == 0) {
         fprintf(g_bc_f,
