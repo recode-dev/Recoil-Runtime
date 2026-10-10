@@ -3025,9 +3025,9 @@ uint32_t rcl_targets_hits(void)
     return g_targets_resolved;
 }
 
-uint32_t rcl_targets_scan(const Image &img)
+uint32_t rcl_targets_scan(const Image &img, FILE *out)
 {
-    if (!img.base || !img.read)
+    if (!img.base || !img.read || !out)
         return 0;
     RCL_LOGLN("[targets] scan start, base=%#llx vmsize=%#llx root=%s", (unsigned long long)img.base,
               (unsigned long long)img.image_vmsize, dumps_root());
@@ -3101,45 +3101,34 @@ uint32_t rcl_targets_scan(const Image &img)
     RCL_LOGLN("[targets] scanned %u methods, identified %zu (%u from the bundle rvas), classes %zu",
               scanned, method_sig.size(), bundle_hits, class_table.size());
 
-    char path[1200];
-    snprintf(path, sizeof path, "%s/methods.md", dumps_root());
-    FILE *f = fopen(path, "w");
-    if (f)
+    fprintf(out, "- methods identified `%zu`, of them `%u` reached through the rva the reference "
+               "bundle gives and the rest through the strings the function uses, class tables "
+               "`%zu`\n\n",
+            method_sig.size(), bundle_hits, class_table.size());
+    std::map<std::string, std::pair<uint32_t, uint32_t>> rows;
+    for (std::map<uint32_t, std::string>::iterator it = method_sig.begin();
+         it != method_sig.end(); ++it)
     {
-        fprintf(f, "# methods identified in this binary by their own strings\n\n");
-        fprintf(f, "- a method lands here when the strings it references match the signatures the "
-                   "reference bundle recorded for it, so the rva is the address in THIS build\n");
-        fprintf(f, "- `score` is how many of those signature strings the function really "
-                   "references, two is the minimum\n\n");
-        fprintf(f, "| class | method | method rva | table rva |\n|-------|--------|-----------:|"
-                   "----------:|\n");
-        std::map<std::string, std::pair<uint32_t, uint32_t>> rows;
-        for (std::map<uint32_t, std::string>::iterator it = method_sig.begin();
-             it != method_sig.end(); ++it)
-        {
-            const char *sep = strstr(it->second.c_str(), "::");
-            const std::string cls =
-                sep ? std::string(it->second.c_str(), (size_t)(sep - it->second.c_str()))
-                    : std::string(it->second);
-            std::map<std::string, uint32_t>::iterator ct = class_table.find(cls);
-            rows[it->second] = std::make_pair(it->first,
-                                             ct == class_table.end() ? 0u : ct->second);
-        }
-        uint32_t written = 0;
-        for (std::map<std::string, std::pair<uint32_t, uint32_t>>::iterator it = rows.begin();
-             it != rows.end(); ++it)
-        {
-            const char *sep = strstr(it->first.c_str(), "::");
-            const std::string cls =
-                sep ? std::string(it->first.c_str(), (size_t)(sep - it->first.c_str()))
-                    : std::string("-");
-            fprintf(f, "| %s | `%s` | `0x%x` | `0x%x` |\n", cls.c_str(), it->first.c_str(),
-                    it->second.first, it->second.second);
-            written++;
-        }
-        fclose(f);
-        RCL_LOGLN("[targets] methods written to %s (%u rows)", path, written);
+        const char *sep = strstr(it->second.c_str(), "::");
+        const std::string cls =
+            sep ? std::string(it->second.c_str(), (size_t)(sep - it->second.c_str()))
+                : std::string(it->second);
+        std::map<std::string, uint32_t>::iterator ct = class_table.find(cls);
+        rows[it->second] = std::make_pair(it->first, ct == class_table.end() ? 0u : ct->second);
     }
+    fprintf(out, "| class | method | method rva | table rva |\n|-------|--------|-----------:|"
+                 "----------:|\n");
+    for (std::map<std::string, std::pair<uint32_t, uint32_t>>::iterator it = rows.begin();
+         it != rows.end(); ++it)
+    {
+        const char *sep = strstr(it->first.c_str(), "::");
+        const std::string cls =
+            sep ? std::string(it->first.c_str(), (size_t)(sep - it->first.c_str()))
+                : std::string("-");
+        fprintf(out, "| %s | `%s` | `0x%x` | `0x%x` |\n", cls.c_str(), it->first.c_str(),
+                it->second.first, it->second.second);
+    }
+    fprintf(out, "\n");
 
     const char *tf = getenv("RCL_TARGETS");
     char tpath[1200];
@@ -3154,19 +3143,12 @@ uint32_t rcl_targets_scan(const Image &img)
         return (uint32_t)method_sig.size();
     }
 
-    snprintf(path, sizeof path, "%s/targets.md", dumps_root());
-    f = fopen(path, "w");
-    if (!f)
-    {
-        fclose(tin);
-        return (uint32_t)method_sig.size();
-    }
+    FILE *f = out;
     uint32_t total = 0;
     uint32_t done = 0;
     uint32_t cls_only = 0;
-    fprintf(f, "# the wanted offsets against this binary\n\n");
-    fprintf(f, "- source `%s`, methods identified `%zu`, class tables `%zu`\n\n", tpath,
-            method_sig.size(), class_table.size());
+    fprintf(f, "## the wanted offsets\n\n");
+    fprintf(f, "- list `%s`\n\n", tpath);
     fprintf(f, "| target | status | class | method | rva |\n|--------|--------|-------|--------|"
                "----:|\n");
     char line[512];
@@ -3230,8 +3212,8 @@ uint32_t rcl_targets_scan(const Image &img)
         fprintf(f, "- unresolved `%s`\n", pending[i].c_str());
     fclose(f);
     g_targets_resolved = done;
-    RCL_LOGLN("[targets] %u targets, %u resolved, %u class only, %zu unresolved -> %s", total, done,
-              cls_only, pending.size(), path);
+    RCL_LOGLN("[targets] %u targets, %u resolved, %u class only, %zu unresolved", total, done,
+              cls_only, pending.size());
     return done;
 }
 
@@ -3340,7 +3322,6 @@ void dump_class_tree(const Image &img)
     RCL_LOGLN("[classes] end tables=%zu slots=%llu named_slots=%llu", t.size(),
               (unsigned long long)slots, (unsigned long long)named);
 
-    rcl_targets_scan(img);
 }
 
 std::vector<ClassBoundary> discover_class_boundaries(const Image &img)

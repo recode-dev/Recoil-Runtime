@@ -1963,16 +1963,6 @@ static bool bc_class_known(const char *label)
     return strncmp(label, "vt_", 3) != 0 && strcmp(label, "unknown") != 0;
 }
 
-static void bc_class_dir(char *out, size_t cap, const char *root, uint32_t kd, uint64_t vt,
-                         const char *label)
-{
-    char safe[192];
-    bc_safe_name(safe, sizeof safe, label);
-    const uint32_t rva = vt ? (uint32_t)vt : 0;
-    snprintf(out, cap, "%s/%s/%s/%s_%08x", root, bc_class_known(label) ? "known" : "unknown",
-             nl_kind_name(kd), safe, rva);
-}
-
 static void bc_mkdir_p(const char *path)
 {
     char buf[1200];
@@ -2022,30 +2012,6 @@ static const char *bc_search_key(const char *label)
     return key;
 }
 
-static std::vector<std::string> bc_split_tabs(const char *line)
-{
-    std::vector<std::string> f;
-    const char *p = line;
-    for (;;)
-    {
-        const char *t = strchr(p, '\t');
-        const char *e = t ? t : p + strlen(p);
-        std::string s(p, (size_t)(e - p));
-        while (!s.empty() && (s[s.size() - 1] == '\n' || s[s.size() - 1] == '\r'))
-            s.erase(s.size() - 1);
-        f.push_back(s);
-        if (!t)
-            break;
-        p = t + 1;
-    }
-    return f;
-}
-
-static const char *bc_field(const std::vector<std::string> &f, size_t i)
-{
-    return (i < f.size()) ? f[i].c_str() : "";
-}
-
 static void bc_str_at(uint64_t va, char *out, size_t cap)
 {
     size_t i = 0;
@@ -2066,67 +2032,6 @@ static void bc_str_at(uint64_t va, char *out, size_t cap)
     out[i] = 0;
     if (i < 4)
         out[0] = 0;
-}
-
-static void bc_all_copy(FILE *out, const char *path)
-{
-    FILE *in = fopen(path, "r");
-    if (!in)
-        return;
-    char line[2048];
-    bool started = false;
-    while (fgets(line, sizeof line, in))
-    {
-        if (strncmp(line, "# Battle offsets", 16) == 0 || strncmp(line, "- image base", 12) == 0 ||
-            strncmp(line, "- in battle", 11) == 0 || strncmp(line, "- folder ", 9) == 0 ||
-            strncmp(line, "- class id ", 11) == 0 || strncmp(line, "- search key ", 13) == 0 ||
-            strncmp(line, "## class ", 9) == 0)
-            continue;
-        if (!started && line[0] == '\n')
-            continue;
-        started = true;
-        fputs(line, out);
-    }
-    fclose(in);
-}
-
-static void bc_all_rows(FILE *out, const char *path)
-{
-    FILE *in = fopen(path, "r");
-    if (!in)
-        return;
-    char line[4096];
-    while (fgets(line, sizeof line, in))
-    {
-        if (line[0] == '#' || strncmp(line, "kind\t", 5) == 0 || line[0] == '\n')
-            continue;
-        const std::vector<std::string> f = bc_split_tabs(line);
-        if (f.empty())
-            continue;
-        const std::string &t = f[0];
-        const char *kind = bc_field(f, 2);
-        if (t == "class")
-            fprintf(out, "| %s | vtable |  | `%s` | fp | `%s` | `%s` | `%s` |\n", kind,
-                    bc_field(f, 7), bc_field(f, 6), bc_field(f, 7), bc_field(f, 2));
-        else if (t == "method")
-            fprintf(out, "| %s | method | %s |  |  |  | `%s` | %s |\n", kind, bc_field(f, 3),
-                    bc_field(f, 6), bc_field(f, 7));
-        else if (t == "field")
-            fprintf(out, "| %s | field |  | `%s` | %s | `%s` |  | %s |\n", kind, bc_field(f, 4),
-                    bc_field(f, 5), bc_field(f, 6), bc_field(f, 8));
-        else if (t == "access")
-            fprintf(out, "| %s | code ref |  |  |  |  | `%s` |  |\n", kind, bc_field(f, 7));
-        else if (t == "ref")
-            fprintf(out, "| %s | member ref | %s | `%s` | %s |  |  | %s |\n", kind, bc_field(f, 3),
-                    bc_field(f, 4), bc_field(f, 5), bc_field(f, 8));
-        else if (t == "container")
-            fprintf(out, "| %s | array | %s | `%s` | %s | %s | `%s` | %s |\n", kind, bc_field(f, 3),
-                    bc_field(f, 4), bc_field(f, 5), bc_field(f, 6), bc_field(f, 7), bc_field(f, 8));
-        else if (t == "global")
-            fprintf(out, "| %s | global cell |  |  | %s |  | `%s` |  |\n", kind, bc_field(f, 5),
-                    bc_field(f, 7));
-    }
-    fclose(in);
 }
 
 static const char *bc_src_name(int src)
@@ -2207,138 +2112,6 @@ static bool bc_row_better(const BcClassRow &a, const BcClassRow &b)
     if (a.fields != b.fields)
         return a.fields > b.fields;
     return a.id < b.id;
-}
-
-static void bc_write_classes(const Image &img, const char *root,
-                             const std::vector<std::pair<uint32_t, uint64_t>> &cls,
-                             const std::map<uint32_t, uint32_t> &kind_of,
-                             const std::map<uint32_t, std::string> &lbl)
-{
-    std::vector<BcClassRow> rows;
-    char path[1200];
-    for (size_t c = 0; c < cls.size(); c++)
-    {
-        BcClassRow r;
-        r.id = cls[c].first;
-        r.methods = 0;
-        r.named = 0;
-        r.fields = 0;
-        r.refs = 0;
-        r.arrays = 0;
-        r.globals = 0;
-        r.code = 0;
-        char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kind_lookup(kind_of, r.id),
-                     bc_vt_of(r.id) - img.base,
-                     lbl.find(r.id)->second.c_str());
-        snprintf(path, sizeof path, "%s/offsets.tsv.md", cdir);
-        FILE *in = fopen(path, "r");
-        if (in)
-        {
-            char line[4096];
-            while (fgets(line, sizeof line, in))
-            {
-                if (line[0] == '#' || strncmp(line, "kind\t", 5) == 0)
-                    continue;
-                const std::vector<std::string> f = bc_split_tabs(line);
-                if (f.empty())
-                    continue;
-                if (f[0] == "method")
-                {
-                    r.methods++;
-                    if (bc_field(f, 7)[0])
-                        r.named++;
-                }
-                else if (f[0] == "field")
-                    r.fields++;
-                else if (f[0] == "ref")
-                    r.refs++;
-                else if (f[0] == "container")
-                    r.arrays++;
-                else if (f[0] == "global")
-                    r.globals++;
-                else if (f[0] == "access")
-                    r.code++;
-            }
-            fclose(in);
-        }
-        rows.push_back(r);
-    }
-    std::sort(rows.begin(), rows.end(), bc_row_better);
-
-    snprintf(path, sizeof path, "%s/CLASSES.md", root);
-    FILE *f = fopen(path, "w");
-    if (!f)
-        return;
-    uint32_t namedRows = 0;
-    uint32_t stringRows = 0;
-    uint32_t vtRows = 0;
-    uint32_t totalMethods = 0;
-    uint32_t totalNamed = 0;
-    size_t classesWithNamed = 0;
-    for (size_t i = 0; i < rows.size(); i++)
-    {
-        const std::string &lb = lbl.find(rows[i].id)->second;
-        const char *t = bc_type_name(lb.c_str());
-        if (strcmp(t, "name") == 0)
-            namedRows++;
-        else if (strcmp(t, "string") == 0)
-            stringRows++;
-        else
-            vtRows++;
-        totalMethods += rows[i].methods;
-        totalNamed += rows[i].named;
-        if (rows[i].named)
-            classesWithNamed++;
-    }
-    fprintf(f, "# every class of the battle dump, most readable first\n\n");
-    fprintf(f, "- entries `%zu`: `%u` named classes, `%u` string hits, `%u` unnamed vtables\n",
-            rows.size(), namedRows, stringRows, vtRows);
-    fprintf(f, "- method slots `%u`, of them named from the reference bundle `%u` in `%zu` "
-               "classes\n",
-            totalMethods, totalNamed, classesWithNamed);
-    fprintf(f, "- `named` counts the slots whose rva the reference bundle knows, so a class with "
-               "`named > 0` is the one to read first\n");
-    fprintf(f, "- a `string` row is a word that only pointed at a string (asset path, text id, "
-               "hash, host), not a class name\n");
-    fprintf(f, "- order: `named` desc, then slots, then fields; everything else is in "
-               "`BattleDumpAll.md`\n\n");
-    std::map<std::string, uint32_t> share;
-    for (size_t i = 0; i < rows.size(); i++)
-        share[lbl.find(rows[i].id)->second]++;
-    uint32_t sharedRows = 0;
-    for (size_t i = 0; i < rows.size(); i++)
-    {
-        if (share[lbl.find(rows[i].id)->second] > 1)
-            sharedRows++;
-    }
-    fprintf(f, "- `shared` is how many classes carry the same label: a label the reference bundle "
-               "resolved from one method slot lands on every class that shares that slot, so a "
-               "`shared` over 1 means the name is a hint and the vtable rva is what tells them "
-               "apart.  Folders are unique either way - the rva is part of the name.\n");
-    fprintf(f, "- `%u` of `%zu` entries share their label with another class\n\n", sharedRows,
-            rows.size());
-    fprintf(f, "| class | type | kind | vtable rva | slots | named | fields | refs | arrays | "
-               "globals | code | shared | search key | folder |\n");
-    fprintf(f, "|-------|------|------|-----------:|------:|------:|-------:|-----:|-------:|"
-               "--------:|-----:|-------:|------------|--------|\n");
-    for (size_t i = 0; i < rows.size(); i++)
-    {
-        const uint32_t id = rows[i].id;
-        const std::string &lb = lbl.find(id)->second;
-        const uint32_t kd = kind_lookup(kind_of, id);
-        char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kd, bc_vt_of(id) - img.base, lb.c_str());
-        fprintf(f,
-                "| %s | %s | `%s` | `0x%llx` | %u | %u | %u | %u | %u | %u | %u | %u | `%s` | "
-                "`%s` |\n",
-                lb.c_str(), bc_type_name(lb.c_str()), nl_kind_name(kd),
-                (unsigned long long)(bc_vt_of(id) ? bc_vt_of(id) - img.base : 0),
-                rows[i].methods, rows[i].named, rows[i].fields, rows[i].refs, rows[i].arrays,
-                rows[i].globals, rows[i].code, share[lb], bc_search_key(lb.c_str()), cdir);
-    }
-    fclose(f);
-    RCL_LOGLN("[battle] class list written to %s", path);
 }
 
 struct BcSem
@@ -2698,84 +2471,6 @@ static void bc_data_load(const char *root)
               files, dir);
 }
 
-static void bc_write_fields(const Image &img, const char *root,
-                            const std::vector<std::pair<uint32_t, uint64_t>> &cls,
-                            const std::map<uint32_t, std::string> &lbl)
-{
-    char path[1200];
-    snprintf(path, sizeof path, "%s/fields.md", root);
-    FILE *f = fopen(path, "w");
-    if (!f)
-        return;
-    fprintf(f, "# every field the battle dump saw, with the behaviour it showed\n\n");
-    fprintf(f, "- `reads` is how often the walk touched the offset, `changes` how often the "
-               "value differed from the previous read\n");
-    fprintf(f, "- `guess` comes from the value: `object` points at a heap object with a vtable, "
-               "`data` at a plain image address, `text` at a readable string, `float` when the "
-               "word reads as a plausible float and not as an offset, `state` when it changed "
-               "under the battle, `const` when it never did\n\n");
-    uint32_t n_obj = 0;
-    uint32_t n_state = 0;
-    uint32_t n_text = 0;
-    uint32_t n_const = 0;
-    for (size_t c = 0; c < cls.size(); c++)
-    {
-        const uint32_t id = cls[c].first;
-        fprintf(f, "## %u. %s\n\n", id, lbl.find(id)->second.c_str());
-        fprintf(f, "| off | kind | reads | changes | min | max | guess | sample |\n");
-        fprintf(f, "|-----|------|------:|--------:|-----|-----|-------|--------|\n");
-        for (std::map<uint64_t, BcSem>::iterator it = g_bc_sem.begin(); it != g_bc_sem.end(); ++it)
-        {
-            if ((uint32_t)(it->first >> 32) != id)
-                continue;
-            const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
-            const BcSem &s = it->second;
-            const uint64_t val = (uint64_t)s.last;
-            const char *guess = "const";
-            char extra[128];
-            extra[0] = 0;
-            if (s.kind == 6)
-            {
-                guess = "text";
-                bc_str_at(val, extra, sizeof extra);
-                n_text++;
-            }
-            else if (in_image(img, val))
-            {
-                uint64_t vt = 0;
-                if (bc_read(val, &vt, 8) && vtable_valid(img, vt))
-                {
-                    guess = "object";
-                    n_obj++;
-                }
-                else
-                    guess = "data";
-            }
-            else if (s.changes > 0)
-            {
-                const float fv = (float)(uint32_t)val;
-                const uint32_t bits = (uint32_t)val;
-                float f = 0.0f;
-                memcpy(&f, &bits, 4);
-                if (fv == fv && f == f && (f > 1e-3f || f < -1e-3f) && f < 1e4f && f > -1e4f)
-                    guess = "float";
-                else
-                    guess = "state";
-                n_state++;
-            }
-            else
-                n_const++;
-            fprintf(f, "| `0x%x` | %s | %u | %u | %lld | %lld | %s | `0x%llx` %s |\n", off,
-                    bc_kind_name(s.kind), s.reads, s.changes, (long long)s.imin, (long long)s.imax,
-                    guess, (unsigned long long)val, extra);
-        }
-        fprintf(f, "\n");
-    }
-    fclose(f);
-    RCL_LOGLN("[resolve] fields: object %u state %u text %u const %u", n_obj, n_state, n_text,
-              n_const);
-}
-
 static void bc_list_add(char *list, size_t cap, const char *s)
 {
     const size_t used = strlen(list);
@@ -2784,614 +2479,379 @@ static void bc_list_add(char *list, size_t cap, const char *s)
     snprintf(list + used, cap - used, "%s`%s` ", used ? " " : "", s);
 }
 
-static void bc_write_anchors(const Image &img, const char *root,
-                             const std::vector<std::pair<uint32_t, uint64_t>> &cls,
-                             const std::map<uint32_t, std::string> &lbl)
+static void bc_rm_tree(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d)
+    {
+        unlink(path);
+        return;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != nullptr)
+    {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        char child[1400];
+        snprintf(child, sizeof child, "%s/%s", path, e->d_name);
+        bc_rm_tree(child);
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+static void bc_clean_old(const char *root)
+{
+    static const char *const gone[] = {"INDEX.md",       "CLASSES.md", "Resolve.md",
+                                       "fields.md",      "anchors.md", "globals.md",
+                                       "callgraph.md",   "methods.md", "targets.md",
+                                       "root-containers.md", "battle-offsets.md",
+                                       "battle-offsets.tsv.md", "battle-offsets-INDEX.md"};
+    char path[1400];
+    for (size_t i = 0; i < sizeof gone / sizeof gone[0]; i++)
+    {
+        snprintf(path, sizeof path, "%s/%s", root, gone[i]);
+        unlink(path);
+    }
+    for (uint32_t kd = 0; kd <= NLK_KIND_MAX; kd++)
+    {
+        snprintf(path, sizeof path, "%s/%s", root, nl_kind_name(kd));
+        bc_rm_tree(path);
+    }
+    snprintf(path, sizeof path, "%s/known", root);
+    bc_rm_tree(path);
+    snprintf(path, sizeof path, "%s/unknown", root);
+    bc_rm_tree(path);
+}
+
+static void bc_write_one(const Image &img, const char *root,
+                         const std::vector<std::pair<uint32_t, uint64_t>> &cls,
+                         const std::map<uint32_t, uint32_t> &kind_of,
+                         const std::map<uint32_t, std::string> &lbl,
+                         const std::map<uint32_t, int> &src_of)
 {
     char path[1200];
-    snprintf(path, sizeof path, "%s/anchors.md", root);
+    snprintf(path, sizeof path, "%s/BattleDumpAll.md", root);
     FILE *f = fopen(path, "w");
     if (!f)
         return;
-    fprintf(f, "# strings each class touches, the fastest way to name one by hand\n\n");
-    fprintf(f, "- strings come from the field values of the class and from the code of its "
-               "slots\n");
-    fprintf(f, "- `data` says how many of the strings are keys of the data files the game ships, "
-               "which is the strong hint for a Logic table class\n\n");
-    fprintf(f, "| class | type | kind | data keys | strings |\n");
-    fprintf(f, "|-------|------|------|----------:|--------|\n");
-    uint32_t total_keys = 0;
-    for (size_t c = 0; c < cls.size(); c++)
-    {
-        const uint32_t id = cls[c].first;
-        const std::string &lb = lbl.find(id)->second;
-        char list[2048];
-        list[0] = 0;
-        uint32_t keys = 0;
-        uint32_t shown = 0;
-        for (std::map<uint64_t, BcSem>::iterator it = g_bc_sem.begin(); it != g_bc_sem.end(); ++it)
-        {
-            if ((uint32_t)(it->first >> 32) != id || it->second.kind != 6)
-                continue;
-            char s[96];
-            bc_str_at((uint64_t)it->second.last, s, sizeof s);
-            if (strlen(s) < 6 || shown >= 6)
-                continue;
-            if (strchr(s, ' '))
-                continue;
-            shown++;
-            bc_list_add(list, sizeof list, s);
-            if (g_bc_data_names.find(s) != g_bc_data_names.end())
-                keys++;
-        }
-        uint32_t slots[96];
-        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 96);
-        for (uint32_t s = 0; s < n && shown < 10; s++)
-        {
-            char strs[4][96];
-            const uint32_t got = bc_strings_of(img, slots[s], strs, 4, 384);
-            for (uint32_t k = 0; k < got && shown < 10; k++)
-            {
-                shown++;
-                bc_list_add(list, sizeof list, strs[k]);
-                if (g_bc_data_names.find(strs[k]) != g_bc_data_names.end())
-                    keys++;
-            }
-        }
-        total_keys += keys;
-        fprintf(f, "| %s | %s | `%s` | %u | %s |\n", lb.c_str(), bc_type_name(lb.c_str()),
-                nl_kind_name(nl_kind((uint32_t)(cls[c].second - img.base))), keys, list);
-    }
-    fclose(f);
-    RCL_LOGLN("[resolve] anchors written, data keys hit %u", total_keys);
-}
 
-static void bc_write_globals(const Image &img, const char *root,
-                             const std::vector<std::pair<uint32_t, uint64_t>> &cls,
-                             const std::map<uint32_t, std::string> &lbl)
-{
-    char path[1200];
-    snprintf(path, sizeof path, "%s/globals.md", root);
-    FILE *f = fopen(path, "w");
-    if (!f)
-        return;
-    fprintf(f, "# data cells that hold an object of a class\n\n");
-    fprintf(f, "- a run of neighbouring cells that hold the same class is a table or array, a "
-               "lone cell is the singleton or the holder of one object\n");
-    fprintf(f, "- `refs` is how many code sites were seen touching that class\n\n");
-    fprintf(f, "| cell | class | class | kind | refs | shape |\n");
-    fprintf(f, "|------|-------|-------|------|-----:|-------|\n");
-    std::map<uint32_t, std::string> label_of_id;
-    for (size_t c = 0; c < cls.size(); c++)
-        label_of_id[cls[c].first] = lbl.find(cls[c].first)->second;
-    std::map<uint32_t, uint32_t> refs;
-    for (size_t i = 0; i < g_bc_access.size(); i++)
-        refs[g_bc_access[i].cls]++;
-    std::vector<std::pair<uint64_t, uint32_t>> cells;
-    for (std::map<uint64_t, uint32_t>::iterator it = g_bc_cell.begin(); it != g_bc_cell.end();
-         ++it)
-        cells.push_back(std::make_pair(it->first, it->second));
-    std::sort(cells.begin(), cells.end());
-    uint32_t tables = 0;
-    uint32_t singles = 0;
-    for (size_t i = 0; i < cells.size(); i++)
-    {
-        uint32_t run = 1;
-        while (i + run < cells.size() && cells[i + run].second == cells[i].second &&
-               cells[i + run].first - cells[i + run - 1].first <= 16)
-            run++;
-        const char *shape = run >= 3 ? "table" : "single";
-        if (run >= 3)
-            tables++;
-        else
-            singles++;
-        fprintf(f, "| `0x%llx` | %u | %s | `%s` | %u | %s (%u) |\n",
-                (unsigned long long)cells[i].first, cells[i].second,
-                label_of_id.count(cells[i].second) ? label_of_id[cells[i].second].c_str() : "-",
-                nl_kind_name(nl_kind((uint32_t)(bc_vt_of(cells[i].second)
-                                                    ? bc_vt_of(cells[i].second) - img.base
-                                                    : 0))),
-                refs.count(cells[i].second) ? refs[cells[i].second] : 0, shape, run);
-        i += run - 1;
-    }
-    fclose(f);
-    RCL_LOGLN("[resolve] globals: %u tables, %u singles", tables, singles);
-}
-
-static void bc_write_callgraph(const Image &img, const char *root,
-                               const std::vector<std::pair<uint32_t, uint64_t>> &cls,
-                               const std::map<uint32_t, std::string> &lbl)
-{
     std::map<uint32_t, uint32_t> owner;
     for (size_t c = 0; c < cls.size(); c++)
     {
-        uint32_t slots[96];
-        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 96);
+        uint32_t slots[128];
+        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 128);
         for (uint32_t s = 0; s < n; s++)
         {
             if (owner.find(slots[s]) == owner.end())
                 owner[slots[s]] = cls[c].first;
         }
     }
-    char path[1200];
-    snprintf(path, sizeof path, "%s/callgraph.md", root);
-    FILE *f = fopen(path, "w");
-    if (!f)
-        return;
-    fprintf(f, "# calls between the classes of the dump\n\n");
-    fprintf(f, "- an edge means a slot of the first class branches to a slot of the second, so a "
-               "class with a named neighbour is the next one to name\n");
-    fprintf(f, "- `evidence` counts the calls behind the edge\n\n");
-    std::map<std::pair<uint32_t, uint32_t>, uint32_t> edges;
-    uint32_t scanned = 0;
-    for (size_t c = 0; c < cls.size(); c++)
-    {
-        uint32_t slots[96];
-        const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 96);
-        for (uint32_t s = 0; s < n; s++)
-        {
-            uint32_t calls[24];
-            const uint32_t got = bc_calls_of(img, slots[s], calls, 24, 256);
-            scanned++;
-            for (uint32_t k = 0; k < got; k++)
-            {
-                std::map<uint32_t, uint32_t>::iterator it = owner.find(calls[k]);
-                if (it == owner.end() || it->second == cls[c].first)
-                    continue;
-                edges[std::make_pair(cls[c].first, it->second)]++;
-            }
-        }
-    }
-    fprintf(f, "| from | from class | to | to class | evidence |\n");
-    fprintf(f, "|------|------------|----|----------|---------:|\n");
-    for (std::map<std::pair<uint32_t, uint32_t>, uint32_t>::iterator it = edges.begin();
-         it != edges.end(); ++it)
-    {
-        const std::pair<uint32_t, uint32_t> &k = it->first;
-        fprintf(f, "| %u | %s | %u | %s | %u |\n", k.first, lbl.find(k.first)->second.c_str(),
-                k.second, lbl.find(k.second)->second.c_str(), it->second);
-    }
-    fclose(f);
-    RCL_LOGLN("[resolve] callgraph: %zu edges from %u scanned slots", edges.size(), scanned);
-}
 
-static void bc_write_resolve(const Image &img, const char *root,
-                             const std::vector<std::pair<uint32_t, uint64_t>> &cls,
-                             const std::map<uint32_t, uint32_t> &kind_of,
-                             const std::map<uint32_t, std::string> &lbl)
-{
+    std::map<uint32_t, uint32_t> refs;
+    for (size_t i = 0; i < g_bc_access.size(); i++)
+        refs[g_bc_access[i].cls]++;
+
+    fprintf(f, "# battle dump\n\n");
+    fprintf(f, "- image base `0x%llx`, vmsize `0x%llx`\n", (unsigned long long)img.base,
+            (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
+    bc_battle_line(f);
+    fprintf(f, "- state when this file was written `%u`, total polls `%llu`\n", g_bc_state,
+            (unsigned long long)g_bc_tick);
+    fprintf(f, "- classes `%u`, objects `%u`, field reads `%u`, method slots `%u`, code refs `%u`, "
+               "member refs `%u`, arrays `%u`, globals `%u`\n\n",
+            g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors, (uint32_t)g_bc_access.size(),
+            (uint32_t)g_bc_ref.size(), (uint32_t)g_bc_arr.size(), (uint32_t)g_bc_cell.size());
+
     uint32_t doc_classes = 0;
     uint32_t doc_rvas = 0;
     uint32_t doc_in = 0;
     nl_build_check(&doc_classes, &doc_rvas, &doc_in);
     uint32_t hits[NL_SRC_MAX + 1];
     nl_stats(hits);
-    char path[1200];
-    snprintf(path, sizeof path, "%s/Resolve.md", root);
-    FILE *f = fopen(path, "w");
-    if (!f)
-        return;
-    fprintf(f, "# how the names of this dump were found\n\n");
-    fprintf(f, "- reference bundle: `%u` classes with methods, `%u` of their first method rvas "
-               "land inside this binary, so the bundle %s this build\n",
+    fprintf(f, "## where the names came from\n\n");
+    fprintf(f, "- reference bundle: `%u` classes, `%u` of their first method rvas land inside this "
+               "binary, so the bundle %s this build\n",
             doc_classes, doc_in,
             (doc_in * 10 >= doc_classes * 8) ? "matches" : "does NOT match");
-    uint32_t named = 0;
-    for (size_t c = 0; c < cls.size(); c++)
-    {
-        if (bc_class_named(lbl.find(cls[c].first)->second.c_str()))
-            named++;
-    }
-    fprintf(f, "- `%u` of `%zu` classes carry a name, the rest are string hits or unnamed "
-               "vtables\n",
-            named, cls.size());
-    fprintf(f, "\n## name sources, in the order they are tried\n\n");
-    fprintf(f, "| source | classes named |\n|--------|--------------:|\n");
-    fprintf(f, "| overlay file | %u |\n", hits[NL_OVERLAY]);
-    fprintf(f, "| documented vtable | %u |\n", hits[NL_DOC_VT]);
-    fprintf(f, "| method slot votes | %u |\n", hits[NL_DOC_METHODS]);
+    fprintf(f, "- names file `%s`, function db `%zu` entries (`%u` new this run), data keys `%zu` "
+               "from `%u` files\n",
+            getenv("RCL_NAMES_FILE") ? getenv("RCL_NAMES_FILE") : "names.txt",
+            g_bc_sigdb.size(), g_bc_sigdb_new, g_bc_data_names.size(), g_bc_data_files);
+    fprintf(f, "\n| source | classes |\n|--------|--------:|\n");
+    fprintf(f, "| names file | %u |\n", hits[NL_OVERLAY]);
+    fprintf(f, "| documented table | %u |\n", hits[NL_DOC_VT]);
+    fprintf(f, "| method votes | %u |\n", hits[NL_DOC_METHODS]);
     fprintf(f, "| slot set match | %u |\n", hits[NL_SLOTSET]);
     fprintf(f, "| structural match | %u |\n", hits[NL_STRUCT]);
     fprintf(f, "| string window | %u |\n", hits[NL_STRINGS]);
-    fprintf(f, "| method name prefix | %u |\n", hits[NL_METHOD_NAMES]);
-    fprintf(f, "| class table of the deep dump | %u |\n", hits[NL_INSTANCE]);
-    fprintf(f, "- wanted list: `%u` offsets resolved against this binary\n", rcl_targets_hits());
-    fprintf(f, "\n## learning\n\n");
-    fprintf(f, "- function db entries loaded `%zu`, new this run `%u`\n", g_bc_sigdb.size(),
-            g_bc_sigdb_new);
-    fprintf(f, "- data files read `%u`, key names `%zu`\n", g_bc_data_files,
-            g_bc_data_names.size());
-    fprintf(f, "- fields tracked `%zu`, calls scanned `%zu` arrays, globals `%zu`\n",
-            g_bc_sem.size(), g_bc_arr.size(), g_bc_cell.size());
-    fprintf(f, "\n## files\n\n");
-    fprintf(f, "- `CLASSES.md` every class, most readable first\n");
-    fprintf(f, "- `BattleDumpAll.md` every row of every class\n");
-    fprintf(f, "- `fields.md` field behaviour, `anchors.md` strings per class, `globals.md` data "
-               "cells, `callgraph.md` calls between classes\n");
-    fprintf(f, "- `functions.db` function hash to name, grows every run and is what makes the "
-               "next build resolve without the bundle\n");
-    fprintf(f, "\n## names to fix first\n\n");
+    fprintf(f, "| method name | %u |\n", hits[NL_METHOD_NAMES]);
+    fprintf(f, "| deep dump table | %u |\n", hits[NL_INSTANCE]);
+    fprintf(f, "| class table rva | 0 |\n");
+
+    uint32_t per_kind[NLK_KIND_MAX + 1] = {0, 0, 0, 0, 0};
+    uint32_t per_split[NLK_KIND_MAX + 1][2] = {{0}};
+    uint32_t known = 0;
+    std::map<std::string, uint32_t> share;
     for (size_t c = 0; c < cls.size(); c++)
     {
         const uint32_t id = cls[c].first;
         const std::string &lb = lbl.find(id)->second;
-        if (!bc_class_named(lb.c_str()) && !bc_class_known(lb.c_str()))
-            continue;
-        if (bc_class_named(lb.c_str()))
-            continue;
-        std::map<uint32_t, uint32_t>::const_iterator kit = kind_of.find(id);
-        fprintf(f, "- `%s` %s vtable `0x%llx`\n", lb.c_str(),
-                nl_kind_name(kit == kind_of.end() ? (uint32_t)NLK_UNKNOWN : kit->second),
-                (unsigned long long)(cls[c].second - img.base));
+        per_kind[kind_of.find(id)->second]++;
+        const bool kk = bc_class_known(lb.c_str());
+        per_split[kind_of.find(id)->second][kk ? 0 : 1]++;
+        if (kk)
+            known++;
+        share[lb]++;
     }
-    fclose(f);
-    RCL_LOGLN("[resolve] report written to %s", path);
-}
-
-static void bc_write_all(const Image &img, const char *root,
-                         const std::vector<std::pair<uint32_t, uint64_t>> &cls,
-                         const std::map<uint32_t, uint32_t> &kind_of,
-                         const std::map<uint32_t, std::string> &lbl)
-{
-    char path[1200];
-    snprintf(path, sizeof path, "%s/BattleDumpAll.md", root);
-    FILE *out = fopen(path, "w");
-    if (!out)
-        return;
-
-    uint32_t names = 0;
-    uint32_t strings = 0;
+    uint32_t sharedRows = 0;
     for (size_t c = 0; c < cls.size(); c++)
     {
-        if (bc_class_named(lbl.find(cls[c].first)->second.c_str()))
-            names++;
-        else if (bc_class_known(lbl.find(cls[c].first)->second.c_str()))
-            strings++;
+        if (share[lbl.find(cls[c].first)->second] > 1)
+            sharedRows++;
     }
 
-    fprintf(out, "# BattleDump all\n\n");
-    fprintf(out, "Everything the battle dump wrote, in one file: every class and every row.\n\n");
-    fprintf(out, "- image base `0x%llx`, vmsize `0x%llx`\n",
-            (unsigned long long)img.base,
-            (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
-    bc_battle_line(out);
-    fprintf(out, "- state when this file was written `%u`, total polls `%llu`\n",
-            g_bc_state, (unsigned long long)g_bc_tick);
-    fprintf(out,
-            "- classes `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
-            "member refs `%u`, arrays `%u`, globals `%u`\n",
-            g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors, (uint32_t)g_bc_access.size(),
-            (uint32_t)g_bc_ref.size(), (uint32_t)g_bc_arr.size(), (uint32_t)g_bc_cell.size());
-    fprintf(out, "- entries `%zu`: `%u` named classes, `%u` strings that are not classes, "
-                 "`%zu` unnamed vtables\n\n",
-            cls.size(), names, strings, cls.size() - names - strings);
-    fprintf(out, "## how to read this\n\n");
-    fprintf(out, "- `type` is `name` for an entry the discovery named as a class, `string` when "
-                 "the word only pointed at a string (asset path, text id, hash, host), `vt` when "
-                 "nothing named it.\n");
-    fprintf(out, "- `vtable` rows give the class table rva and its first function pointer; "
-                 "`method` rows are the slots of that table.\n");
-    fprintf(out, "- `field` rows are offsets seen being read/written on live objects, `member ref` "
-                 "and `array` rows are offsets holding a pointer to / an array of another class.\n");
-    fprintf(out, "- `code ref` rows are code addresses that touch the class, `global cell` rows "
-                 "are data cells holding one of its objects.\n");
-    fprintf(out, "- search by the last path component of a label (the `search key`) - a plain "
-                 "`LogicBattleModeClient` or `getX` grep works here.\n\n");
-
-    fprintf(out, "## every row\n\n");
-    fprintf(out, "| class | type | slot | off | hint | value | rva | name |\n");
-    fprintf(out, "|-------|------|-----:|-----|------|-------|-----|------|\n");
-    for (size_t c = 0; c < cls.size(); c++)
-    {
-        char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kind_lookup(kind_of, cls[c].first),
-                     bc_vt_of(cls[c].first) - img.base,
-                     lbl.find(cls[c].first)->second.c_str());
-        snprintf(path, sizeof path, "%s/offsets.tsv.md", cdir);
-        bc_all_rows(out, path);
-    }
-
-    fprintf(out, "\n## index\n\n");
-    fprintf(out, "| class id | kind | state | type | folder | label |\n");
-    fprintf(out, "|---------:|------|-------|------|--------|-------|\n");
+    fprintf(f, "\n## classes\n\n");
+    fprintf(f, "- `type` is `name` for a class, `string` for a word that only pointed at a string, "
+               "`vt` for an unnamed vtable\n");
+    fprintf(f, "- `source` is the pass that named it, `shared` how many classes carry the same "
+               "label, so the vtable rva is what tells them apart\n");
+    fprintf(f, "- `%u` of `%zu` classes share their label, `%u` have a name\n\n", sharedRows,
+            cls.size(), known);
+    fprintf(f, "| kind | known | unknown | classes |\n|------|------:|--------:|--------:|\n");
+    for (uint32_t kd = 0; kd <= NLK_KIND_MAX; kd++)
+        fprintf(f, "| `%s` | %u | %u | %u |\n", nl_kind_name(kd), per_split[kd][0],
+                per_split[kd][1], per_kind[kd]);
+    fprintf(f, "| **total** | **%u** | **%u** | **%zu** |\n\n", known,
+            (uint32_t)cls.size() - known, cls.size());
+    fprintf(f, "| id | class | type | kind | source | shared | vtable rva | search key |\n");
+    fprintf(f, "|---:|-------|------|------|--------|-------:|-----------:|------------|\n");
     for (size_t c = 0; c < cls.size(); c++)
     {
         const uint32_t id = cls[c].first;
         const std::string &lb = lbl.find(id)->second;
-        const uint32_t kd = kind_lookup(kind_of, id);
-        char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kd, bc_vt_of(id) - img.base, lb.c_str());
-        fprintf(out, "| %u | `%s` | %s | %s | `%s` | %s |\n", id, nl_kind_name(kd),
-                bc_class_known(lb.c_str()) ? "known" : "unknown",
-                bc_type_name(lb.c_str()),
-                cdir, lb.c_str());
+        std::map<uint32_t, int>::const_iterator si = src_of.find(id);
+        fprintf(f, "| %u | `%s` | %s | `%s` | %s | %u | `0x%llx` | `%s` |\n", id, lb.c_str(),
+                bc_type_name(lb.c_str()), nl_kind_name(kind_of.find(id)->second),
+                bc_src_name(si == src_of.end() ? -1 : si->second), share[lb],
+                (unsigned long long)(cls[c].second - img.base), bc_search_key(lb.c_str()));
     }
 
-    fprintf(out, "\n## classes\n\n");
-    for (size_t c = 0; c < cls.size(); c++)
-    {
-        const uint32_t id = cls[c].first;
-        const std::string &lb = lbl.find(id)->second;
-        const uint32_t kd = kind_lookup(kind_of, id);
-        char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kd, bc_vt_of(id) - img.base, lb.c_str());
-        fprintf(out, "### %u. %s\n\n", id, lb.c_str());
-        snprintf(path, sizeof path, "%s/offsets.md", cdir);
-        bc_all_copy(out, path);
-        fprintf(out, "\n");
-    }
-
-    fclose(out);
-    RCL_LOGLN("[battle] all-in-one written to %s", path);
-}
-
-static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
-                          const std::vector<std::pair<uint32_t, uint64_t>> &cls,
-                          const std::map<uint32_t, uint32_t> &kind_of,
-                          const std::map<uint32_t, std::string> &lbl)
-{
-    char path[1200];
+    fprintf(f, "\n## every class\n\n");
     for (size_t c = 0; c < cls.size(); c++)
     {
         const uint32_t id = cls[c].first;
         const uint64_t vt = cls[c].second;
-        if (kind_lookup(kind_of, id) != kd)
-            continue;
-        char label[192];
-        snprintf(label, sizeof label, "%s", lbl.find(id)->second.c_str());
-        char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kd, vt - img.base, label);
-        bc_mkdir_p(cdir);
-        snprintf(path, sizeof path, "%s/offsets.tsv.md", cdir);
-        FILE *f = fopen(path, "w");
-        if (f)
-        {
-            fprintf(f, "# recoil battle offsets\n");
-            fprintf(f,
-                    "# image_base=0x%llx vmsize=0x%llx battle_state=%u battle_scene=0x%llx "
-                    "battle_players=0x%llx battle_count=%u battle_peak=%u battle_polls=%llu "
-                    "tick=%llu\n",
-                    (unsigned long long)img.base,
-                    (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize),
-                    g_bc_open_state, (unsigned long long)g_bc_open_scene,
-                    (unsigned long long)g_bc_open_players, g_bc_open_count, g_bc_peak_count,
-                    (unsigned long long)g_bc_battle_polls, (unsigned long long)g_bc_tick);
-            fprintf(f, "kind\tclass_id\tclass\tslot\toff\thint\tvalue\trva\tname\n");
-            fprintf(f, "class\t%u\t%s\t\t\t\t0x%llx\t0x%llx\t%s\n", id, label,
-                    (unsigned long long)bc_fp(img, vt), (unsigned long long)(vt - img.base), label);
-            uint64_t rvas[64];
-            const uint32_t nm = bc_class_methods(img, vt, rvas, 64);
-            for (uint32_t s = 0; s < nm; s++)
-            {
-                const uint32_t rva = (uint32_t)(rvas[s] - img.base);
-                const char *name = bc_method_name(img, rva);
-                fprintf(f, "method\t%u\t%s\t%u\t\t\t0x%llx\t%s\n", id, label, s,
-                        (unsigned long long)rva, (name && strcmp(name, "-") != 0) ? name : "");
-            }
-            for (std::map<uint64_t, char>::iterator it = g_bc_slot.begin(); it != g_bc_slot.end();
-                 ++it)
-            {
-                if ((uint32_t)(it->first >> 32) != id)
-                    continue;
-                const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
-                std::map<uint64_t, uint64_t>::iterator sm = g_bc_sample.find(it->first);
-                const uint64_t sv = (sm != g_bc_sample.end() ? sm->second : 0);
-                char st[200];
-                st[0] = 0;
-                if (it->second == 6)
-                    bc_str_at(sv, st, sizeof st);
-                fprintf(f, "field\t%u\t%s\t\t0x%x\t%s\t0x%llx\t\t%s\n", id, label, off,
-                        bc_kind_name(it->second), (unsigned long long)sv, st);
-            }
-            for (size_t a = 0; a < g_bc_access.size(); a++)
-            {
-                if (g_bc_access[a].cls != id)
-                    continue;
-                fprintf(f, "access\t%u\t%s\t\t\t\t\t0x%x\t\n", id, label, g_bc_access[a].rva);
-            }
-            for (size_t r = 0; r < g_bc_ref.size(); r++)
-            {
-                if (g_bc_ref[r].pcls != id)
-                    continue;
-                if (kind_lookup(kind_of, g_bc_ref[r].ccls) != kd)
-                    continue;
-                char cl[128];
-                bc_label_of(img, g_bc_ref[r].ccls, cl, sizeof cl);
-                fprintf(f, "ref\t%u\t%s\t%u\t0x%x\t->class\t%s\t0x%llx\t%s\n", id, label,
-                        g_bc_ref[r].ccls, g_bc_ref[r].off, cl,
-                        (unsigned long long)(bc_vt_of(g_bc_ref[r].ccls) - img.base), cl);
-            }
-            for (size_t r = 0; r < g_bc_arr.size(); r++)
-            {
-                if (g_bc_arr[r].pcls != id)
-                    continue;
-                if (kind_lookup(kind_of, g_bc_arr[r].ccls) != kd)
-                    continue;
-                char cl[128];
-                char hint[32];
-                bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
-                if (g_bc_arr[r].direct)
-                    snprintf(hint, sizeof hint, "array");
-                else
-                    snprintf(hint, sizeof hint, "array-via=0x%x", g_bc_arr[r].via);
-                fprintf(f, "container\t%u\t%s\t%u\t0x%x\t%s\t%u\t0x%llx\t%s\n", id, label,
-                        g_bc_arr[r].ccls, g_bc_arr[r].off, hint, g_bc_arr[r].n,
-                        (unsigned long long)(bc_vt_of(g_bc_arr[r].ccls) - img.base), cl);
-            }
-            for (std::map<uint64_t, uint32_t>::iterator it = g_bc_cell.begin();
-                 it != g_bc_cell.end(); ++it)
-            {
-                if (it->second != id)
-                    continue;
-                fprintf(f, "global\t%u\t%s\t\t\tcell\t\t0x%llx\t\n", id, label,
-                        (unsigned long long)it->first);
-            }
-            fclose(f);
-        }
-        RCL_LOGLN("[battle] class tsv written to %s", path);
+        const std::string &lb = lbl.find(id)->second;
+        const uint32_t kd = kind_of.find(id)->second;
+        fprintf(f, "### %u. %s\n\n", id, lb.c_str());
+        fprintf(f, "- vtable `0x%llx`, kind `%s`, type `%s`, search key `%s`, label shared by `%u` "
+                   "classes\n\n",
+                (unsigned long long)vt, nl_kind_name(kd), bc_type_name(lb.c_str()),
+                bc_search_key(lb.c_str()), share[lb]);
 
-        snprintf(path, sizeof path, "%s/offsets.md", cdir);
-        f = fopen(path, "w");
-        if (f)
+        uint32_t slots[128];
+        const uint32_t nslots = bc_slot_rvas(img, vt, slots, 128);
+        if (nslots)
         {
-            fprintf(f, "# Battle offsets (Recoil-Runtime)\n\n");
-            fprintf(f, "- image base: `0x%llx`, vmsize `0x%llx`\n",
-                    (unsigned long long)img.base,
-                    (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
-            bc_battle_line(f);
-            fprintf(f, "- folder `%s`, %s\n", nl_kind_name(kd),
-                    bc_class_known(label) ? "known" : "unknown");
-            fprintf(f, "- class id `%u`, vtable rva `0x%llx`, label `%s`, type `%s`\n", id,
-                    (unsigned long long)(vt - img.base), label,
-                    bc_type_name(label));
-            fprintf(f, "- search key `%s` (the part after the last `/` or `#`)\n\n",
-                    bc_search_key(label));
-            fprintf(f, "## class %u: %s\n\n", id, label);
-            fprintf(f, "- vtable `+0x%llx` (0x%llx), fp `0x%llx`\n\n",
-                    (unsigned long long)(vt - img.base), (unsigned long long)vt,
-                    (unsigned long long)bc_fp(img, vt));
-            uint64_t rvas[64];
-            const uint32_t nm = bc_class_methods(img, vt, rvas, 64);
-            if (nm)
+            fprintf(f, "#### methods\n\n| slot | rva | name |\n|---:|---|---|\n");
+            for (uint32_t s = 0; s < nslots; s++)
             {
-                fprintf(f, "| slot | rva | name |\n|---:|---|---|\n");
-                for (uint32_t s = 0; s < nm; s++)
-                {
-                    const uint32_t rva = (uint32_t)(rvas[s] - img.base);
-                    const char *name = bc_method_name(img, rva);
-                    fprintf(f, "| %u | `0x%x` | %s |\n", s, rva,
-                            (name && strcmp(name, "-") != 0) ? name : "-");
-                }
-                fprintf(f, "\n");
+                const char *mn = bc_method_name(img, slots[s]);
+                fprintf(f, "| %u | `0x%x` | %s |\n", s, slots[s],
+                        (mn && *mn && strcmp(mn, "-") != 0) ? mn : "");
             }
-            fprintf(f, "| offset | kind | sample |\n|---:|---|---|\n");
-            std::vector<std::string> texts;
-            std::string run;
-            uint64_t runend = 0;
-            for (std::map<uint64_t, char>::iterator it = g_bc_slot.begin(); it != g_bc_slot.end();
-                 ++it)
-            {
-                if ((uint32_t)(it->first >> 32) != id)
-                    continue;
-                const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
-                std::map<uint64_t, uint64_t>::iterator sm = g_bc_sample.find(it->first);
-                const uint64_t val = (sm != g_bc_sample.end() ? sm->second : 0);
-                char t8[9];
-                char ps[200];
-                ps[0] = 0;
-                const bool istext = (it->second == 6 && bc_text8(val, t8));
-                if (it->second == 6 && !istext)
-                    bc_str_at(val, ps, sizeof ps);
-                if (istext)
-                    fprintf(f, "| `0x%x` | text | `%s` |\n", off, t8);
-                else if (ps[0])
-                    fprintf(f, "| `0x%x` | text | `%s` (ptr `0x%llx`) |\n", off, ps,
-                            (unsigned long long)val);
-                else
-                    fprintf(f, "| `0x%x` | %s | `0x%llx` |\n", off, bc_kind_name(it->second),
-                            (unsigned long long)val);
-                if (istext && run.size() && off == runend + 8)
-                {
-                    run += t8;
-                    runend = off;
-                }
-                else
-                {
-                    if (run.size() >= 8)
-                        texts.push_back(run);
-                    run = istext ? t8 : std::string();
-                    runend = off;
-                }
-            }
-            if (run.size() >= 8)
-                texts.push_back(run);
             fprintf(f, "\n");
-            if (!texts.empty())
-            {
-                std::set<std::string> uniq(texts.begin(), texts.end());
-                fprintf(f, "Texts:");
-                for (std::set<std::string>::iterator ti = uniq.begin(); ti != uniq.end(); ++ti)
-                    fprintf(f, " `%s`", ti->c_str());
-                fprintf(f, "\n\n");
-            }
-            bool anyRef = false;
-            for (size_t r = 0; r < g_bc_ref.size(); r++)
-            {
-                if (g_bc_ref[r].pcls != id)
-                    continue;
-                if (kind_lookup(kind_of, g_bc_ref[r].ccls) != kd)
-                    continue;
-                if (!anyRef)
-                {
-                    fprintf(f, "| member offset | -> class |\n|---:|---|\n");
-                    anyRef = true;
-                }
-                std::map<uint32_t, std::string>::const_iterator ci = lbl.find(g_bc_ref[r].ccls);
-                const char *cl = (ci != lbl.end()) ? ci->second.c_str() : "?";
-                fprintf(f, "| `0x%x` | %u %s |\n", g_bc_ref[r].off, g_bc_ref[r].ccls, cl);
-            }
-            if (anyRef)
-                fprintf(f, "\n");
-            bool anyArr = false;
-            for (size_t r = 0; r < g_bc_arr.size(); r++)
-            {
-                if (g_bc_arr[r].pcls != id)
-                    continue;
-                if (kind_lookup(kind_of, g_bc_arr[r].ccls) != kd)
-                    continue;
-                if (!anyArr)
-                {
-                    fprintf(f, "| array offset | count | element class |\n|---:|---:|---|\n");
-                    anyArr = true;
-                }
-                char cl[128];
-                bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
-                if (g_bc_arr[r].direct)
-                    fprintf(f, "| `0x%x` | %u | %u %s |\n", g_bc_arr[r].off, g_bc_arr[r].n,
-                            g_bc_arr[r].ccls, cl);
-                else
-                    fprintf(f, "| `0x%x` via `0x%x` | %u | %u %s |\n", g_bc_arr[r].off,
-                            g_bc_arr[r].via, g_bc_arr[r].n, g_bc_arr[r].ccls, cl);
-            }
-            if (anyArr)
-                fprintf(f, "\n");
-            bool anyGlob = false;
-            for (std::map<uint64_t, uint32_t>::iterator it = g_bc_cell.begin();
-                 it != g_bc_cell.end(); ++it)
-            {
-                if (it->second != id)
-                    continue;
-                if (!anyGlob)
-                {
-                    fprintf(f, "| global cell rva |\n|---:|\n");
-                    anyGlob = true;
-                }
-                fprintf(f, "| `0x%llx` |\n", (unsigned long long)it->first);
-            }
-            if (anyGlob)
-                fprintf(f, "\n");
-            bool any = false;
-            for (size_t a = 0; a < g_bc_access.size(); a++)
-            {
-                if (g_bc_access[a].cls != id)
-                    continue;
-                if (!any)
-                {
-                    fprintf(f, "Code references: ");
-                    any = true;
-                }
-                else
-                {
-                    fprintf(f, ", ");
-                }
-                fprintf(f, "`0x%x`", g_bc_access[a].rva);
-            }
-            if (any)
-                fprintf(f, "\n\n");
-            fclose(f);
         }
-        RCL_LOGLN("[battle] class md written to %s", path);
+
+        uint32_t shown = 0;
+        for (std::map<uint64_t, BcSem>::iterator it = g_bc_sem.begin(); it != g_bc_sem.end(); ++it)
+        {
+            if ((uint32_t)(it->first >> 32) != id)
+                continue;
+            if (!shown)
+            {
+                fprintf(f, "#### fields\n\n| off | kind | reads | changes | min | max | guess | "
+                           "sample |\n|-----|------|------:|--------:|-----|-----|-------|--------|\n");
+            }
+            shown++;
+            const uint32_t off = (uint32_t)(it->first & 0xffffffffu);
+            const BcSem &sm = it->second;
+            const uint64_t val = (uint64_t)sm.last;
+            const char *guess = "const";
+            char extra[160];
+            extra[0] = 0;
+            if (sm.kind == 6)
+            {
+                guess = "text";
+                bc_str_at(val, extra, sizeof extra);
+            }
+            else if (in_image(img, val))
+            {
+                uint64_t t = 0;
+                guess = (bc_read(val, &t, 8) && vtable_valid(img, t)) ? "object" : "data";
+            }
+            else if (sm.changes)
+            {
+                const uint32_t bits = (uint32_t)val;
+                float fl = 0.0f;
+                memcpy(&fl, &bits, 4);
+                guess = (fl == fl && (fl > 1e-3f || fl < -1e-3f) && fl < 1e4f && fl > -1e4f)
+                            ? "float"
+                            : "state";
+            }
+            if (strlen(extra) > 100)
+                extra[100] = 0;
+            fprintf(f, "| `0x%x` | %s | %u | %u | %lld | %lld | %s | `0x%llx` %s |\n", off,
+                    bc_kind_name(sm.kind), sm.reads, sm.changes, (long long)sm.imin,
+                    (long long)sm.imax, guess, (unsigned long long)val, extra);
+        }
+        if (shown)
+            fprintf(f, "\n");
+
+        uint32_t shownRefs = 0;
+        for (size_t r = 0; r < g_bc_ref.size(); r++)
+        {
+            if (g_bc_ref[r].ccls != id && g_bc_ref[r].pcls != id)
+                continue;
+            if (!shownRefs)
+                fprintf(f, "#### member refs\n\n| holder | offset | class |\n|--------|-------:|"
+                           "-------|\n");
+            shownRefs++;
+            char cl[192];
+            bc_label_of(img, g_bc_ref[r].ccls, cl, sizeof cl);
+            fprintf(f, "| %u | `0x%x` | %u %s |\n", g_bc_ref[r].pcls, g_bc_ref[r].off,
+                    g_bc_ref[r].ccls, cl);
+            if (shownRefs > 64)
+                break;
+        }
+        if (shownRefs)
+            fprintf(f, "\n");
+
+        uint32_t shownArr = 0;
+        for (size_t r = 0; r < g_bc_arr.size(); r++)
+        {
+            if (g_bc_arr[r].ccls != id && g_bc_arr[r].pcls != id)
+                continue;
+            if (!shownArr)
+                fprintf(f, "#### arrays\n\n| holder | offset | count | element class |\n"
+                           "|--------|-------:|------:|---------------|\n");
+            shownArr++;
+            char cl[192];
+            bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
+            fprintf(f, "| %u | `0x%x` | %u | %u %s |\n", g_bc_arr[r].pcls, g_bc_arr[r].off,
+                    g_bc_arr[r].n, g_bc_arr[r].ccls, cl);
+            if (shownArr > 64)
+                break;
+        }
+        if (shownArr)
+            fprintf(f, "\n");
+
+        uint32_t shownGlob = 0;
+        for (std::map<uint64_t, uint32_t>::iterator it = g_bc_cell.begin(); it != g_bc_cell.end();
+             ++it)
+        {
+            if (it->second != id)
+                continue;
+            if (!shownGlob)
+                fprintf(f, "#### global cells\n\n| cell rva |\n|---------:|\n");
+            shownGlob++;
+            fprintf(f, "| `0x%llx` |\n", (unsigned long long)it->first);
+        }
+        if (shownGlob)
+            fprintf(f, "\n");
+
+        uint32_t shownCode = 0;
+        for (size_t a = 0; a < g_bc_access.size(); a++)
+        {
+            if (g_bc_access[a].cls != id)
+                continue;
+            if (!shownCode)
+                fprintf(f, "#### code refs\n\n| rva |\n|----:|\n");
+            shownCode++;
+            fprintf(f, "| `0x%x` |\n", g_bc_access[a].rva);
+            if (shownCode > 64)
+                break;
+        }
+        if (shownCode)
+            fprintf(f, "\n");
+
+        char list[2048];
+        list[0] = 0;
+        uint32_t keys = 0;
+        uint32_t shownStr = 0;
+        for (std::map<uint64_t, BcSem>::iterator it = g_bc_sem.begin(); it != g_bc_sem.end() &&
+                                                                        shownStr < 8;
+             ++it)
+        {
+            if ((uint32_t)(it->first >> 32) != id || it->second.kind != 6)
+                continue;
+            char s[96];
+            bc_str_at((uint64_t)it->second.last, s, sizeof s);
+            if (strlen(s) < 6 || strchr(s, ' '))
+                continue;
+            shownStr++;
+            bc_list_add(list, sizeof list, s);
+            if (g_bc_data_names.find(s) != g_bc_data_names.end())
+                keys++;
+        }
+        for (uint32_t s = 0; s < nslots && shownStr < 10; s++)
+        {
+            char strs[3][96];
+            const uint32_t got = bc_strings_of(img, slots[s], strs, 3, 288);
+            for (uint32_t k = 0; k < got && shownStr < 10; k++)
+            {
+                shownStr++;
+                bc_list_add(list, sizeof list, strs[k]);
+                if (g_bc_data_names.find(strs[k]) != g_bc_data_names.end())
+                    keys++;
+            }
+        }
+        if (list[0])
+            fprintf(f, "#### strings\n\n- data keys `%u`: %s\n\n", keys, list);
+
+        uint32_t edges = 0;
+        for (uint32_t s = 0; s < nslots; s++)
+        {
+            uint32_t calls[16];
+            const uint32_t got = bc_calls_of(img, slots[s], calls, 16, 256);
+            for (uint32_t k = 0; k < got; k++)
+            {
+                std::map<uint32_t, uint32_t>::iterator ow = owner.find(calls[k]);
+                if (ow == owner.end() || ow->second == id)
+                    continue;
+                if (!edges)
+                    fprintf(f, "#### calls into other classes\n\n| from slot | to class |\n"
+                               "|----------:|----------|\n");
+                edges++;
+                fprintf(f, "| %u | %u %s |\n", s, ow->second,
+                        lbl.find(ow->second)->second.c_str());
+            }
+            if (edges > 32)
+                break;
+        }
+        if (edges)
+            fprintf(f, "\n");
+        fprintf(f, "| refs `%u` |\n\n", refs.count(id) ? refs[id] : 0);
     }
+
+    fprintf(f, "## root containers\n\n| offset | count | element class | class |\n"
+               "|-------:|------:|--------------:|-------|\n");
+    for (size_t r = 0; r < g_bc_arr.size(); r++)
+    {
+        if (g_bc_arr[r].pcls != kBcRootCls)
+            continue;
+        char cl[192];
+        bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
+        fprintf(f, "| `0x%x` | %u | %u | %s |\n", g_bc_arr[r].off, g_bc_arr[r].n,
+                g_bc_arr[r].ccls, cl);
+    }
+
+    fprintf(f, "\n## method tables of this binary\n\n");
+    rcl_targets_scan(img, f);
+
+    fclose(f);
+    RCL_LOGLN("[battle] everything written to %s", path);
 }
 
 static void bc_write_offsets(const Image &img)
@@ -3399,6 +2859,7 @@ static void bc_write_offsets(const Image &img)
     char root[900];
     snprintf(root, sizeof root, "%s/BattleDump", bc_dir());
     bc_mkdir_p(root);
+    bc_clean_old(root);
 
     std::vector<std::pair<uint32_t, uint64_t>> cls;
     bc_class_order(cls);
@@ -3464,85 +2925,8 @@ static void bc_write_offsets(const Image &img)
             known++;
     }
 
-    for (uint32_t kd = 0; kd <= NLK_KIND_MAX; kd++)
-    {
-        if (per_kind[kd])
-            bc_write_kind(img, kd, root, cls, kind_of, lbl);
-    }
-
-    char path[1200];
-    snprintf(path, sizeof path, "%s/root-containers.md", root);
-    FILE *f = fopen(path, "w");
-    if (f)
-    {
-        fprintf(f, "# root container, offsets into the root class\n\n");
-        fprintf(f, "| offset | count | element class | class |\n|---:|---:|---|---|\n");
-        for (size_t r = 0; r < g_bc_arr.size(); r++)
-        {
-            if (g_bc_arr[r].pcls != kBcRootCls)
-                continue;
-            char cl[192];
-            bc_label_of(img, g_bc_arr[r].ccls, cl, sizeof cl);
-            fprintf(f, "| `0x%x` | %u | %u | %s |\n", g_bc_arr[r].off, g_bc_arr[r].n,
-                    g_bc_arr[r].ccls, cl);
-        }
-        fclose(f);
-    }
-
-    snprintf(path, sizeof path, "%s/INDEX.md", root);
-    f = fopen(path, "w");
-    if (!f)
-        return;
-    fprintf(f, "# battle dump, one folder per class\n\n");
-    fprintf(f, "- image base `0x%llx`, vmsize `0x%llx`\n",
-            (unsigned long long)img.base,
-            (unsigned long long)(img.image_vmsize ? img.image_vmsize : img.vmsize));
-    bc_battle_line(f);
-    fprintf(f, "- state when this file was written `%u`, total polls `%llu`\n",
-            g_bc_state, (unsigned long long)g_bc_tick);
-    fprintf(f,
-            "- classes `%u`, objects `%u`, fields `%u`, method slots `%u`, code refs `%u`, "
-            "member refs `%u`, arrays `%u`, globals `%u`\n\n",
-            g_bc_classes, g_bc_objects, g_bc_fields, g_bc_accessors, (uint32_t)g_bc_access.size(),
-            (uint32_t)g_bc_ref.size(), (uint32_t)g_bc_arr.size(), (uint32_t)g_bc_cell.size());
-    fprintf(f, "known and unknown classes are split first, then by kind, then one folder per "
-               "class\n\n");
-    fprintf(f, "| kind | known | unknown | classes |\n|------|------:|--------:|--------:|\n");
-    for (uint32_t kd = 0; kd <= NLK_KIND_MAX; kd++)
-        fprintf(f, "| `%s` | %u | %u | %u |\n", nl_kind_name(kd), per_split[kd][0],
-                per_split[kd][1], per_kind[kd]);
-    fprintf(f, "| **total** | **%u** | **%u** | **%zu** |\n\n", known,
-            (uint32_t)cls.size() - known, cls.size());
-    fprintf(f, "`type` is `name` for an entry named as a class, `string` when the word only "
-               "pointed at a string, `vt` when nothing named it.  The whole dump is also in "
-               "`BattleDumpAll.md`.\n\n");
-    fprintf(f, "`source` says which pass produced the name, see `Resolve.md`.\n\n");
-    fprintf(f, "| class id | kind | state | type | source | search key | folder | label |\n");
-    fprintf(f, "|---------:|------|-------|------|--------|------------|--------|-------|\n");
-    for (size_t c = 0; c < cls.size(); c++)
-    {
-        const uint32_t id = cls[c].first;
-        const std::string &lb = lbl.find(id)->second;
-        char cdir[900];
-        bc_class_dir(cdir, sizeof cdir, root, kind_of[id], bc_vt_of(id) - img.base, lb.c_str());
-        std::map<uint32_t, int>::const_iterator si = src_of.find(id);
-        fprintf(f, "| %u | `%s` | %s | %s | %s | `%s` | `%s` | %s |\n", id,
-                nl_kind_name(kind_of[id]), bc_class_known(lb.c_str()) ? "known" : "unknown",
-                bc_type_name(lb.c_str()),
-                bc_src_name(si == src_of.end() ? -1 : si->second), bc_search_key(lb.c_str()), cdir,
-                lb.c_str());
-    }
-    fclose(f);
-    bc_write_all(img, root, cls, kind_of, lbl);
-    bc_write_classes(img, root, cls, kind_of, lbl);
-    bc_write_fields(img, root, cls, lbl);
-    bc_write_anchors(img, root, cls, lbl);
-    bc_write_globals(img, root, cls, lbl);
-    bc_write_callgraph(img, root, cls, lbl);
-    rcl_targets_scan(img);
-    bc_write_resolve(img, root, cls, kind_of, lbl);
+    bc_write_one(img, root, cls, kind_of, lbl, src_of);
     bc_db_store(img, root, cls, lbl);
-    RCL_LOGLN("[battle] battle dump: %zu classes (%u known) in %s", cls.size(), known, root);
 }
 
 void bc_close(void)
