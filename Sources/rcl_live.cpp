@@ -967,53 +967,116 @@ void bc_close(void) {
     g_bc_active = false;
 }
 
-void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint64_t arr, uint32_t n) {
-    bool inBattle = false;
+struct BcPos
+{
+    uint64_t obj;
+    uint32_t off;
+    int32_t x;
+    int32_t y;
+    int valid;
+};
+
+BcPos g_bc_prev[160];
+
+void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint64_t arr, uint32_t n)
+{
+    BcPos next[160];
+    uint32_t nextN = 0;
+    uint32_t i = 0;
+    uint32_t j = 0;
+    int inBattle = 0;
+    uint32_t coordObjs = 0;
+    uint32_t moved = 0;
+    uint32_t maxInst = 0;
     bc_open_file();
     if (!g_bc_f) return;
     {
-        uint64_t seen[8];
-        uint32_t seenN = 0;
-        uint32_t distinct = 0;
-        uint32_t coordObjs = 0;
-        uint32_t i = 0;
+        uint64_t cls[32];
+        uint32_t inst[32];
+        uint32_t clsN = 0;
+        for (i = 0; i < n && i < 128; i++) {
+            uint64_t obj = 0;
+            uint64_t vt = 0;
+            uint32_t c = 0;
+            int hit = 0;
+            if (!bc_read(arr + (uint64_t)i * 8, &obj, 8) || !obj) continue;
+            if (!bc_read(obj, &vt, 8) || !vt) continue;
+            for (c = 0; c < clsN; c++) {
+                if (cls[c] == vt) {
+                    inst[c]++;
+                    hit = 1;
+                    break;
+                }
+            }
+            if (!hit && clsN < 32) {
+                cls[clsN] = vt;
+                inst[clsN] = 1;
+                clsN++;
+            }
+        }
         for (i = 0; i < n && i < 128; i++) {
             uint64_t obj = 0;
             uint64_t vt = 0;
             uint64_t words[64];
+            uint32_t off = 0;
+            uint32_t c = 0;
+            uint32_t instHere = 0;
+            int32_t px = 0;
+            int32_t py = 0;
+            int found = 0;
             uint32_t k = 0;
-            int dup = 0;
-            int hasCoord = 0;
             if (!bc_read(arr + (uint64_t)i * 8, &obj, 8) || !obj) continue;
             if (!bc_read(obj, &vt, 8) || !vt) continue;
-            if (bc_read(obj, words, sizeof words)) {
-                for (k = 0; k < 64; k++) {
-                    uint32_t lo = (uint32_t)words[k];
-                    uint32_t hi = (uint32_t)(words[k] >> 32);
-                    if (lo >= 200u && lo <= 40000u && hi >= 200u && hi <= 40000u) {
-                        hasCoord = 1;
-                        break;
-                    }
-                }
-            }
-            if (hasCoord) coordObjs++;
-            for (k = 0; k < seenN; k++) {
-                if (seen[k] == vt) {
-                    dup = 1;
+            if (!bc_read(obj, words, sizeof words)) continue;
+            for (c = 0; c < clsN; c++) {
+                if (cls[c] == vt) {
+                    instHere = inst[c];
                     break;
                 }
             }
-            if (!dup && seenN < 8) seen[seenN++] = vt;
+            for (k = 0; k < 64; k++) {
+                uint32_t lo = (uint32_t)words[k];
+                uint32_t hi = (uint32_t)(words[k] >> 32);
+                if (lo >= 200u && lo <= 40000u && hi >= 200u && hi <= 40000u) {
+                    off = k * 8;
+                    px = (int32_t)lo;
+                    py = (int32_t)hi;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) continue;
+            coordObjs++;
+            if (instHere > maxInst) maxInst = instHere;
+            if (nextN < 160) {
+                next[nextN].obj = obj;
+                next[nextN].off = off;
+                next[nextN].x = px;
+                next[nextN].y = py;
+                next[nextN].valid = 1;
+                nextN++;
+            }
+            for (j = 0; j < 160; j++) {
+                int32_t dx = 0;
+                int32_t dy = 0;
+                if (!g_bc_prev[j].valid || g_bc_prev[j].obj != obj || g_bc_prev[j].off != off) continue;
+                dx = px - g_bc_prev[j].x;
+                dy = py - g_bc_prev[j].y;
+                if (dx < 0) dx = -dx;
+                if (dy < 0) dy = -dy;
+                if ((dx + dy) > 6 && instHere >= 2 && instHere <= 24) moved++;
+                break;
+            }
         }
-        distinct = seenN;
-        inBattle = (coordObjs >= 2);
+    }
+    for (i = 0; i < 160; i++) g_bc_prev[i] = i < nextN ? next[i] : BcPos{0, 0, 0, 0, 0};
+    inBattle = (moved >= 2);
     g_bc_last_n = n;
-        if ((g_bc_tick % 10) == 0) {
-            fprintf(g_bc_f, "poll %llu state=%u cur=0x%llx mgr=0x%llx n=%u vt=%u coord=%u live=%d classes=%u fields=%u\n",
-                    (unsigned long long)g_bc_tick, state, (unsigned long long)cur, (unsigned long long)mgr, n, distinct, coordObjs,
-                    inBattle ? 1 : 0, g_bc_classes, g_bc_fields);
-            fflush(g_bc_f);
-        }
+    if ((g_bc_tick % 10) == 0) {
+        fprintf(g_bc_f, "poll %llu state=%u n=%u coord=%u moved=%u inst=%u live=%d classes=%u fields=%u\n",
+                (unsigned long long)g_bc_tick, state, n, coordObjs, moved, maxInst, inBattle ? 1 : 0, g_bc_classes,
+                g_bc_fields);
+        fflush(g_bc_f);
     }
     if (inBattle) {
         if (!g_bc_active) {
@@ -1023,11 +1086,11 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
         g_bc_quiet = 0;
     } else if (g_bc_active) {
         g_bc_quiet++;
-        if (g_bc_quiet >= 10) bc_close();
+        if (g_bc_quiet >= 50) bc_close();
     }
     if (!g_bc_active) return;
     g_bc_tick++;
-    for (uint32_t i = 0; i < n && i < 256; i++) {
+    for (i = 0; i < n && i < 256; i++) {
         uint64_t obj = 0;
         uint64_t vt = 0;
         uint64_t words[64];
@@ -1081,6 +1144,7 @@ void bc_poll(const Image &img, uint32_t state, uint64_t cur, uint64_t mgr, uint6
     }
     if ((g_bc_tick % 10) == 0) fflush(g_bc_f);
 }
+
 
 void battle_capture_open(void)
 {
