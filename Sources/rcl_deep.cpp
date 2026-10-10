@@ -534,8 +534,8 @@ void objc_dump_methods(const Image &img, const MachInsight &mi, FILE *f, uint64_
     uint32_t ef = 0, cnt = 0;
     if (!d_rd32(img, ml, ef) || !d_rd32(img, ml + 4, cnt)) return;
     if (!cnt || cnt > 4096) return;
-    const bool rel = (ef & 0x3u) == 0x3u;
-    uint32_t esz = ef & ~0x3u;
+    const bool rel = (ef & 0x3u) == 0x3u || (ef & 0x80000000u) != 0;
+    uint32_t esz = ef & 0x7ffffffcu;
     if (esz < 8 || esz > 64) esz = rel ? 12u : 24u;
     for (uint32_t i = 0; i < cnt; i++) {
         const uint64_t ent = ml + 8 + (uint64_t)i * esz;
@@ -551,7 +551,13 @@ void objc_dump_methods(const Image &img, const MachInsight &mi, FILE *f, uint64_
         }
         if (!va_inside_image(mi, nva)) continue;
         std::string sel;
-        if (!d_cstr(img, nva, sel)) continue;
+        if (!d_cstr(img, nva, sel) || sel.empty()) {
+            if (!rel) continue;
+            bool ok3 = false;
+            uint64_t cell = img_slot(img, mi, nva, &ok3);
+            if (!ok3 || !va_inside_image(mi, cell)) continue;
+            if (!d_cstr(img, cell, sel) || sel.empty()) continue;
+        }
         counted++;
         if (counted <= cap)
             fprintf(f, "| `%#x` | `+%u` | %s |\n", (uint32_t)(ent - img.base), i * esz, sel.c_str());
