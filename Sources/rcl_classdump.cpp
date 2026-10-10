@@ -2782,6 +2782,8 @@ void shape_name_for(const Image &img, uint32_t rva, char *out, size_t cap) {
     snprintf(out, cap, "-");
 }
 
+static void vote_strings_in_fn(const Image &img, uint32_t rva, uint32_t trva);
+
 static uint32_t symbolize_with(const Image &img, const Layout &L,
                                const std::vector<ClassTable> &tables) {
     uint32_t added = 0;
@@ -2792,33 +2794,40 @@ static uint32_t symbolize_with(const Image &img, const Layout &L,
         uint64_t s = L.data[di].start, e = L.data[di].end;
         if (e <= s) continue;
         for (uint64_t va = (s + 7) & ~7ULL; va + 16 <= e; va += 8) {
-            uint64_t q0 = 0, q1 = 0;
-            if (!at(img, va, &q0, 8) || !at(img, va + 8, &q1, 8)) break;
-            uint32_t r0 = sym_slot_rva(img, q0), r1 = sym_slot_rva(img, q1);
-            if (!r0 || !r1) continue;
-            uint32_t trva = 0, srva = 0;
-            if (tset.count(r0) && !tset.count(r1)) {
-                trva = r0;
-                srva = r1;
-            } else if (tset.count(r1) && !tset.count(r0)) {
-                trva = r1;
-                srva = r0;
-            } else {
-                continue;
+            uint64_t q0 = 0;
+            if (!at(img, va, &q0, 8)) break;
+            const uint32_t r0 = sym_slot_rva(img, q0);
+            if (!r0) continue;
+            for (uint64_t st = 8; st <= 40; st += 8) {
+                uint64_t q1 = 0;
+                if (va + st + 8 > e) break;
+                if (!at(img, va + st, &q1, 8)) break;
+                const uint32_t r1 = sym_slot_rva(img, q1);
+                if (!r1) continue;
+                uint32_t trva = 0, srva = 0;
+                if (tset.count(r0) && !tset.count(r1)) {
+                    trva = r0;
+                    srva = r1;
+                } else if (tset.count(r1) && !tset.count(r0)) {
+                    trva = r1;
+                    srva = r0;
+                } else {
+                    continue;
+                }
+                if (name_of_table(trva)) continue;
+                char buf[96];
+                if (!at(img, img.base + srva, buf, sizeof buf - 1)) continue;
+                buf[sizeof buf - 1] = 0;
+                size_t ln = strnlen(buf, sizeof buf - 1);
+                if (!sym_ident(buf, ln)) continue;
+                g_table_class[trva] = std::string(buf, ln);
+                g_table_src[trva] = "registry";
+                added++;
             }
-            if (name_of_table(trva)) continue;
-            char buf[96];
-            if (!at(img, img.base + srva, buf, sizeof buf - 1)) continue;
-            buf[sizeof buf - 1] = 0;
-            size_t ln = strnlen(buf, sizeof buf - 1);
-            if (!sym_ident(buf, ln)) continue;
-            g_table_class[trva] = std::string(buf, ln);
-            g_table_src[trva] = "registry";
-            added++;
         }
     }
 
-    {
+    for (int hpass = 0; hpass < 3; hpass++) {
         std::map<std::string, std::vector<size_t> > groups;
         for (size_t i = 0; i < tables.size(); i++) {
             if (tables[i].slots < 4) continue;
@@ -2931,15 +2940,96 @@ static uint32_t symbolize_with(const Image &img, const Layout &L,
                     g_table_class[trva] = std::string(buf, ln);
                     g_table_src[trva] = "register";
                     added++;
-                    age_tbl[b] = 99;
-                }
+                     age_tbl[b] = 99;
+                 }
+             }
+         }
+     }
+
+    for (size_t i = 0; i < tables.size(); i++) {
+        if (name_of_table(tables[i].start)) continue;
+        for (uint32_t s = 0; s < tables[i].slots; s++) {
+            const uint32_t frva = table_slot_rva(img, tables[i], s);
+            if (!frva) continue;
+            vote_strings_in_fn(img, frva, tables[i].start);
+        }
+    }
+
+    {
+        char pn[160];
+        pn[0] = 0;
+        for (size_t i = 0; i < tables.size(); i++) {
+            const char *c = name_of_table(tables[i].start);
+            if (c) {
+                snprintf(pn, sizeof pn, "%s", c);
+                continue;
             }
+            if (family_of_table(tables[i].start)) continue;
+            if (!pn[0]) continue;
+            char nm[224];
+            snprintf(nm, sizeof nm, "%s_sub_%x", pn, tables[i].start);
+            g_table_class[tables[i].start] = std::string(nm);
+            g_table_src[tables[i].start] = "neighbour";
+            added++;
         }
     }
     return added;
 }
 
 static std::map<uint32_t, std::map<std::string, uint32_t> > g_heap_votes;
+static std::set<std::string> g_vocab;
+
+void rcl_symbol_vocab_add(const char *token) {
+    if (!token || !*token) return;
+    if (!sym_ident(token, strlen(token))) return;
+    g_vocab.insert(std::string(token));
+}
+
+static void vote_strings_in_fn(const Image &img, uint32_t rva, uint32_t trva) {
+    uint64_t adrp[32];
+    for (int r = 0; r < 32; r++) adrp[r] = 0;
+    for (uint32_t i = 0; i < 256; i++) {
+        const uint64_t pc = img.base + rva + (uint64_t)i * 4;
+        const uint32_t w = sym_insn(img, pc);
+        if (!w) break;
+        if ((w & 0x9F000000u) == 0x90000000u) {
+            const int rd = w & 31;
+            int64_t off = (int64_t)((((w >> 5) & 0x7FFFFu) << 2) | ((w >> 29) & 3u));
+            off = (off << 43) >> 43;
+            adrp[rd] = (pc & ~0xFFFULL) + ((uint64_t)off << 12);
+            continue;
+        }
+        if ((w & 0xFF800000u) != 0x91000000u) continue;
+        const int rd = w & 31, rn = (w >> 5) & 31;
+        uint32_t imm = (w >> 10) & 0xFFFu;
+        if ((w >> 22) & 3u) imm <<= 12;
+        if (!adrp[rn]) continue;
+        const uint64_t t = adrp[rn] + imm;
+        if (t < img.base || t - img.base >= img.image_vmsize) continue;
+        char buf[64];
+        size_t k = 0;
+        for (; k + 1 < sizeof buf; k++) {
+            char c = 0;
+            if (!at(img, t + k, &c, 1) || !c) break;
+            buf[k] = c;
+        }
+        if (k < 6 || k > 40) continue;
+        buf[k] = 0;
+        if (buf[0] < 'A' || buf[0] > 'Z') continue;
+        bool ok2 = true;
+        for (size_t z = 0; z < k; z++) {
+            const char c = buf[z];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                c == '_')
+                continue;
+            ok2 = false;
+            break;
+        }
+        if (!ok2) continue;
+        rcl_symbol_vote(trva, buf, "method");
+        (void)rd;
+    }
+}
 
 void rcl_symbol_vote(uint32_t table_rva, const char *name, const char *source) {
     (void)source;
@@ -2965,6 +3055,16 @@ static uint32_t apply_heap_votes() {
         g_table_class[it->first] = *best;
         g_table_src[it->first] = "asset";
         added++;
+    }
+    if (!g_vocab.empty()) {
+        for (std::map<uint32_t, std::string>::iterator it = g_table_family.begin();
+             it != g_table_family.end(); ++it) {
+            if (name_of_table(it->first)) continue;
+            if (!g_vocab.count(it->second)) continue;
+            g_table_class[it->first] = it->second;
+            g_table_src[it->first] = "asset";
+            added++;
+        }
     }
     return added;
 }

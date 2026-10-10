@@ -1665,7 +1665,7 @@ void deep_heap(const Image &img, const MachInsight &mi, const FnStarts &fs, cons
             hits[(uint32_t)(v - img.base)]++;
             {
                 const uint32_t trva = (uint32_t)(v - img.base);
-                uint64_t fld[32];
+                uint64_t fld[64];
                 unsigned long long got2 = 0;
                 if (mach_vm_read_overwrite(mach_task_self_, addr + off, sizeof fld,
                                            (unsigned long long)fld, &got2) == 0 &&
@@ -1676,6 +1676,19 @@ void deep_heap(const Image &img, const MachInsight &mi, const FnStarts &fs, cons
                         if (q < img.base || q - img.base >= img.image_vmsize) continue;
                         std::string s;
                         if (!d_cstr(img, q, s)) continue;
+                        {
+                            const size_t dot = s.rfind('.');
+                            if (dot != std::string::npos && dot > 0 &&
+                                (s.compare(dot, 4, ".csv") == 0 || s.compare(dot, 3, ".sc") == 0)) {
+                                std::string b = s.substr(0, dot);
+                                const size_t sl = b.find_last_of("/\\");
+                                if (sl != std::string::npos) b = b.substr(sl + 1);
+                                if (!b.empty() && b[0] >= 'a' && b[0] <= 'z')
+                                    b[0] = (char)(b[0] - 32);
+                                rcl_symbol_vocab_add(b.c_str());
+                                continue;
+                            }
+                        }
                         if (s.size() < 6 || s.size() > 48) continue;
                         if (s[0] < 'A' || s[0] > 'Z') continue;
                         bool idok = true;
@@ -1689,6 +1702,7 @@ void deep_heap(const Image &img, const MachInsight &mi, const FnStarts &fs, cons
                         }
                         if (!idok) continue;
                         rcl_symbol_vote(trva, s.c_str(), "asset");
+                        rcl_symbol_vocab_add(s.c_str());
                     }
                 }
             }

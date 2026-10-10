@@ -45,6 +45,7 @@ void write_all_bundle();
 void write_symbols(const Image &img, const std::vector<ClassTable> &tables, const char *root);
 uint32_t symbolize_tables(const Image &img, const std::vector<ClassTable> &tables);
 void rcl_symbol_vote(uint32_t table_rva, const char *name, const char *source);
+void rcl_symbol_vocab_add(const char *token);
 void set_skip_bundle(bool skip);
 const char *dumps_root();
 void live_docs_note(const Image &img, uint32_t state, int tick);
