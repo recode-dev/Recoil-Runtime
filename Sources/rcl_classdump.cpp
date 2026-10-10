@@ -3018,10 +3018,19 @@ static uint32_t table_entries(const Image &img, uint32_t start, uint32_t slots, 
     return n;
 }
 
+static uint32_t g_targets_resolved = 0;
+
+uint32_t rcl_targets_hits(void)
+{
+    return g_targets_resolved;
+}
+
 uint32_t rcl_targets_scan(const Image &img)
 {
-    if (!img.ok())
+    if (!img.base || !img.read)
         return 0;
+    RCL_LOGLN("[targets] scan start, base=%#llx vmsize=%#llx root=%s", (unsigned long long)img.base,
+              (unsigned long long)img.image_vmsize, dumps_root());
     std::vector<ClassTable> tables = scan_class_tables(img, nullptr);
     std::map<uint32_t, std::string> method_sig;
     std::map<std::string, uint32_t> method_rva;
@@ -3140,7 +3149,10 @@ uint32_t rcl_targets_scan(const Image &img)
         snprintf(tpath, sizeof tpath, "%s/../targets.txt", dumps_root());
     FILE *tin = fopen(tpath, "r");
     if (!tin)
+    {
+        RCL_LOGLN("[targets] no wanted list at %s, methods.md only", tpath);
         return (uint32_t)method_sig.size();
+    }
 
     snprintf(path, sizeof path, "%s/targets.md", dumps_root());
     f = fopen(path, "w");
@@ -3217,6 +3229,7 @@ uint32_t rcl_targets_scan(const Image &img)
     for (size_t i = 0; i < pending.size(); i++)
         fprintf(f, "- unresolved `%s`\n", pending[i].c_str());
     fclose(f);
+    g_targets_resolved = done;
     RCL_LOGLN("[targets] %u targets, %u resolved, %u class only, %zu unresolved -> %s", total, done,
               cls_only, pending.size(), path);
     return done;

@@ -1909,6 +1909,34 @@ static void bc_collect(const Image &img, uint64_t cur, uint64_t mgr, uint64_t ar
         bc_walk(img, players, depth, nodes);
 }
 
+static uint32_t bc_thunk_rva(const Image &img, uint32_t rva)
+{
+    uint32_t w = 0;
+    if (!bc_read(img.base + rva, &w, 4))
+        return 0;
+    if ((w & 0xfc000000u) != 0x14000000u)
+        return 0;
+    int32_t imm = (int32_t)(w & 0x03ffffffu);
+    if (imm & 0x02000000)
+        imm |= 0xfc000000;
+    const int64_t t = (int64_t)rva + (int64_t)imm * 4;
+    if (t <= 0 || (uint64_t)t >= img.image_vmsize)
+        return 0;
+    return (uint32_t)t;
+}
+
+static const char *bc_method_name(const Image &img, uint32_t rva)
+{
+    const char *nm = name_for_rva(rva);
+    if (nm && *nm && strcmp(nm, "-") != 0)
+        return nm;
+    const uint32_t th = bc_thunk_rva(img, rva);
+    if (!th)
+        return nm;
+    const char *tn = name_for_rva(th);
+    return (tn && *tn) ? tn : nm;
+}
+
 static uint32_t kind_lookup(const std::map<uint32_t, uint32_t> &m, uint32_t id)
 {
     std::map<uint32_t, uint32_t>::const_iterator it = m.find(id);
@@ -2518,7 +2546,7 @@ static void bc_db_store(const Image &img, const char *root,
         const uint32_t n = bc_slot_rvas(img, cls[c].second, slots, 96);
         for (uint32_t s = 0; s < n; s++)
         {
-            const char *mn = name_for_rva(slots[s]);
+            const char *mn = bc_method_name(img, slots[s]);
             const std::string nm =
                 (mn && strcmp(mn, "-") != 0) ? std::string(mn) : lb;
             for (int nrm = 0; nrm < 2; nrm++)
@@ -2967,6 +2995,7 @@ static void bc_write_resolve(const Image &img, const char *root,
     fprintf(f, "| string window | %u |\n", hits[NL_STRINGS]);
     fprintf(f, "| method name prefix | %u |\n", hits[NL_METHOD_NAMES]);
     fprintf(f, "| class table of the deep dump | %u |\n", hits[NL_INSTANCE]);
+    fprintf(f, "- wanted list: `%u` offsets resolved against this binary\n", rcl_targets_hits());
     fprintf(f, "\n## learning\n\n");
     fprintf(f, "- function db entries loaded `%zu`, new this run `%u`\n", g_bc_sigdb.size(),
             g_bc_sigdb_new);
@@ -3135,7 +3164,7 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
             for (uint32_t s = 0; s < nm; s++)
             {
                 const uint32_t rva = (uint32_t)(rvas[s] - img.base);
-                const char *name = name_for_rva(rva);
+                const char *name = bc_method_name(img, rva);
                 fprintf(f, "method\t%u\t%s\t%u\t\t\t0x%llx\t%s\n", id, label, s,
                         (unsigned long long)rva, (name && strcmp(name, "-") != 0) ? name : "");
             }
@@ -3229,7 +3258,7 @@ static void bc_write_kind(const Image &img, uint32_t kd, const char *root,
                 for (uint32_t s = 0; s < nm; s++)
                 {
                     const uint32_t rva = (uint32_t)(rvas[s] - img.base);
-                    const char *name = name_for_rva(rva);
+                    const char *name = bc_method_name(img, rva);
                     fprintf(f, "| %u | `0x%x` | %s |\n", s, rva,
                             (name && strcmp(name, "-") != 0) ? name : "-");
                 }
@@ -3510,6 +3539,7 @@ static void bc_write_offsets(const Image &img)
     bc_write_anchors(img, root, cls, lbl);
     bc_write_globals(img, root, cls, lbl);
     bc_write_callgraph(img, root, cls, lbl);
+    rcl_targets_scan(img);
     bc_write_resolve(img, root, cls, kind_of, lbl);
     bc_db_store(img, root, cls, lbl);
     RCL_LOGLN("[battle] battle dump: %zu classes (%u known) in %s", cls.size(), known, root);
