@@ -33,7 +33,7 @@ const uint32_t kSigDfMax = 3;
 const uint32_t kSigMinLen = 4;
 const uint32_t kWindow = 160;
 const uint32_t kMaxSlots = 64;
-const uint32_t kMinMethodVotes = 2;
+const uint32_t kMinMethodVotes = 1;
 const uint32_t kMinStringHits = 1;
 
 bool read_va(uint64_t va, void *dst, size_t n)
@@ -496,17 +496,6 @@ const char *nl_label(uint32_t vt, const uint32_t *slots, uint32_t nslots, char *
         scan_window(g_base + (uint64_t)slots[i], refs);
         score_strings(refs, by_string);
     }
-    std::map<uint32_t, std::string>::const_iterator as = g_asset.find(vt);
-    if (as != g_asset.end())
-    {
-        snprintf(buf, cap, "%s", as->second.c_str());
-        g_hits[NL_ASSET]++;
-        if (src)
-        {
-            *src = NL_ASSET;
-        }
-        return buf;
-    }
 
     if (best_of(by_string, kMinStringHits, best))
     {
@@ -542,6 +531,18 @@ const char *nl_label(uint32_t vt, const uint32_t *slots, uint32_t nslots, char *
         if (src)
         {
             *src = NL_METHOD_NAMES;
+        }
+        return buf;
+    }
+
+    std::map<uint32_t, std::string>::const_iterator as = g_asset.find(vt);
+    if (as != g_asset.end())
+    {
+        snprintf(buf, cap, "%s", as->second.c_str());
+        g_hits[NL_ASSET]++;
+        if (src)
+        {
+            *src = NL_ASSET;
         }
         return buf;
     }
