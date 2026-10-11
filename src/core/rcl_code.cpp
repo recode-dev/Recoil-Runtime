@@ -289,6 +289,86 @@ static bool cstr_range(const Image &img, uint64_t &va, uint64_t &size)
     return false;
 }
 
+void code_profile(const Image &img, uint64_t rva, std::string &out)
+{
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    uint64_t va = 0;
+    uint64_t page = 0;
+    int have_page = 0;
+    char buf[128];
+    int n = 0;
+    if (!code_text_range(img, lo, hi))
+        return;
+    va = img.base + rva;
+    if (va < lo || va >= hi)
+        return;
+    for (n = 0; n < 400 && va < hi; n++, va += 4)
+    {
+        uint32_t w = 0;
+        uint32_t rn = 0;
+        uint32_t rt = 0;
+        int64_t off = 0;
+        if (!img.u32(va, w))
+            return;
+        if (n && w == Ret)
+        {
+            snprintf(buf, sizeof buf, "- ret\n");
+            out += buf;
+            return;
+        }
+        if (n && is_prologue(w))
+        {
+            snprintf(buf, sizeof buf, "- next fn 0x%llx\n", (unsigned long long)(va - img.base));
+            out += buf;
+            return;
+        }
+        if (is_adrp(w))
+        {
+            page = adrp_page(va, w);
+            have_page = 1;
+            continue;
+        }
+        if (have_page && (w & 0x7F800000u) == 0x11000000u)
+        {
+            snprintf(buf, sizeof buf, "- adr add 0x%llx\n",
+                     (unsigned long long)(page + ((w >> 10) & 0xFFFu)));
+            out += buf;
+            have_page = 0;
+            continue;
+        }
+        if ((w & 0xFC000000u) == 0x94000000u)
+        {
+            int64_t imm = (int64_t)(w & 0x3FFFFFFu);
+            if (imm & 0x2000000)
+                imm -= 0x4000000;
+            snprintf(buf, sizeof buf, "- bl 0x%llx\n",
+                     (unsigned long long)((va + (uint64_t)(imm << 2)) - img.base));
+            out += buf;
+            have_page = 0;
+            continue;
+        }
+        if (load_off(w, rn, rt, off))
+        {
+            if (rn <= 31 && rn >= 1 && off >= 0 && off <= 0x4000)
+            {
+                snprintf(buf, sizeof buf, "- mem x%u %s 0x%llx\n", rn,
+                         ((w & 0x00C00000u) == 0x00400000u ||
+                          (w & 0xFFE00000u) == StUr || (w & 0xFFFFFC00u) == 0xF8000000u)
+                             ? "st"
+                             : "ld",
+                         (unsigned long long)off);
+                out += buf;
+            }
+            have_page = 0;
+            continue;
+        }
+        have_page = 0;
+    }
+    snprintf(buf, sizeof buf, "- cut at 0x%llx\n", (unsigned long long)(va - img.base));
+    out += buf;
+}
+
 void code_resolve(const Image &img, const Seeds &s, Found &f, size_t &by_str, size_t &by_sing)
 {
     static bool str_done = false;

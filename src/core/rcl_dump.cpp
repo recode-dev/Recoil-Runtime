@@ -1,6 +1,7 @@
 #include "rcl_dump.h"
 
 #include "rcl_find.h"
+#include "rcl_syms.h"
 #include "rcl_log.h"
 #include "../utils/rcl_out.h"
 
@@ -58,6 +59,18 @@ void dump_targets(const Image &img, const Seeds &s)
         const Found &f = fr.items[i];
         t += out_fmt("| `%s` | `0x%llx` | %u | %s | %s |\n", f.key, (unsigned long long)f.value,
                      (unsigned)f.kind, f.src, f.info.empty() ? "-" : f.info.c_str());
+    }
+    t += "\n## anchor profiles\n\n";
+    for (i = 0; i < fr.items.size(); i++)
+    {
+        const Found &p = fr.items[i];
+        if (p.value <= 0x1000 || (strcmp(p.src, "rva+") && strcmp(p.src, "str")))
+            continue;
+        t += out_fmt("### %s `0x%llx`\n\n", p.key, (unsigned long long)p.value);
+        std::string prof;
+        code_profile(img, p.value, prof);
+        t += prof;
+        t += "\n";
     }
     out_write_root("map-all", t);
     RCL_LOGLN("[dump] targets sym %zu field %zu unresolved %zu", fr.by_sym, fr.by_field, fr.missing);

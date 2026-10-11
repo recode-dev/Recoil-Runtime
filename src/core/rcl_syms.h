@@ -29,6 +29,7 @@ uint64_t code_str_lookup(const Image &img, uint64_t cstr_va, uint64_t cstr_size,
 void code_str_refs(const Image &img, uint64_t cstr_va, uint64_t cstr_size,
                    std::map<uint64_t, std::vector<uint64_t>> &out);
 void code_singletons(const Image &img, std::vector<uint64_t> &out);
+void code_profile(const Image &img, uint64_t rva, std::string &out);
 void code_resolve(const Image &img, const Seeds &s, Found &f, size_t &by_str, size_t &by_sing);
 
 } // namespace rcl
