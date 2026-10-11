@@ -1,8 +1,5 @@
 #include "rcl_report.h"
 #include "rcl_log.h"
-#include "rcl_classdump.h"
-#include "rcl_docgen.h"
-#include "rcl_hook.h"
 #include <stdlib.h>
 #include <map>
 #include <set>
@@ -74,49 +71,6 @@ static void dump_own_char_flags(const Image &img, const Seeds &s)
         RCL_LOGLN("   +0x%04x", o);
 }
 
-static void dump_class_columns(const Image &img, const Seeds &s)
-{
-    const std::vector<ClassBoundary> bounds = discover_class_boundaries(img);
-    std::vector<ClassColumns> cls = scan_class_columns(img, s, bounds);
-    size_t total = 0, mism = 0, unresolved_classes = 0;
-    for (auto &c : cls)
-        total += c.items.size();
-    RCL_LOGLN("[class columns] classes=%zu  columns=%zu  (all columns of every data class, live)",
-              cls.size(), total);
-    for (auto &c : cls)
-    {
-        bool all_zero = !c.items.empty();
-        for (auto &it : c.items)
-            if (it.id)
-                all_zero = false;
-        if (c.items.size() != c.cols)
-            mism++;
-        if (all_zero)
-            unresolved_classes++;
-        const char *nm = c.name ? c.name : "?";
-        RCL_LOGLN("  %-30s loader=0x%06x  cols=%3zu/%u%s%s", nm, c.start, c.items.size(), c.cols,
-                  c.items.size() == c.cols ? "" : "  MISMATCH",
-                  all_zero ? "  ids not resolved yet" : "");
-        RCL_LOG("     ");
-        int n = 0;
-        for (auto &it : c.items)
-        {
-            if (it.id == 0xFFFFFFFFu)
-                RCL_LOG("%s%s=?", n ? " " : "", it.name.c_str());
-            else
-                RCL_LOG("%s%s=%u", n ? " " : "", it.name.c_str(), it.id);
-            if (++n % 8 == 0)
-            {
-                RCL_LOGLN("");
-                RCL_LOG("     ");
-            }
-        }
-        RCL_LOGLN("");
-    }
-    if (mism || unresolved_classes)
-        RCL_LOGLN("[class columns] mismatched=%zu  not-yet-resolved=%zu", mism, unresolved_classes);
-}
-
 void report_run(const Image &img, const Seeds &s)
 {
     RCL_LOGLN("== Recoil-Runtime offset search ==");
@@ -134,24 +88,6 @@ void report_run(const Image &img, const Seeds &s)
     dump_column_names(img, cols);
     RCL_LOGLN("");
     dump_own_char_flags(img, s);
-    RCL_LOGLN("");
-    dump_class_tree(img);
-    RCL_LOGLN("");
-    {
-        const char *e = getenv("RCL_CLASS_COLUMNS");
-        if (!e || *e != '0')
-            dump_class_columns(img, s);
-        RCL_LOGLN("");
-    }
-    ScanStats ss;
-    std::vector<ClassTable> tb = scan_class_tables(img, &ss);
-    symbolize_tables(img, tb);
-    runtime_trace_install(img, tb);
-    write_class_docs(img);
-    RCL_LOGLN("");
-    write_symbols(img, tb, dumps_root());
-    RCL_LOGLN("");
-    write_all_bundle();
     RCL_LOGLN("");
     RCL_LOGLN("== end ==");
 }
