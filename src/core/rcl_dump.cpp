@@ -34,14 +34,6 @@ static const MissHint kMiss[] = {
     {"SkillCommandTypeTable", 0, 3},
 };
 
-static uint64_t seed_of(const char *key)
-{
-    for (size_t i = 0; i < kTargetCount; i++)
-        if (std::string(kTargets[i].key) == key)
-            return kTargets[i].seed;
-    return 0;
-}
-
 void dump_index(const Image &img)
 {
     std::string t = "# Recoil-Runtime dump\n\n";
