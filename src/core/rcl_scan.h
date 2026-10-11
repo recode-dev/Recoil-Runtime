@@ -23,6 +23,8 @@ struct Image
     void *ctx = nullptr;
 
     bool (*read)(void *ctx, uint64_t va, void *dst, size_t n) = nullptr;
+    // unrestricted reader: also reaches heap objects (the image-bounded read refuses them)
+    bool (*read_raw)(void *ctx, uint64_t va, void *dst, size_t n) = nullptr;
 
     bool ok() const
     {

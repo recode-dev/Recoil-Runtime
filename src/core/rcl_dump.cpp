@@ -244,6 +244,13 @@ void dump_missing(const Image &img)
     RCL_LOGLN("[dump] missing %zu", sizeof kMiss / sizeof kMiss[0]);
 }
 
+static bool rdany(const Image &img, uint64_t va, void *dst, size_t n)
+{
+    if (img.read_raw)
+        return img.read_raw(img.ctx, va, dst, n);
+    return img.read(img.ctx, va, dst, n);
+}
+
 void dump_colmap(const Image &img, const Seeds &s)
 {
     const uint64_t arr = img.base + 0x1154f08ULL;
@@ -253,7 +260,7 @@ void dump_colmap(const Image &img, const Seeds &s)
     for (int i = 0; i < 24; i++)
     {
         uint64_t w = 0;
-        if (img.read(img.ctx, arr + (uint64_t)i * 8, &w, 8))
+        if (rdany(img, arr + (uint64_t)i * 8, &w, 8))
             root += out_fmt("- slot[%d] = `0x%llx`\n", i, (unsigned long long)w);
     }
     for (int i = 0; i < 24; i++)
@@ -265,26 +272,26 @@ void dump_colmap(const Image &img, const Seeds &s)
         uint64_t b = 0;
         uint64_t c = 0;
         std::string nm;
-        if (!img.read(img.ctx, arr + (uint64_t)i * 8, &t, 8) || !t)
+        if (!rdany(img, arr + (uint64_t)i * 8, &t, 8) || !t)
             continue;
         root += out_fmt("\n## slot %d  table `0x%llx`\n\n", i, (unsigned long long)t);
-        if (img.read(img.ctx, t, &vt, 8))
+        if (rdany(img, t, &vt, 8))
             root += out_fmt("- *(table) = `0x%llx`\n", (unsigned long long)vt);
-        if (img.read(img.ctx, t + 0x50, &cnt, 8))
+        if (rdany(img, t + 0x50, &cnt, 8))
             root += out_fmt("- *(table+0x50) = `0x%llx`\n", (unsigned long long)cnt);
-        if (!img.read(img.ctx, t + 0x58, &a, 8) || !a)
+        if (!rdany(img, t + 0x58, &a, 8) || !a)
         {
             root += "- *(table+0x58) = null\n";
             continue;
         }
         root += out_fmt("- *(table+0x58) = `0x%llx`\n", (unsigned long long)a);
-        if (img.read(img.ctx, a, &b, 8))
+        if (rdany(img, a, &b, 8))
             root += out_fmt("- *(csv+0x00) = `0x%llx`\n", (unsigned long long)b);
-        if (img.read(img.ctx, a + 8, &b, 8))
+        if (rdany(img, a + 8, &b, 8))
             root += out_fmt("- *(csv+0x08) = `0x%llx`\n", (unsigned long long)b);
-        if (img.read(img.ctx, a + 0x18, &b, 8))
+        if (rdany(img, a + 0x18, &b, 8))
             root += out_fmt("- *(csv+0x18) = `0x%llx`\n", (unsigned long long)b);
-        if (img.read(img.ctx, a + 0x58, &b, 8) && b && img.read(img.ctx, b + 0x18, &c, 8) && c)
+        if (rdany(img, a + 0x58, &b, 8) && b && rdany(img, b + 0x18, &c, 8) && c)
         {
             uint64_t sc = c + 0x30;
             uint32_t len = 0;
@@ -295,13 +302,13 @@ void dump_colmap(const Image &img, const Seeds &s)
                 if (len <= 7)
                 {
                     char buf[72];
-                    if (img.read(img.ctx, sc + 8, buf, len))
+                    if (rdany(img, sc + 8, buf, len))
                     {
                         buf[len] = 0;
                         nm = std::string(buf);
                     }
                 }
-                else if (img.read(img.ctx, sc + 8, &data, 8) && data)
+                else if (rdany(img, sc + 8, &data, 8) && data)
                 {
                     std::string tmp;
                     if (img.cstr(data, tmp))
