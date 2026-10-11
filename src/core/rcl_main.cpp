@@ -14,7 +14,6 @@
 #include <vector>
 
 #if defined(__APPLE__)
-#include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <unistd.h>
@@ -43,13 +42,14 @@ static bool live_read(void *ctx, uint64_t va, void *dst, size_t n)
 
 static bool raw_read(void *, uint64_t va, void *dst, size_t n)
 {
-    mach_vm_size_t got = 0;
-    if (n == 0 || n > 0x10000 || va < 0x100000000ULL)
+    // heap objects live far above the image; keep the window tight so a bogus
+    // value cannot turn into a wild dereference
+    if (n == 0 || n > 0x10000 || va < 0x100000000ULL || va >= 0x400000000ULL)
         return false;
-    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)va, (mach_vm_size_t)n,
-                               (mach_vm_address_t)(uintptr_t)dst, &got) != KERN_SUCCESS)
+    if (va + n < va)
         return false;
-    return got == n;
+    memcpy(dst, (const void *)(uintptr_t)va, n);
+    return true;
 }
 
 static uint64_t text_vmsize(const struct mach_header_64 *h)
