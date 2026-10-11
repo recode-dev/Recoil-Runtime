@@ -4,9 +4,11 @@
 #include "rcl_syms.h"
 #include "rcl_disasm.h"
 #include "rcl_pseudo.h"
+#include "rcl_objc.h"
 #include "rcl_log.h"
 #include "../utils/rcl_out.h"
 
+#include <algorithm>
 #include <map>
 #include <stdlib.h>
 #include <string>
@@ -83,7 +85,7 @@ void dump_index(const Image &img)
     t += out_fmt("- base: `0x%llx`\n", (unsigned long long)img.base);
     t += out_fmt("- image_vmsize: `0x%llx`\n\n", (unsigned long long)img.image_vmsize);
     t += "report: `map-all`\n";
-    t += "sections: `anchors`, `disasm`, `pseudo`, `map-all`\n";
+    t += "sections: `anchors`, `disasm`, `objc`, `pseudo`, `map-all`\n";
     out_write_root("index", t);
 }
 
@@ -143,6 +145,33 @@ void dump_targets(const Image &img, const Seeds &s)
     RCL_LOGLN("[dump] targets sym %zu field %zu unresolved %zu", fr.by_sym, fr.by_field, fr.missing);
 }
 
+void dump_objc(const Image &img)
+{
+    std::vector<ObjcSymbol> syms;
+    const size_t got = objc_collect(img, syms);
+    std::sort(syms.begin(), syms.end(),
+              [](const ObjcSymbol &a, const ObjcSymbol &b) { return a.rva < b.rva; });
+    std::string t = "# objc symbols\n\n";
+    t += out_fmt("- classes with methods in image: %zu\n", objc_class_count(syms));
+    t += out_fmt("- methods in image: %zu\n\n", got);
+    if (!got)
+    {
+        t += "the objc runtime exposed nothing inside this image\n";
+        out_write_root("objc", t);
+        return;
+    }
+    const uint64_t cap = cfg_u64("RCL_OBJC_MAX", 4000);
+    t += "| rva | method |\n|---|---|\n";
+    size_t i = 0;
+    for (i = 0; i < syms.size() && (uint64_t)i < cap; i++)
+        t += out_fmt("| `0x%llx` | `%s[%s %s]` |\n", (unsigned long long)syms[i].rva,
+                     syms[i].meta ? "+" : "-", syms[i].cls.c_str(), syms[i].sel.c_str());
+    if ((uint64_t)i < syms.size())
+        t += out_fmt("\n(cut: RCL_OBJC_MAX=%llu of %zu)\n", (unsigned long long)cap, syms.size());
+    out_write_root("objc", t);
+    RCL_LOGLN("[dump] objc: %zu methods", got);
+}
+
 void dump_code(const Image &img, const Seeds &s)
 {
     FindResult fr = find_all(img, s);
@@ -168,6 +197,11 @@ void dump_code(const Image &img, const Seeds &s)
         return;
     }
 
+    {
+        std::vector<ObjcSymbol> syms;
+        objc_collect(img, syms);
+        objc_names(syms, fns);
+    }
     parse_rvas(getenv("RCL_DISASM_RVAS"), rvas);
     for (size_t k = 0; k < rvas.size(); k++)
     {
@@ -241,6 +275,7 @@ void dump_all(const Image &img, const Seeds &s)
     dump_index(img);
     dump_anchors(img, s);
     dump_targets(img, s);
+    dump_objc(img);
     dump_code(img, s);
 }
 

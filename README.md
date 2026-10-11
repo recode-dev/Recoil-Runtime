@@ -23,11 +23,17 @@ tools      signature helpers
 index.md
 anchors/anchors.md
 map-all.md
+objc.md
 disasm/index.md + disasm/fn-<rva>.md
 pseudo/index.md + pseudo/fn-<rva>.md
 ```
 
 - `map-all.md` — the target table: JS offset object, per-target detail and the anchor profiles.
+- `objc.md` — the ObjC runtime walked in-process (`objc_copyClassList` +
+  `class_copyMethodList`), filtered to `IMP`s that land inside the target image: every name the
+  stripped client still exposes, as `rva -> -[Class sel]` / `+[Class sel]`. These names also feed
+  the disassembly and pseudocode, so calls and tail calls into engine methods get real names
+  instead of `sub_<rva>`.
 - `disasm/fn-<rva>.md` — full A64 listing (`rva`, raw word, mnemonic, resolved branch/call name)
   plus the call sites of that function.
 - `pseudo/fn-<rva>.md` — pseudocode for the same function: register-accurate basic statements,
@@ -59,6 +65,7 @@ The dylib lands in `.theos/`; `make` also copies it next to the project root for
 | `RCL_DISASM_RVAS` | extra RVAs to disassemble regardless of the target table (`0x1234 0x5678`) |
 | `RCL_DISASM_INSNS` | instruction cap per function (default 2000) |
 | `RCL_PSEUDO_LINES` | pseudocode statement cap per function (default 400) |
+| `RCL_OBJC_MAX` | rows written to `objc.md` (default 4000) |
 
 ## Decoder notes
 
