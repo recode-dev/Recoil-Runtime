@@ -105,7 +105,7 @@ void dump_vtables(const Image &img)
     {
         idx += out_fmt("| `0x%llx` | %u | `0x%llx` | %s |\n", (unsigned long long)v[i].addr, v[i].slots,
                        (unsigned long long)v[i].first, v[i].guess.empty() ? "-" : v[i].guess.c_str());
-        if (files < 1500)
+        if (files < 8000)
         {
             std::string t = out_fmt("# vtable 0x%llx\n\n- slots: %u\n- name guess: %s\n\n",
                                     (unsigned long long)v[i].addr, v[i].slots,
@@ -134,7 +134,7 @@ void dump_ctors(const Image &img)
     {
         idx += out_fmt("| `0x%llx` | `0x%llx` | `0x%llx` |\n", (unsigned long long)v[i].fn,
                        (unsigned long long)v[i].vtable, (unsigned long long)v[i].store_at);
-        if (files < 1500)
+        if (files < 8000)
         {
             std::string t = out_fmt("# ctor 0x%llx\n\n- vtable written: `0x%llx`\n- at: `0x%llx`\n\n",
                                     (unsigned long long)v[i].fn, (unsigned long long)v[i].vtable,
@@ -151,8 +151,12 @@ void dump_ctors(const Image &img)
 void dump_targets(const Image &img, const Seeds &s)
 {
     FindResult fr = find_all(img, s);
-    std::string t = out_fmt("# targets\n\nresolved: %zu/%zu\naliases: %zu\nmissing: %zu\n\n", fr.resolved,
-                            kTargetCount, fr.duplicated, fr.missing);
+    size_t amb = 0;
+    for (size_t i = 0; i < kTargetCount; i++)
+        if (kTargets[i].seed == 0 && kTargets[i].cls && kTargets[i].cls[0])
+            amb++;
+    std::string t = out_fmt("# targets\n\nresolved: %zu/%zu\naliases: %zu\nambiguous (no resolver): %zu\nno class: %zu\n\n",
+                            fr.resolved, kTargetCount, fr.duplicated, amb, kTargetCount - fr.resolved - fr.duplicated - amb);
     t += "| key | value | source | alias of |\n|---|---|---|---|\n";
     for (size_t i = 0; i < fr.items.size(); i++)
     {
@@ -161,7 +165,12 @@ void dump_targets(const Image &img, const Seeds &s)
                      f.alias_of ? f.alias_of : "-");
     }
     out_write("targets", "resolved", t);
-    RCL_LOGLN("[dump] targets %zu/%zu", fr.resolved, kTargetCount);
+    std::string a = "# ambiguous targets (class known, resolver absent)\n\n";
+    for (size_t i = 0; i < kTargetCount; i++)
+        if (kTargets[i].seed == 0 && kTargets[i].cls && kTargets[i].cls[0])
+            a += out_fmt("- `%s`  (class `%s`)\n", kTargets[i].key, kTargets[i].cls);
+    out_write("targets", "ambiguous", a);
+    RCL_LOGLN("[dump] targets %zu/%zu amb %zu", fr.resolved, kTargetCount, amb);
 }
 
 void dump_missing(const Image &img)

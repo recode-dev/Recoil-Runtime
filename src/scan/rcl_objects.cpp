@@ -1,6 +1,8 @@
 #include "rcl_objects.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <set>
 
 namespace rcl
@@ -108,20 +110,59 @@ static uint64_t fn_start(const Image &img, uint64_t at, uint64_t lo)
     return 0;
 }
 
-static std::string guess_name(const Image &img, uint64_t base, uint64_t lo, uint64_t hi)
+static bool class_shaped(const std::string &s)
 {
-    for (int i = 0; i < 64; i++)
+    if (s.size() < 4 || s.size() > 48)
+        return false;
+    if (!isupper((unsigned char)s[0]))
+        return false;
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        const char c = s[i];
+        if (!(isalnum((unsigned char)c) || c == '_'))
+            return false;
+    }
+    return true;
+}
+
+static int name_rank(const std::string &s)
+{
+    static const char *pre[] = {"Logic", "Game", "Battle", "Character", "Projectile", "Skill",
+                                "Data",  "Tile", "Screen", "Scene",   "Player",     "Object",
+                                "Render", "Component", "Area", "Alliance", "Message", "Team"};
+    for (size_t i = 0; i < sizeof pre / sizeof pre[0]; i++)
+    {
+        if (s.compare(0, strlen(pre[i]), pre[i]) == 0)
+            return 2;
+    }
+    return 1;
+}
+
+static std::string guess_name(const Image &img, uint64_t base)
+{
+    std::string best;
+    int best_rank = 0;
+    for (int i = -32; i <= 96; i++)
     {
         uint64_t p = 0;
         std::string s;
-        if (!img.read(img.ctx, base + (uint64_t)i * 8, &p, 8) || !p)
+        uint64_t at = base + (int64_t)i * 8;
+        if (at < img.base || at >= img.base + img.vmsize)
             continue;
-        if (p >= lo && p < hi)
+        if (!img.read(img.ctx, at, &p, 8) || p < img.base || p >= img.base + img.vmsize)
             continue;
-        if (img.cstr(p, s) && s.size() >= 3 && s.size() <= 64 && s.find(' ') == std::string::npos)
-            return s;
+        if (!img.cstr(p, s) || !class_shaped(s))
+            continue;
+        const int r = name_rank(s);
+        if (r > best_rank)
+        {
+            best_rank = r;
+            best = s;
+            if (r == 2)
+                break;
+        }
     }
-    return std::string();
+    return best;
 }
 
 static void push_run(const Image &img, uint64_t start, uint64_t slots, uint64_t lo, uint64_t hi,
@@ -131,7 +172,7 @@ static void push_run(const Image &img, uint64_t start, uint64_t slots, uint64_t 
     v.addr = start;
     v.slots = (uint32_t)slots;
     img.read(img.ctx, start, &v.first, 8);
-    v.guess = guess_name(img, start, lo, hi);
+    v.guess = guess_name(img, start);
     out.push_back(v);
 }
 
@@ -177,15 +218,23 @@ std::vector<Ctor> scan_ctors(const Image &img, uint64_t vtable_hint)
     uint64_t hi = 0;
     if (!macho_text_range(img, lo, hi))
         return out;
-    for (uint64_t va = lo; va + 20 <= hi; va += 4)
+    for (uint64_t va = lo; va + 24 <= hi; va += 4)
     {
         uint32_t w = 0;
         uint64_t val = 0;
         uint64_t f = 0;
-        if (!img.u32(va, w) || (w & 0xFFC00000u) != 0xF9000000u || ((w >> 5) & 0x1Fu) != 0)
+        uint32_t rn = 0;
+        uint32_t imm = 0;
+        if (!img.u32(va, w))
+            continue;
+        if ((w & 0xFFC00000u) != 0xF9000000u) // str xN,[xR,#imm]
+            continue;
+        rn = (w >> 5) & 0x1Fu;
+        imm = (w >> 10) & 0xFFFu;
+        if (rn == 31 || (imm != 0 && imm != 8))
             continue;
         const uint32_t reg = w & 0x1Fu;
-        if (reg > 2 || !value_before(img, va, reg, 3, val))
+        if (reg == 31 || !value_before(img, va, reg, 4, val))
             continue;
         if (vtable_hint && val != vtable_hint)
             continue;
