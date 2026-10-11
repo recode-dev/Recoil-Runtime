@@ -138,7 +138,7 @@ uint64_t code_fn_start(const Image &img, uint64_t va, uint64_t lo)
     return 0;
 }
 
-uint64_t code_str_lookup(const Image &img, uint64_t cstr_va, uint64_t cstr_size, const char *needle)
+uint64_t code_str_lookup(const Image &img, uint64_t cstr_va, uint64_t cstr_size, const char *needle, uint32_t *hits)
 {
     std::vector<char> buf;
     const size_t n = (size_t)cstr_size;
@@ -148,14 +148,23 @@ uint64_t code_str_lookup(const Image &img, uint64_t cstr_va, uint64_t cstr_size,
     if (!img.read(img.ctx, cstr_va, buf.data(), n))
         return 0;
     const size_t len = strlen(needle);
+    uint64_t first = 0;
+    uint32_t cnt = 0;
     for (size_t i = 0; i + len + 1 <= n; i++)
     {
         if (buf[i] != needle[0])
             continue;
-        if (!memcmp(buf.data() + i, needle, len) && buf[i + len] == 0)
-            return cstr_va + i;
+        if (memcmp(buf.data() + i, needle, len) && 1)
+            continue;
+        if (buf[i + len] != 0)
+            continue;
+        if (!first)
+            first = cstr_va + i;
+        cnt++;
     }
-    return 0;
+    if (hits)
+        *hits = cnt;
+    return first;
 }
 
 void code_str_refs(const Image &img, uint64_t cstr_va, uint64_t cstr_size,
@@ -327,8 +336,9 @@ void code_resolve(const Image &img, const Seeds &s, Found &f, size_t &by_str, si
     len = strlen(last);
     if (len >= 3 && len < sizeof name)
     {
-        const uint64_t sv = code_str_lookup(img, sva, ssz, last);
-        if (sv)
+        uint32_t hits = 0;
+        const uint64_t sv = code_str_lookup(img, sva, ssz, last, &hits);
+        if (sv && len >= 8 && hits == 1)
         {
             if (!str_done)
             {
@@ -337,7 +347,7 @@ void code_resolve(const Image &img, const Seeds &s, Found &f, size_t &by_str, si
                 RCL_LOGLN("[code] string refs %zu", refs.size());
             }
             std::map<uint64_t, std::vector<uint64_t>>::iterator it = refs.find(sv);
-            if (it != refs.end() && !it->second.empty())
+            if (it != refs.end() && !it->second.empty() && it->second.size() <= 8)
             {
                 uint64_t best = it->second[0];
                 for (size_t k = 1; k < it->second.size(); k++)
@@ -346,7 +356,7 @@ void code_resolve(const Image &img, const Seeds &s, Found &f, size_t &by_str, si
                         best = it->second[k];
                 }
                 snprintf(name, sizeof name, "\"%s\" x%zu", last, it->second.size());
-                f.value = best;
+                f.value = best - img.base;
                 f.src = "str";
                 f.info = name;
                 by_str++;
