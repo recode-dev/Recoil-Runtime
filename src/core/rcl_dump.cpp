@@ -247,58 +247,75 @@ void dump_missing(const Image &img)
 void dump_colmap(const Image &img, const Seeds &s)
 {
     const uint64_t arr = img.base + 0x1154f08ULL;
-    std::string idx = "# column map (pure reads, nothing is called)\n\n"
-                      "for each LogicDataTable slot: table -> csv -> bucket map\n\n";
-    for (int i = 0; i < 157; i++)
+    std::string root = out_fmt("# table array probe\n\n- arr: `0x%llx`\n\n## raw slots\n\n",
+                               (unsigned long long)arr);
+    std::string idx = "# column map\n\n";
+    for (int i = 0; i < 24; i++)
+    {
+        uint64_t w = 0;
+        if (img.read(img.ctx, arr + (uint64_t)i * 8, &w, 8))
+            root += out_fmt("- slot[%d] = `0x%llx`\n", i, (unsigned long long)w);
+    }
+    for (int i = 0; i < 24; i++)
     {
         uint64_t t = 0;
-        uint64_t a = 0;
-        uint64_t buckets = 0;
+        uint64_t vt = 0;
         uint64_t cnt = 0;
-        uint64_t arena = 0;
-        std::string head;
+        uint64_t a = 0;
+        uint64_t b = 0;
+        uint64_t c = 0;
+        std::string nm;
         if (!img.read(img.ctx, arr + (uint64_t)i * 8, &t, 8) || !t)
             continue;
+        root += out_fmt("\n## slot %d  table `0x%llx`\n\n", i, (unsigned long long)t);
+        if (img.read(img.ctx, t, &vt, 8))
+            root += out_fmt("- *(table) = `0x%llx`\n", (unsigned long long)vt);
+        if (img.read(img.ctx, t + 0x50, &cnt, 8))
+            root += out_fmt("- *(table+0x50) = `0x%llx`\n", (unsigned long long)cnt);
         if (!img.read(img.ctx, t + 0x58, &a, 8) || !a)
-            continue;
-        img.read(img.ctx, a, &buckets, 8);
-        img.read(img.ctx, a + 8, &cnt, 8);
-        img.read(img.ctx, a + 0x18, &arena, 8);
-        head = out_fmt("# table slot %d\n\n- table: `0x%llx`\n- csv: `0x%llx`\n"
-                       "- buckets: `0x%llx`\n- count: %llu\n- arena: `0x%llx`\n\n",
-                       i, (unsigned long long)t, (unsigned long long)a, (unsigned long long)buckets,
-                       (unsigned long long)cnt, (unsigned long long)arena);
-        if (buckets > img.base && buckets < img.base + img.vmsize && cnt > 0 && cnt <= 4096)
         {
-            for (uint64_t b = 0; b < cnt && b < 8; b++)
+            root += "- *(table+0x58) = null\n";
+            continue;
+        }
+        root += out_fmt("- *(table+0x58) = `0x%llx`\n", (unsigned long long)a);
+        if (img.read(img.ctx, a, &b, 8))
+            root += out_fmt("- *(csv+0x00) = `0x%llx`\n", (unsigned long long)b);
+        if (img.read(img.ctx, a + 8, &b, 8))
+            root += out_fmt("- *(csv+0x08) = `0x%llx`\n", (unsigned long long)b);
+        if (img.read(img.ctx, a + 0x18, &b, 8))
+            root += out_fmt("- *(csv+0x18) = `0x%llx`\n", (unsigned long long)b);
+        if (img.read(img.ctx, a + 0x58, &b, 8) && b && img.read(img.ctx, b + 0x18, &c, 8) && c)
+        {
+            uint64_t sc = c + 0x30;
+            uint32_t len = 0;
+            uint64_t data = 0;
+            root += out_fmt("- name-scstring `0x%llx`\n", (unsigned long long)sc);
+            if (img.u32(sc + 4, len) && len > 0 && len < 64)
             {
-                uint64_t e = 0;
-                if (!img.read(img.ctx, buckets + b * 8, &e, 8) || !e)
-                    continue;
-                if (e < img.base || e >= img.base + img.vmsize)
-                    continue;
-                head += out_fmt("\n## bucket %llu entry `0x%llx`\n\n", (unsigned long long)b,
-                                (unsigned long long)e);
-                for (int k = 0; k < 8; k++)
+                if (len <= 7)
                 {
-                    uint64_t w = 0;
-                    std::string st;
-                    if (!img.read(img.ctx, e + (uint64_t)k * 8, &w, 8))
-                        break;
-                    head += out_fmt("- `+0x%02x` = `0x%llx`", k * 8, (unsigned long long)w);
-                    if (w > 0x1000 && img.cstr(w, st) && !st.empty() && st.size() <= 48)
-                        head += "  \"" + st + "\"";
-                    head += "\n";
+                    char buf[72];
+                    if (img.read(img.ctx, sc + 8, buf, len))
+                    {
+                        buf[len] = 0;
+                        nm = std::string(buf);
+                    }
                 }
+                else if (img.read(img.ctx, sc + 8, &data, 8) && data)
+                {
+                    std::string tmp;
+                    if (img.cstr(data, tmp))
+                        nm = tmp;
+                }
+                root += out_fmt("- name = \"%s\"\n", nm.c_str());
             }
         }
-        out_write("columns", out_fmt("map-%d", i).c_str(), head);
-        idx += out_fmt("- [%d] table `0x%llx` csv `0x%llx` buckets `0x%llx` count %llu\n", i,
-                       (unsigned long long)t, (unsigned long long)a, (unsigned long long)buckets,
-                       (unsigned long long)cnt);
+        idx += out_fmt("- [%d] table `0x%llx` csv `0x%llx` name \"%s\"\n", i,
+                       (unsigned long long)t, (unsigned long long)a, nm.c_str());
     }
+    out_write("columns", "map-root", root);
     out_write("columns", "map-index", idx);
-    RCL_LOGLN("[dump] column map");
+    RCL_LOGLN("[dump] column map probe");
 }
 
 void dump_all(const Image &img, const Seeds &s)
