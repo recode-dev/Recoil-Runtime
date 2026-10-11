@@ -15,3 +15,7 @@ RecoilRuntime_FRAMEWORKS := UIKit Foundation
 RecoilRuntime_INSTALL_PATH := /usr/lib
 
 include $(THEOS_MAKE_PATH)/library.mk
+
+after-all::
+	@D="$$(find .theos -name RecoilRuntime.dylib ! -path '*dSYM*' | head -1)"; \
+	if [ -n "$$D" ]; then cp "$$D" ./RecoilRuntime.dylib; echo "artifact: RecoilRuntime.dylib"; fi
