@@ -351,8 +351,7 @@ FindResult find_all(const Image &img, const Seeds &s)
 {
     FindResult r;
     std::map<uint64_t, std::string> seen;
-    std::map<std::string, const ClassBoundary *> bounds;
-    std::vector<ClassBoundary> all = discover_class_boundaries(img);
+    std::map<std::string, size_t> cls_seen;
     uint64_t lo = 0;
     uint64_t hi = 0;
     size_t i = 0;
@@ -362,13 +361,6 @@ FindResult find_all(const Image &img, const Seeds &s)
         hi = img.base + img.vmsize;
     }
     (void)s;
-    for (i = 0; i < all.size(); i++)
-    {
-        if (all[i].name && all[i].name[0])
-        {
-            bounds.emplace(all[i].name, &all[i]);
-        }
-    }
     for (i = 0; i < kTargetCount; i++)
     {
         const Target &t = kTargets[i];
@@ -394,10 +386,13 @@ FindResult find_all(const Image &img, const Seeds &s)
             r.items.push_back(f);
             continue;
         }
-        if (t.cls && t.cls[0] && bounds.count(t.cls))
+        if (t.cls && t.cls[0] && cls_seen.find(t.cls) == cls_seen.end())
         {
-            const ClassBoundary *b = bounds[t.cls];
-            RCL_LOGLN("[class] %-34s slots=%u rows=%u", t.cls, (unsigned)b->slots, (unsigned)b->start);
+            cls_seen[t.cls] = 1;
+            RCL_LOGLN("[class] %-34s kind=%u (no resolver for this class in this build)", t.cls, (unsigned)t.kind);
+        }
+        if (t.cls && t.cls[0])
+        {
             r.ambiguous++;
             continue;
         }
