@@ -137,10 +137,8 @@ void dump_vtables(const Image &img)
 
 void dump_ctors(const Image &img)
 {
-    std::set<uint64_t> vs;
-    for (size_t k = 0; k < vt.size(); k++)
-        vs.insert(vt[k].addr);
     std::vector<VTable> &vt = g_vt;
+    std::set<uint64_t> vs;
     std::vector<Ctor> v;
     for (size_t k = 0; k < vt.size(); k++)
         vs.insert(vt[k].addr);
