@@ -220,6 +220,8 @@ static void open_log_anywhere()
     }
 }
 
+static void find_once(const Image &img, const Seeds &s);
+
 static void run_pass(const Image &img, const std::string &why, int pass)
 {
     const Seeds s = Seeds::discover(img);
