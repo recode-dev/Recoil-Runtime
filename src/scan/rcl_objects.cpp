@@ -136,6 +136,65 @@ static int name_rank(const std::string &s)
     return 1;
 }
 
+static std::string demangle_itanium(const std::string &in)
+{
+    std::string s = in;
+    size_t i = 0;
+    std::string out;
+    if (s.compare(0, 2, "_Z") == 0)
+        s = s.substr(2);
+    if (s.empty() || s[0] != 'N')
+        return in;
+    i = 1;
+    while (i < s.size() && s[i] != 'E')
+    {
+        size_t j = i;
+        int n = 0;
+        while (j < s.size() && isdigit((unsigned char)s[j]))
+        {
+            n = n * 10 + (s[j] - '0');
+            j++;
+        }
+        if (j == i || n <= 0 || j + (size_t)n > s.size())
+            break;
+        if (!out.empty())
+            out += "::";
+        out += s.substr(j, (size_t)n);
+        i = j + (size_t)n;
+    }
+    return out.empty() ? in : out;
+}
+
+static bool typeinfo_name(const Image &img, uint64_t vtable, std::string &out)
+{
+    static const int slots[] = {-4, -3, -2, -1};
+    for (size_t i = 0; i < sizeof slots / sizeof slots[0]; i++)
+    {
+        uint64_t p = 0;
+        std::string s;
+        if (!img.read(img.ctx, vtable + (int64_t)slots[i] * 8, &p, 8) || !p)
+            continue;
+        if (p < img.base || p >= img.base + img.vmsize)
+            continue;
+        if (!img.cstr(p, s) || s.empty())
+            continue;
+        if (s[0] != 'N' && s.compare(0, 2, "_Z") != 0)
+        {
+            uint64_t n2 = 0;
+            std::string s2;
+            if (!img.read(img.ctx, p + 8, &n2, 8) || !n2 || n2 < img.base || n2 >= img.base + img.vmsize)
+                continue;
+            if (!img.cstr(n2, s2) || s2.empty())
+                continue;
+            s = s2;
+        }
+        out = demangle_itanium(s);
+        if (!out.empty())
+            return true;
+    }
+    return false;
+}
+
 static bool probe(const Image &img, uint64_t p, std::string &out)
 {
     if (p < img.base || p >= img.base + img.vmsize)
@@ -146,6 +205,8 @@ static bool probe(const Image &img, uint64_t p, std::string &out)
 static std::string guess_name(const Image &img, uint64_t base)
 {
     std::string s;
+    if (typeinfo_name(img, base, s))
+        return s;
     std::string best;
     int best_rank = 0;
     uint64_t q = 0;
