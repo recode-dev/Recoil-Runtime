@@ -382,6 +382,8 @@ void dump_colmap(const Image &img, const Seeds &s)
         uint64_t pv = 0;
         if (rdany_5(img, csv + 0x58, &a, 8) && rdany_5(img, a + 0x38, &pv, 8) && pv)
             path = rstr_5(img, pv, 64);
+        if (path.compare(0, 10, "csv_logic/") != 0)
+            continue;
         body = out_fmt("# tbl %d\n\n- table `0x%llx` vtable `0x%llx` idx %llu\n- csv `0x%llx`\n"
                        "- buckets `0x%llx` n=%llu\n- rows `0x%llx`\n",
                        i, (unsigned long long)t, (unsigned long long)vt, (unsigned long long)ti,
