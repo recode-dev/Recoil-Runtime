@@ -246,25 +246,25 @@ void dump_missing(const Image &img)
     RCL_LOGLN("[dump] missing %zu", sizeof kMiss / sizeof kMiss[0]);
 }
 
-static bool rdany_4(const Image &img, uint64_t va, void *dst, size_t n)
+static bool rdany_5(const Image &img, uint64_t va, void *dst, size_t n)
 {
     if (img.read_raw)
         return img.read_raw(img.ctx, va, dst, n);
     return img.read(img.ctx, va, dst, n);
 }
 
-static bool win_ok_4(uint64_t va)
+static bool win_ok_5(uint64_t va)
 {
     return va >= 0x100000000ULL && va < 0x400000000ULL && (va & 7) == 0;
 }
 
-static std::string rstr_4(const Image &img, uint64_t va, size_t maxn)
+static std::string rstr_5(const Image &img, uint64_t va, size_t maxn)
 {
     char buf[64];
     size_t n = maxn < sizeof buf - 1 ? maxn : sizeof buf - 1;
-    if (!win_ok_4(va) || n < 2)
+    if (!win_ok_5(va) || n < 2)
         return std::string();
-    if (!rdany_4(img, va, buf, n))
+    if (!rdany_5(img, va, buf, n))
         return std::string();
     buf[n] = 0;
     for (size_t i = 0; i < n; i++)
@@ -281,7 +281,7 @@ static std::string rstr_4(const Image &img, uint64_t va, size_t maxn)
     return std::string();
 }
 
-static std::string inl_4(uint64_t v)
+static std::string inl_5(uint64_t v)
 {
     unsigned char b[8];
     std::string out;
@@ -289,60 +289,43 @@ static std::string inl_4(uint64_t v)
     for (int i = 0; i < 8; i++)
     {
         if (b[i] == 0)
-            break;
+        {
+            for (int j = i + 1; j < 8; j++)
+            {
+                if (b[j] != 0)
+                    return std::string();
+            }
+            return out.size() >= 2 ? out : std::string();
+        }
         if (b[i] < 32 || b[i] > 127)
             return std::string();
         out.push_back((char)b[i]);
     }
-    return out;
+    return std::string();
 }
 
-static std::string scstr_4(const Image &img, uint64_t base)
+static std::string scstr_5(const Image &img, uint64_t base)
 {
     uint64_t lenw = 0;
     uint64_t data = 0;
     uint32_t len = 0;
     std::string s;
-    if (!rdany_4(img, base, &lenw, 8))
+    if (!rdany_5(img, base, &lenw, 8))
         return std::string();
     len = (uint32_t)(lenw & 0xFFFFFFFFULL);
     if (len == 0 || len > 64)
         return std::string();
-    if (!rdany_4(img, base + 8, &data, 8) || data == 0)
+    if (!rdany_5(img, base + 8, &data, 8) || data == 0)
         return std::string();
     if (len > 7)
-        return rstr_4(img, data, (size_t)len + 1);
-    s = inl_4(data);
+        return rstr_5(img, data, (size_t)len + 1);
+    s = inl_5(data);
     if (s.size() != len)
         return std::string();
     return s;
 }
 
-static std::string runs_4(const Image &img, const char *tag, uint64_t base, size_t size)
-{
-    unsigned char buf[0x100];
-    std::string t;
-    size_t i = 0;
-    if (size > sizeof buf)
-        size = sizeof buf;
-    while (size >= 8 && !rdany_4(img, base, buf, size))
-        size /= 2;
-    if (size < 8)
-        return t;
-    while (i < size)
-    {
-        size_t j = i;
-        while (j < size && buf[j] >= 32 && buf[j] < 127)
-            j++;
-        if (j - i >= 4)
-            t += out_fmt("- %s+0x%02zx `0x%llx`  run \"%s\"\n", tag, i, (unsigned long long)base,
-                         std::string((const char *)buf + i, j - i).c_str());
-        i = j + 1;
-    }
-    return t;
-}
-
-static std::string probe_4(const Image &img, const char *tag, uint64_t base)
+static std::string probe_5(const Image &img, const char *tag, uint64_t base)
 {
     std::string t;
     for (int k = 0; k < 16; k++)
@@ -352,17 +335,17 @@ static std::string probe_4(const Image &img, const char *tag, uint64_t base)
         std::string s;
         std::string i;
         std::string sc;
-        if (!rdany_4(img, va, &v, 8) || v == 0)
+        if (!rdany_5(img, va, &v, 8) || v == 0)
             continue;
-        s = rstr_4(img, v, 40);
+        s = rstr_5(img, v, 40);
         if (!s.empty())
             t += out_fmt("- %s+0x%02x `0x%llx`  str \"%s\"\n", tag, k * 8,
                          (unsigned long long)v, s.c_str());
-        i = inl_4(v);
+        i = inl_5(v);
         if (!i.empty())
             t += out_fmt("- %s+0x%02x `0x%llx`  inl \"%s\"\n", tag, k * 8,
                          (unsigned long long)v, i.c_str());
-        sc = scstr_4(img, va);
+        sc = scstr_5(img, va);
         if (!sc.empty())
             t += out_fmt("- %s+0x%02x `0x%llx`  sc \"%s\"\n", tag, k * 8,
                          (unsigned long long)v, sc.c_str());
@@ -385,71 +368,45 @@ void dump_colmap(const Image &img, const Seeds &s)
         uint64_t cnt = 0;
         uint64_t rows = 0;
         uint64_t a = 0;
-        uint64_t b = 0;
-        uint64_t c = 0;
-        std::string nm;
         std::string body;
-        if (!rdany_4(img, arr + (uint64_t)i * 8, &t, 8) || !t)
+        if (!rdany_5(img, arr + (uint64_t)i * 8, &t, 8) || !t)
             continue;
-        rdany_4(img, t, &vt, 8);
-        rdany_4(img, t + 0x50, &ti, 8);
-        if (!rdany_4(img, t + 0x58, &csv, 8) || !csv)
+        rdany_5(img, t, &vt, 8);
+        rdany_5(img, t + 0x50, &ti, 8);
+        if (!rdany_5(img, t + 0x58, &csv, 8) || !csv)
             continue;
-        rdany_4(img, csv, &buckets, 8);
-        rdany_4(img, csv + 8, &cnt, 8);
-        rdany_4(img, csv + 0x18, &rows, 8);
+        rdany_5(img, csv, &buckets, 8);
+        rdany_5(img, csv + 8, &cnt, 8);
+        rdany_5(img, csv + 0x18, &rows, 8);
         std::string path;
-        if (rdany_4(img, csv + 0x58, &a, 8) && a && rdany_4(img, a + 0x18, &b, 8) && b)
-        {
-            if (rdany_4(img, b + 0x30, &c, 8))
-                nm = scstr_4(img, b + 0x30);
-        }
-        {
-            uint64_t pv = 0;
-            if (rdany_4(img, a + 0x38, &pv, 8) && pv)
-                path = rstr_4(img, pv, 64);
-        }
+        uint64_t pv = 0;
+        if (rdany_5(img, csv + 0x58, &a, 8) && rdany_5(img, a + 0x38, &pv, 8) && pv)
+            path = rstr_5(img, pv, 64);
         body = out_fmt("# tbl %d\n\n- table `0x%llx` vtable `0x%llx` idx %llu\n- csv `0x%llx`\n"
                        "- buckets `0x%llx` n=%llu\n- rows `0x%llx`\n",
                        i, (unsigned long long)t, (unsigned long long)vt, (unsigned long long)ti,
                        (unsigned long long)csv, (unsigned long long)buckets, (unsigned long long)cnt,
                        (unsigned long long)rows);
-        if (!nm.empty())
-            body += out_fmt("- name \"%s\"\n", nm.c_str());
         if (!path.empty())
             body += out_fmt("- file \"%s\"\n", path.c_str());
         body += "\n## probe\n\n";
-        if (win_ok_4(t))
-        {
-            body += probe_4(img, "t", t);
-            body += runs_4(img, "t", t, 0x100);
-        }
-        if (win_ok_4(csv))
-        {
-            body += probe_4(img, "csv", csv);
-            body += runs_4(img, "csv", csv, 0x100);
-        }
-        if (win_ok_4(a))
-        {
-            body += probe_4(img, "a", a);
-            body += runs_4(img, "a", a, 0x100);
-        }
-        if (win_ok_4(b))
-        {
-            body += probe_4(img, "b", b);
-            body += runs_4(img, "b", b, 0x100);
-        }
-        if (win_ok_4(buckets) && cnt > 0 && cnt <= 4096)
+        if (win_ok_5(t))
+            body += probe_5(img, "t", t);
+        if (win_ok_5(csv))
+            body += probe_5(img, "csv", csv);
+        if (win_ok_5(a))
+            body += probe_5(img, "a", a);
+        if (win_ok_5(buckets) && cnt > 0 && cnt <= 4096)
         {
             size_t shown = 0;
             for (uint64_t k = 0; k < cnt && shown < 48; k++)
             {
                 uint64_t e = 0;
-                if (!rdany_4(img, buckets + k * 8, &e, 8) || !e)
+                if (!rdany_5(img, buckets + k * 8, &e, 8) || !e)
                     continue;
                 for (int chain = 0; chain < 8 && shown < 48; chain++)
                 {
-                    if (!win_ok_4(e))
+                    if (!win_ok_5(e))
                         break;
                     body += out_fmt("\n## bucket %llu entry `0x%llx`\n\n", (unsigned long long)k,
                                     (unsigned long long)e);
@@ -457,27 +414,27 @@ void dump_colmap(const Image &img, const Seeds &s)
                     {
                         uint64_t w = 0;
                         std::string st;
-                        if (!rdany_4(img, e + (uint64_t)q * 8, &w, 8))
+                        if (!rdany_5(img, e + (uint64_t)q * 8, &w, 8))
                             break;
-                        st = rstr_4(img, w, 40);
+                        st = rstr_5(img, w, 40);
                         body += out_fmt("- `+0x%02x` = `0x%llx`%s%s%s\n", q * 8,
                                         (unsigned long long)w, st.empty() ? "" : "  \"",
                                         st.empty() ? "" : st.c_str(), st.empty() ? "" : "\"");
                     }
                     {
-                        std::string en = scstr_4(img, e + 0x10);
+                        std::string en = scstr_5(img, e + 0x10);
                         uint64_t colw = 0;
                         if (!en.empty())
                         {
-                            rdany_4(img, e + 0x20, &colw, 8);
+                            rdany_5(img, e + 0x20, &colw, 8);
                             body += out_fmt("- name \"%s\"  col %llu\n", en.c_str(),
                                             (unsigned long long)(colw & 0xFFFFFFFFULL));
                         }
                         else
                         {
                             uint64_t nw = 0;
-                            rdany_4(img, e + 0x08, &nw, 8);
-                            rdany_4(img, e + 0x10, &colw, 8);
+                            rdany_5(img, e + 0x08, &nw, 8);
+                            rdany_5(img, e + 0x10, &colw, 8);
                             body += out_fmt("- node size=%llu w=`0x%llx`\n",
                                             (unsigned long long)nw, (unsigned long long)colw);
                         }
@@ -485,7 +442,7 @@ void dump_colmap(const Image &img, const Seeds &s)
                     shown++;
                     {
                         uint64_t nxt = 0;
-                        if (!rdany_4(img, e, &nxt, 8) || !nxt || nxt == e)
+                        if (!rdany_5(img, e, &nxt, 8) || !nxt || nxt == e)
                             break;
                         e = nxt;
                     }
