@@ -5,6 +5,7 @@
 #include "rcl_find.h"
 #include "rcl_log.h"
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -95,9 +96,12 @@ void dump_columns(const Image &img, const Seeds &s)
     RCL_LOGLN("[dump] columns %zu", v.size());
 }
 
+static std::vector<VTable> g_vt;
+
 void dump_vtables(const Image &img)
 {
-    std::vector<VTable> v = scan_vtables(img);
+    std::vector<VTable> &v = g_vt;
+    v = scan_vtables(img);
     std::string idx = out_fmt("# vtables\n\ncandidates: %zu\n\n| vtable | slots | first | name guess |\n", v.size());
     idx += "|---|---|---|---|\n";
     size_t files = 0;
@@ -110,6 +114,12 @@ void dump_vtables(const Image &img)
             std::string t = out_fmt("# vtable 0x%llx\n\n- slots: %u\n- name guess: %s\n\n",
                                     (unsigned long long)v[i].addr, v[i].slots,
                                     v[i].guess.empty() ? "-" : v[i].guess.c_str());
+            for (int j = -2; j <= 6; j++)
+            {
+                uint64_t q = 0;
+                if (img.read(img.ctx, v[i].addr + (int64_t)j * 8, &q, 8))
+                    t += out_fmt("- raw[%d] `0x%llx`\n", j, (unsigned long long)q);
+            }
             for (uint32_t k = 0; k < v[i].slots && k < 512; k++)
             {
                 uint64_t p = 0;
@@ -127,13 +137,22 @@ void dump_vtables(const Image &img)
 
 void dump_ctors(const Image &img)
 {
-    std::vector<Ctor> v = scan_ctors(img, 0);
-    std::string idx = out_fmt("# ctors\n\ncandidates: %zu\n\n| ctor | vtable | store |\n|---|---|---|\n", v.size());
+    std::set<uint64_t> vs;
+    for (size_t k = 0; k < vt.size(); k++)
+        vs.insert(vt[k].addr);
+    std::vector<VTable> &vt = g_vt;
+    std::vector<Ctor> v;
+    for (size_t k = 0; k < vt.size(); k++)
+        vs.insert(vt[k].addr);
+    v = scan_ctors(img, vs);
+    std::string idx = out_fmt("# ctors\n\ncandidates: %zu\n\n| ctor | vtable | class | store |\n|---|---|---|---|\n", v.size());
     size_t files = 0;
     for (size_t i = 0; i < v.size(); i++)
     {
-        idx += out_fmt("| `0x%llx` | `0x%llx` | `0x%llx` |\n", (unsigned long long)v[i].fn,
-                       (unsigned long long)v[i].vtable, (unsigned long long)v[i].store_at);
+        std::string cn = vtable_name(img, v[i].vtable);
+        idx += out_fmt("| `0x%llx` | `0x%llx` | %s | `0x%llx` |\n", (unsigned long long)v[i].fn,
+                       (unsigned long long)v[i].vtable, cn.empty() ? "-" : cn.c_str(),
+                       (unsigned long long)v[i].store_at);
         if (files < 8000)
         {
             std::string t = out_fmt("# ctor 0x%llx\n\n- vtable written: `0x%llx`\n- at: `0x%llx`\n\n",
@@ -182,13 +201,28 @@ void dump_missing(const Image &img)
         std::string t = out_fmt("# %s\n\n", h.key);
         if (h.kind == 2)
         {
-            uint64_t vt = seed_of("VTABLE_PROJECTILE_DATA");
-            std::vector<Ctor> cs = scan_ctors(img, vt);
-            t += out_fmt("hint: ctor writes the projectile vtable `0x%llx`\n\ncandidates: %zu\n\n",
-                         (unsigned long long)vt, cs.size());
-            for (size_t k = 0; k < cs.size() && k < 64; k++)
-                t += out_fmt("- `0x%llx`  store@`0x%llx`\n", (unsigned long long)cs[k].fn,
-                             (unsigned long long)cs[k].store_at);
+            std::set<uint64_t> vs;
+            std::vector<Ctor> cs;
+            size_t picked = 0;
+            for (size_t k = 0; k < g_vt.size(); k++)
+                vs.insert(g_vt[k].addr);
+            cs = scan_ctors(img, vs);
+            t += out_fmt("all ctors: %zu; those whose vtable class matches the key:\n\n", cs.size());
+            for (size_t k = 0; k < cs.size(); k++)
+            {
+                std::string cn = vtable_name(img, cs[k].vtable);
+                if (cn.empty() || cn.find(h.key + 0) != std::string::npos)
+                    continue;
+                const bool hit = std::string(h.key).find(cn) != std::string::npos;
+                if (!hit && picked > 32)
+                    continue;
+                t += out_fmt("- `0x%llx`  vtable `0x%llx`  class %s  store@`0x%llx`\n",
+                             (unsigned long long)cs[k].fn, (unsigned long long)cs[k].vtable,
+                             cn.c_str(), (unsigned long long)cs[k].store_at);
+                picked++;
+            }
+            if (!picked)
+                t += "- none matched by class name (see ctors/index.md for the full list)\n";
         }
         else if (h.kind == 3)
         {

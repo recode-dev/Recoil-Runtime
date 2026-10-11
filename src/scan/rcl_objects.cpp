@@ -112,17 +112,15 @@ static uint64_t fn_start(const Image &img, uint64_t at, uint64_t lo)
 
 static bool class_shaped(const std::string &s)
 {
-    if (s.size() < 4 || s.size() > 48)
-        return false;
-    if (!isupper((unsigned char)s[0]))
+    if (s.size() < 3 || s.size() > 64)
         return false;
     for (size_t i = 0; i < s.size(); i++)
     {
         const char c = s[i];
-        if (!(isalnum((unsigned char)c) || c == '_'))
+        if (!(isalnum((unsigned char)c) || c == '_' || c == ':' || c == '<' || c == '>'))
             return false;
     }
-    return true;
+    return isupper((unsigned char)s[0]) || s[0] == '_';
 }
 
 static int name_rank(const std::string &s)
@@ -138,20 +136,28 @@ static int name_rank(const std::string &s)
     return 1;
 }
 
+static bool probe(const Image &img, uint64_t p, std::string &out)
+{
+    if (p < img.base || p >= img.base + img.vmsize)
+        return false;
+    return img.cstr(p, out) && class_shaped(out);
+}
+
 static std::string guess_name(const Image &img, uint64_t base)
 {
+    std::string s;
     std::string best;
     int best_rank = 0;
+    uint64_t q = 0;
+    uint64_t p = 0;
     for (int i = -32; i <= 96; i++)
     {
-        uint64_t p = 0;
-        std::string s;
         uint64_t at = base + (int64_t)i * 8;
         if (at < img.base || at >= img.base + img.vmsize)
             continue;
-        if (!img.read(img.ctx, at, &p, 8) || p < img.base || p >= img.base + img.vmsize)
+        if (!img.read(img.ctx, at, &q, 8) || q < img.base || q >= img.base + img.vmsize)
             continue;
-        if (!img.cstr(p, s) || !class_shaped(s))
+        if (!probe(img, q, s))
             continue;
         const int r = name_rank(s);
         if (r > best_rank)
@@ -159,10 +165,29 @@ static std::string guess_name(const Image &img, uint64_t base)
             best_rank = r;
             best = s;
             if (r == 2)
-                break;
+                return best;
         }
     }
+    if (!best.empty())
+        return best;
+    if (img.read(img.ctx, base - 8, &q, 8) && q >= img.base && q < img.base + img.vmsize)
+    {
+        for (int off = 0; off <= 0x20; off += 8)
+        {
+            if (!img.read(img.ctx, q + (uint64_t)off, &p, 8))
+                continue;
+            if (probe(img, p, s))
+                return s;
+        }
+        if (probe(img, q, s))
+            return s;
+    }
     return best;
+}
+
+std::string vtable_name(const Image &img, uint64_t vtable)
+{
+    return guess_name(img, vtable);
 }
 
 static void push_run(const Image &img, uint64_t start, uint64_t slots, uint64_t lo, uint64_t hi,
@@ -210,7 +235,7 @@ std::vector<VTable> scan_vtables(const Image &img)
     return out;
 }
 
-std::vector<Ctor> scan_ctors(const Image &img, uint64_t vtable_hint)
+std::vector<Ctor> scan_ctors(const Image &img, const std::set<uint64_t> &vtables)
 {
     std::vector<Ctor> out;
     std::set<uint64_t> seen;
@@ -225,18 +250,15 @@ std::vector<Ctor> scan_ctors(const Image &img, uint64_t vtable_hint)
         uint64_t f = 0;
         uint32_t rn = 0;
         uint32_t imm = 0;
-        if (!img.u32(va, w))
-            continue;
-        if ((w & 0xFFC00000u) != 0xF9000000u) // str xN,[xR,#imm]
+        if (!img.u32(va, w) || (w & 0xFFC00000u) != 0xF9000000u)
             continue;
         rn = (w >> 5) & 0x1Fu;
         imm = (w >> 10) & 0xFFFu;
         if (rn == 31 || (imm != 0 && imm != 8))
             continue;
-        const uint32_t reg = w & 0x1Fu;
-        if (reg == 31 || !value_before(img, va, reg, 4, val))
+        if (!value_before(img, va, w & 0x1Fu, 4, val))
             continue;
-        if (vtable_hint && val != vtable_hint)
+        if (!vtables.empty() && !vtables.count(val))
             continue;
         f = fn_start(img, va, lo);
         if (!f || seen.count(f))

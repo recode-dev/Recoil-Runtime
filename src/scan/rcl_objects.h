@@ -3,6 +3,7 @@
 
 #include "../core/rcl_scan.h"
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -33,7 +34,8 @@ struct Leaf
 };
 
 std::vector<VTable> scan_vtables(const Image &img);
-std::vector<Ctor> scan_ctors(const Image &img, uint64_t vtable_hint);
+std::vector<Ctor> scan_ctors(const Image &img, const std::set<uint64_t> &vtables);
+std::string vtable_name(const Image &img, uint64_t vtable);
 std::vector<Leaf> scan_leaf_getters(const Image &img);
 
 } // namespace rcl
