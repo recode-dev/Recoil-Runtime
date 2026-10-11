@@ -16,6 +16,7 @@
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <mach/mach.h>
 #include <unistd.h>
 #include <pthread.h>
 #endif
@@ -40,16 +41,19 @@ static bool live_read(void *ctx, uint64_t va, void *dst, size_t n)
     return true;
 }
 
-static bool raw_read(void *, uint64_t va, void *dst, size_t n)
+static bool raw_read_2(void *, uint64_t va, void *dst, size_t n)
 {
-    // heap objects live far above the image; keep the window tight so a bogus
-    // value cannot turn into a wild dereference
+    vm_size_t got = 0;
     if (n == 0 || n > 0x10000 || va < 0x100000000ULL || va >= 0x400000000ULL)
+        return false;
+    if ((va & 7) != 0)
         return false;
     if (va + n < va)
         return false;
-    memcpy(dst, (const void *)(uintptr_t)va, n);
-    return true;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)va, (vm_size_t)n,
+                          (vm_address_t)(uintptr_t)dst, &got) != KERN_SUCCESS)
+        return false;
+    return got == (vm_size_t)n;
 }
 
 static uint64_t text_vmsize(const struct mach_header_64 *h)
@@ -115,7 +119,7 @@ static int gather_images(std::vector<Loaded> &out, bool verbose)
         l.img.vmsize = ts;
         l.img.image_vmsize = macho_image_size(h);
         l.img.read = live_read;
-        l.img.read_raw = raw_read;
+        l.img.read_raw = raw_read_2;
         l.img.ctx = nullptr;
         l.name = name;
         l.text = ts;
