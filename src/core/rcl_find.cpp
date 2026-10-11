@@ -303,6 +303,37 @@ static void fmt_hex(char *dst, size_t cap, uint64_t v)
     snprintf(dst, cap, "0x%llx", (unsigned long long)v);
 }
 
+static int hint_score(const Image &img, uint64_t rva)
+{
+    uint32_t w[4] = {0, 0, 0, 0};
+    int score = 0;
+    int i = 0;
+    for (i = 0; i < 4; i++)
+    {
+        if (!img.u32(img.base + rva + (uint64_t)i * 4, w[i]))
+            return 0;
+    }
+    if (w[0] == 0xD503237Fu || w[0] == 0xD503233Fu)
+        score += 3;
+    else if ((w[0] & 0xFFC003FFu) == 0xD10003FFu || (w[0] & 0xFFC003FFu) == 0xA98003FFu ||
+             w[0] == 0xA9BF7BFDu || (w[0] & 0xFFC07FFFu) == 0xA9007BFDu)
+        score += 2;
+    else if ((w[0] & 0x9F00001Fu) == 0x90000000u)
+        score += 1;
+    if (w[1] == 0xD65F03C0u || w[3] == 0xD65F03C0u)
+        score += 1;
+    for (i = 0; i < 4; i++)
+    {
+        const uint32_t a = w[i] & 0xFFu;
+        const uint32_t b = (w[i] >> 8) & 0xFFu;
+        if (a >= 0x20u && a < 0x7Fu && b >= 0x20u && b < 0x7Fu)
+            return 0;
+        if ((w[i] == 0) && i == 0)
+            return 0;
+    }
+    return score;
+}
+
 FindResult find_all(const Image &img, const Seeds &s)
 {
     FindResult r;
@@ -369,13 +400,36 @@ FindResult find_all(const Image &img, const Seeds &s)
             r.items.push_back(f);
             continue;
         }
-        f.src = t.seed ? "hint" : "todo";
-        fmt_hex(buf, sizeof buf, t.seed);
-        f.info = buf;
+        if (t.seed > 0x1000u)
+        {
+            int score = hint_score(img, t.seed);
+            uint32_t w0 = 0;
+            uint32_t w1 = 0;
+            img.u32(img.base + t.seed, w0);
+            img.u32(img.base + t.seed + 4, w1);
+            f.src = score >= 2 ? "hint+" : "hint";
+            snprintf(buf, sizeof buf, "0x%x 0x%x", w0, w1);
+            f.info = buf;
+            f.info += score >= 2 ? " prologue" : " nomatch";
+            if (score >= 2)
+            {
+                f.value = t.seed;
+                r.by_hint++;
+                r.resolved++;
+            }
+            else
+            {
+                r.missing++;
+            }
+            r.items.push_back(f);
+            continue;
+        }
+        f.src = "todo";
+        f.info = "0x0";
         r.missing++;
         r.items.push_back(f);
     }
-    RCL_LOGLN("[find] sym=%zu field=%zu unresolved=%zu symtab=%zu", r.by_sym, r.by_field, r.missing,
+    RCL_LOGLN("[find] sym=%zu field=%zu hint=%zu unresolved=%zu symtab=%zu", r.by_sym, r.by_field, r.by_hint, r.missing,
               syms.size());
     return r;
 }

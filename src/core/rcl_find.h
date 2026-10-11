@@ -37,6 +37,7 @@ struct FindResult
     size_t missing = 0;
     size_t by_sym = 0;
     size_t by_field = 0;
+    size_t by_hint = 0;
     std::vector<Found> items;
 };
 
