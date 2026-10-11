@@ -63,14 +63,43 @@ The dylib lands in `.theos/`; `make` also copies it next to the project root for
 ## Decoder notes
 
 The A64 decoder covers the integer, branch, system and load/store encodings, the bitfield
-aliases (`lsl`/`lsr`/`asr`/`ubfx`/`sbfx`/`bfi`/`bfxil`/`sxtb`/`sxth`/`sxtw`), and the common
-scalar FP forms (`fadd`/`fsub`/`fmul`/`fdiv`/`fmax`/`fmin`/`fcmp`/`fabs`/`fneg`/`fsqrt`/`fcvt`/
-`frint*`/`scvtf`/`ucvtf`/`fcvtzs`/`fcvtzu`/`fmov`). Anything else is emitted as `.word 0x…` so a
-listing never silently loses an instruction. Advanced SIMD is not decoded yet and shows up as
-`.word`.
+aliases (`lsl`/`lsr`/`asr`/`ubfx`/`sbfx`/`bfi`/`bfxil`/`sxtb`/`sxth`/`sxtw`), the load/store
+exclusive and acquire/release families (`ldxr`/`stxr`/`ldaxr`/`stlxr`/`ldxp`/`stxp`/`ldar`/`stlr`
+with their byte/half forms), and the scalar FP forms (`fadd`/`fsub`/`fmul`/`fdiv`/`fmax`/`fmin`/
+`fmadd`…/`fcmp`/`fcsel`/`fabs`/`fneg`/`fsqrt`/`fcvt`/`frint*`/`scvtf`/`ucvtf`/`fcvtzs`/`fcvtzu`/
+`fmov`, including the FP-immediate form). Anything else is emitted as `.word 0x…` so a listing
+never silently loses an instruction.
+
+Not decoded yet, and therefore visible as `.word`: advanced SIMD (vector arithmetic, `movi`,
+`dup`, `mov` between vector registers), SVE, the LSE atomics (`ldadd`/`swp`/`cas`) and
+`ccmp`/`ccmn`.
 
 The shipped client is stripped, so function starts are found by the target table and function
-ends by a heuristic: a terminator (`ret` / unconditional `b`) past the furthest forward
-conditional branch, plus a prologue scan for the next function boundary. Both are visible in the
-output as the `insns` / `end` header fields; treat the last few instructions of a function as
-uncertain.
+ends by a heuristic: a terminating instruction (`ret`, a tail call `b` leaving the function, or
+any terminator past the furthest forward conditional branch) plus a prologue scan for the next
+function boundary. Both are visible in the output as the `insns` / `end` header fields; treat the
+last few instructions of a function as uncertain.
+
+## Verification
+
+`tools/decode_check.py` is a differential test for the decoder. It samples A64 words out of a
+Mach-O `__TEXT`, decodes them with both the Recoil decoder and capstone, and reports decode gaps
+and real mismatches (alias spellings and number formatting are normalised away). It is a
+development tool and is not part of the dylib build.
+
+```
+pip install capstone
+python3 tools/decode_check.py <macho> [samples] [stride]
+```
+
+Measured against the Nulls client binary, 20000 sampled `__TEXT` words:
+
+| metric | value |
+|---|---|
+| recoil decodes | 90.1% of the words capstone decodes |
+| emitted as `.word` | 9.9%, of which ~6.7 points is data (`__TEXT` holds string/pointer data between functions) |
+| mnemonic mismatch | 0.6%, of which most is data that happens to form a valid encoding |
+| operand mismatch | 0.2% (formatting: float display, decimal vs hex offsets) |
+
+Every load/store, bitfield, branch, exclusive/atomic and scalar-FP mismatch this gate reported has
+been fixed; what is left is the SIMD/SVE area listed above.

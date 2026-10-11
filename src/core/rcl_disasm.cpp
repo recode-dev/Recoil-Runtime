@@ -119,7 +119,11 @@ std::string ldst_name(int opc, int size, bool vec, bool load, int mode)
     else if (mode == 2)
         base += "tr";
     if (vec)
+    {
+        if (normal)
+            base += "r";
         return base;
+    }
     if (opc == 3 && size == 3)
         return "prfm";
     if (opc == 0 || opc == 1)
@@ -143,6 +147,34 @@ std::string ldst_name(int opc, int size, bool vec, bool load, int mode)
     base += "s";
     base += size == 0 ? "b" : size == 1 ? "h" : "w";
     return base;
+}
+
+std::string fp_imm_value(uint32_t imm8, int bytes)
+{
+    const bool sbit = ((imm8 >> 7) & 1u) != 0;
+    const bool b = ((imm8 >> 6) & 1u) != 0;
+    const uint32_t e = (imm8 >> 4) & 0x3u;
+    const uint32_t f = imm8 & 0xFu;
+    char buf[40];
+    if (bytes == 4)
+    {
+        uint32_t exp = ((b ? 0u : 1u) << 7) | ((b ? 0x1Fu : 0u) << 2) | e;
+        uint32_t bits = ((sbit ? 1u : 0u) << 31) | (exp << 23) | (f << 19);
+        float v = 0;
+        memcpy(&v, &bits, 4);
+        snprintf(buf, sizeof buf, "%.8g", (double)v);
+        return std::string(buf);
+    }
+    if (bytes == 8)
+    {
+        uint64_t exp = ((uint64_t)(b ? 0u : 1u) << 10) | ((uint64_t)(b ? 0xFFu : 0u) << 2) | e;
+        uint64_t bits = ((uint64_t)(sbit ? 1u : 0u) << 63) | (exp << 52) | ((uint64_t)f << 48);
+        double v = 0;
+        memcpy(&v, &bits, 8);
+        snprintf(buf, sizeof buf, "%.17g", v);
+        return std::string(buf);
+    }
+    return std::string();
 }
 
 bool looks_like_entry(uint32_t w)
@@ -287,7 +319,7 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         const uint32_t imm = (w >> 10) & 0xFFFu;
         out.imm = (int64_t)imm << shift;
         out.kind = s ? IK_CMP : IK_ALU;
-        if (s)
+        if (s && rd == 31u)
         {
             out.rd = -1;
             snprintf(buf, sizeof buf, "%s %s, #0x%x", op ? "cmp" : "cmn",
@@ -295,9 +327,9 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         }
         else
         {
-            snprintf(buf, sizeof buf, "%s %s, %s, #0x%x%s", op ? "sub" : "add",
-                     r_x((int)rd, sf, true).c_str(), r_x((int)rn, sf, true).c_str(), imm,
-                     shift ? ", lsl #12" : "");
+            const char *mn = s ? (op ? "subs" : "adds") : (op ? "sub" : "add");
+            snprintf(buf, sizeof buf, "%s %s, %s, #0x%x%s", mn, r_x((int)rd, sf, true).c_str(),
+                     r_x((int)rn, sf, true).c_str(), imm, shift ? ", lsl #12" : "");
         }
         out.text = buf;
         return true;
@@ -366,6 +398,13 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         const std::string d = r_x((int)rd, sf, false);
         const std::string n = r_x((int)rn, sf, false);
         out.kind = IK_ALU;
+        if (!sf && (immr > 31u || imms > 31u))
+        {
+            snprintf(buf, sizeof buf, ".word 0x%08x", w);
+            out.kind = IK_UNKNOWN;
+            out.text = buf;
+            return false;
+        }
         if (opc == 0)
         {
             if (immr == 0 && (imms == 7 || imms == 15 || (imms == 31 && sf)))
@@ -373,20 +412,22 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
                 const char *mn = imms == 7 ? "sxtb" : imms == 15 ? "sxth" : "sxtw";
                 snprintf(buf, sizeof buf, "%s %s, %s", mn, d.c_str(),
                          r_x((int)rn, false, false).c_str());
-                out.text = buf;
-                return true;
             }
-            if (imms == width - 1)
+            else if (imms == width - 1u)
                 snprintf(buf, sizeof buf, "asr %s, %s, #%u", d.c_str(), n.c_str(), immr);
-            else if (immr == 0)
-                snprintf(buf, sizeof buf, "sbfx %s, %s, #0, #%u", d.c_str(), n.c_str(), imms + 1);
+            else if (imms + 1u == immr)
+                snprintf(buf, sizeof buf, "sbfiz %s, %s, #%u, #%u", d.c_str(), n.c_str(),
+                         width - immr, imms + 1);
+            else if (imms >= immr)
+                snprintf(buf, sizeof buf, "sbfx %s, %s, #%u, #%u", d.c_str(), n.c_str(), immr,
+                         imms - immr + 1);
             else
                 snprintf(buf, sizeof buf, "sbfiz %s, %s, #%u, #%u", d.c_str(), n.c_str(),
                          width - immr, imms + 1);
         }
         else if (opc == 1)
         {
-            if (immr == 0 && imms == width - 1)
+            if (immr == 0 && imms == width - 1u)
                 snprintf(buf, sizeof buf, "mov %s, %s", d.c_str(), n.c_str());
             else if (imms < immr)
                 snprintf(buf, sizeof buf, "bfi %s, %s, #%u, #%u", d.c_str(), n.c_str(),
@@ -397,16 +438,17 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         }
         else
         {
-            if (imms == width - 1)
+            if (imms == width - 1u)
                 snprintf(buf, sizeof buf, "lsr %s, %s, #%u", d.c_str(), n.c_str(), immr);
-            else if (imms + 1 == immr)
+            else if (imms + 1u == immr)
                 snprintf(buf, sizeof buf, "lsl %s, %s, #%u", d.c_str(), n.c_str(), width - immr);
-            else if (immr == 0 && imms == 7)
+            else if (immr == 0 && imms == 7u)
                 snprintf(buf, sizeof buf, "uxtb %s, %s", d.c_str(), n.c_str());
-            else if (immr == 0 && imms == 15)
+            else if (immr == 0 && imms == 15u)
                 snprintf(buf, sizeof buf, "uxth %s, %s", d.c_str(), n.c_str());
-            else if (immr == 0)
-                snprintf(buf, sizeof buf, "ubfx %s, %s, #0, #%u", d.c_str(), n.c_str(), imms + 1);
+            else if (imms >= immr)
+                snprintf(buf, sizeof buf, "ubfx %s, %s, #%u, #%u", d.c_str(), n.c_str(), immr,
+                         imms - immr + 1);
             else
                 snprintf(buf, sizeof buf, "ubfiz %s, %s, #%u, #%u", d.c_str(), n.c_str(),
                          width - immr, imms + 1);
@@ -600,6 +642,53 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         return true;
     }
 
+    // ---------------------------------------------------------------- load/store exclusive and ordered
+    if ((w & 0x3F000000u) == 0x08000000u)
+    {
+        static const struct
+        {
+            uint32_t val;
+            const char *mn;
+            bool store;
+            bool pair;
+        } kEx[8] = {
+            {0x08507C00u, "ldxr", false, false},  {0x0850FC00u, "ldaxr", false, false},
+            {0x08007C00u, "stxr", true, false},   {0x0800FC00u, "stlxr", true, false},
+            {0x08D0FC00u, "ldar", false, false},  {0x0890FC00u, "stlr", true, false},
+            {0x08700000u, "ldxp", false, true},   {0x08200000u, "stxp", true, true},
+        };
+        const uint32_t key = w & 0x3FF0FC00u;
+        const uint32_t size = (w >> 30) & 0x3u;
+        const uint32_t rs = (w >> 16) & 0x1Fu;
+        const uint32_t rt2 = (w >> 10) & 0x1Fu;
+        for (int i = 0; i < 8; i++)
+        {
+            if (kEx[i].val != key)
+                continue;
+            const char *suffix = size == 0 ? "b" : size == 1 ? "h" : "";
+            const bool wide = (size == 3);
+            out.kind = kEx[i].store ? IK_STORE : IK_LOAD;
+            out.width = 1 << size;
+            if (kEx[i].pair)
+                snprintf(buf, sizeof buf, "%s%s %s, %s, [%s]", kEx[i].mn, suffix,
+                         kEx[i].store ? r_x((int)rs, false, false).c_str()
+                                      : r_x((int)rd, wide, false).c_str(),
+                         r_x((int)rt2, wide, false).c_str(),
+                         r_x((int)rn, true, true).c_str());
+            else if (kEx[i].store)
+                snprintf(buf, sizeof buf, "%s%s %s, %s, [%s]", kEx[i].mn, suffix,
+                         r_x((int)rs, false, false).c_str(),
+                         r_x((int)rd, wide, false).c_str(),
+                         r_x((int)rn, true, true).c_str());
+            else
+                snprintf(buf, sizeof buf, "%s%s %s, [%s]", kEx[i].mn, suffix,
+                         r_x((int)rd, wide, false).c_str(),
+                         r_x((int)rn, true, true).c_str());
+            out.text = buf;
+            return true;
+        }
+    }
+
     // ---------------------------------------------------------------- LDR (literal)
     if ((w & 0x3B000000u) == 0x18000000u)
     {
@@ -632,7 +721,7 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         const bool load = ((w >> 22) & 1u) != 0;
         const uint32_t idx = (w >> 23) & 0x3u;
         const uint32_t rt2 = (w >> 10) & 0x1Fu;
-        const int scale = vec ? (opc == 3 ? 4 : opc == 2 ? 3 : 2) : (opc == 2 ? 3 : 2);
+        const int scale = vec ? (opc == 0 ? 2 : opc == 1 ? 3 : 4) : (opc == 2 ? 3 : 2);
         const uint64_t raw = (w >> 15) & 0x7Fu;
         const int64_t off = sext(raw, 7) << scale;
         const bool w32 = (!vec && opc == 0);
@@ -656,7 +745,13 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
             a = r_x((int)rd, !w32, false);
             b = r_x((int)rt2, !w32, false);
         }
-        const char *mn = load ? (opc == 1 ? "ldpsw" : "ldp") : "stp";
+        const char *mn;
+        if (!vec && opc == 1)
+            mn = "ldpsw";
+        else if (idx == 0)
+            mn = load ? "ldnp" : "stnp";
+        else
+            mn = load ? "ldp" : "stp";
         if (idx == 1)
             snprintf(buf, sizeof buf, "%s %s, %s, [%s], #%s", mn, a.c_str(), b.c_str(),
                      r_x((int)((w >> 5) & 0x1Fu), true, true).c_str(), hex_off(off).c_str());
@@ -674,9 +769,23 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         const uint32_t size = (w >> 30) & 0x3u;
         const uint32_t opc = (w >> 22) & 0x3u;
         const bool vec = ((w >> 26) & 1u) != 0;
-        const uint64_t off = ((w >> 10) & 0xFFFu) << size;
-        const int bytes = 1 << size;
-        const bool load = opc != 0;
+        uint64_t off = ((w >> 10) & 0xFFFu) << size;
+        int bytes = 1 << size;
+        bool load = opc != 0;
+        if (vec)
+        {
+            if (opc >= 2u)
+            {
+                bytes = 16;
+                load = opc == 3u;
+                off = ((w >> 10) & 0xFFFu) << 4;
+            }
+            else
+            {
+                bytes = 1 << size;
+                load = opc == 1u;
+            }
+        }
         std::string r;
         out.kind = load ? IK_LOAD : IK_STORE;
         out.width = bytes;
@@ -685,8 +794,10 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
             r = r_v((int)rd, bytes);
         else if (opc == 0 || opc == 1)
             r = r_x((int)rd, size == 3, false);
-        else
+        else if (opc == 2)
             r = r_x((int)rd, true, false);
+        else
+            r = r_x((int)rd, false, false);
         snprintf(buf, sizeof buf, "%s %s, [%s, #%s]", ldst_name(opc, size, vec, load, 0).c_str(),
                  r.c_str(), r_x((int)rn, true, true).c_str(), hex_off((int64_t)off).c_str());
         out.text = buf;
@@ -700,9 +811,22 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         const uint32_t opc = (w >> 22) & 0x3u;
         const bool vec = ((w >> 26) & 1u) != 0;
         const uint32_t mode = (w >> 10) & 0x3u;
-        const int64_t off = sext((w >> 12) & 0x1FFu, 9);
-        const int bytes = 1 << size;
-        const bool load = opc != 0;
+        int64_t off = sext((w >> 12) & 0x1FFu, 9);
+        int bytes = 1 << size;
+        bool load = opc != 0;
+        if (vec)
+        {
+            if (opc >= 2u)
+            {
+                bytes = 16;
+                load = opc == 3u;
+            }
+            else
+            {
+                bytes = 1 << size;
+                load = opc == 1u;
+            }
+        }
         const int mn_mode = mode == 0 ? 1 : (mode == 2 ? 2 : 0);
         std::string r;
         out.kind = load ? IK_LOAD : IK_STORE;
@@ -712,8 +836,10 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
             r = r_v((int)rd, bytes);
         else if (opc == 0 || opc == 1)
             r = r_x((int)rd, size == 3, false);
-        else
+        else if (opc == 2)
             r = r_x((int)rd, true, false);
+        else
+            r = r_x((int)rd, false, false);
         if (mode == 1)
             snprintf(buf, sizeof buf, "%s %s, [%s], #%s", ldst_name(opc, size, vec, load, 0).c_str(),
                      r.c_str(), r_x((int)rn, true, true).c_str(), hex_off(off).c_str());
@@ -734,8 +860,21 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         const uint32_t opc = (w >> 22) & 0x3u;
         const bool vec = ((w >> 26) & 1u) != 0;
         const uint32_t option = (w >> 13) & 0x7u;
-        const bool load = opc != 0;
-        const int bytes = 1 << size;
+        int bytes = 1 << size;
+        bool load = opc != 0;
+        if (vec)
+        {
+            if (opc >= 2u)
+            {
+                bytes = 16;
+                load = opc == 3u;
+            }
+            else
+            {
+                bytes = 1 << size;
+                load = opc == 1u;
+            }
+        }
         std::string r;
         out.kind = load ? IK_LOAD : IK_STORE;
         out.width = bytes;
@@ -743,8 +882,10 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
             r = r_v((int)rd, bytes);
         else if (opc == 0 || opc == 1)
             r = r_x((int)rd, size == 3, false);
-        else
+        else if (opc == 2)
             r = r_x((int)rd, true, false);
+        else
+            r = r_x((int)rd, false, false);
         const bool shifted = ((w >> 12) & 1u) != 0;
         if (shifted)
             snprintf(buf, sizeof buf, "%s %s, [%s, %s, lsl #%d]",
@@ -806,13 +947,13 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         std::string rm_s = r_x((int)rm, sf, false);
         if (amt)
             rm_s += ", " + std::string(kShift[shift]) + " #" + std::to_string(amt);
-        if (s)
+        if (s && rd == 31u)
         {
             out.rd = -1;
             set_text(out, op ? "cmp" : "cmn", r_x((int)rn, sf, true) + ", " + rm_s);
             return true;
         }
-        set_text(out, op ? "sub" : "add",
+        set_text(out, s ? (op ? "subs" : "adds") : (op ? "sub" : "add"),
                  r_x((int)rd, sf, true) + ", " + r_x((int)rn, sf, true) + ", " + rm_s);
         return true;
     }
@@ -829,13 +970,13 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         if (amt)
             rm_s += " #" + std::to_string(amt);
         out.kind = s ? IK_CMP : IK_ALU;
-        if (s)
+        if (s && rd == 31u)
         {
             out.rd = -1;
             set_text(out, op ? "cmp" : "cmn", r_x((int)rn, sf, true) + ", " + rm_s);
             return true;
         }
-        set_text(out, op ? "sub" : "add",
+        set_text(out, s ? (op ? "subs" : "adds") : (op ? "sub" : "add"),
                  r_x((int)rd, sf, true) + ", " + r_x((int)rn, sf, true) + ", " + rm_s);
         return true;
     }
@@ -990,6 +1131,72 @@ bool disasm_words(uint64_t va, uint32_t w, Insn &out)
         return true;
     }
 
+    // ---------------------------------------------------------------- FP conditional select
+    if ((w & 0x7F200C00u) == 0x1E200C00u)
+    {
+        int bytes = 0;
+        if (!fp_type(w, bytes))
+        {
+            snprintf(buf, sizeof buf, ".word 0x%08x", w);
+            out.text = buf;
+            return false;
+        }
+        const uint32_t cond = (w >> 12) & 0xFu;
+        out.kind = IK_ALU;
+        snprintf(buf, sizeof buf, "fcsel %s, %s, %s, %s", r_v((int)rd, bytes).c_str(),
+                 r_v((int)rn, bytes).c_str(), r_v((int)rm, bytes).c_str(), kCond[cond]);
+        out.text = buf;
+        return true;
+    }
+
+    // ---------------------------------------------------------------- FP (3 source)
+    if ((w & 0x5F000000u) == 0x1F000000u)
+    {
+        int bytes = 0;
+        const bool o1 = ((w >> 21) & 1u) != 0;
+        const bool o0 = ((w >> 15) & 1u) != 0;
+        const uint32_t ra = (w >> 10) & 0x1Fu;
+        const char *mn =
+            !o1 && !o0 ? "fmadd" : !o1 && o0 ? "fmsub" : o1 && !o0 ? "fnmadd" : "fnmsub";
+        if (!fp_type(w, bytes))
+        {
+            snprintf(buf, sizeof buf, ".word 0x%08x", w);
+            out.text = buf;
+            return false;
+        }
+        out.kind = IK_ALU;
+        snprintf(buf, sizeof buf, "%s %s, %s, %s, %s", mn, r_v((int)rd, bytes).c_str(),
+                 r_v((int)rn, bytes).c_str(), r_v((int)rm, bytes).c_str(),
+                 r_v((int)ra, bytes).c_str());
+        out.text = buf;
+        return true;
+    }
+
+    // ---------------------------------------------------------------- FP immediate
+    if ((w & 0x7F201000u) == 0x1E201000u)
+    {
+        int bytes = 0;
+        if (!fp_type(w, bytes) || bytes == 2)
+        {
+            snprintf(buf, sizeof buf, ".word 0x%08x", w);
+            out.text = buf;
+            return false;
+        }
+        const std::string val = fp_imm_value((w >> 13) & 0xFFu, bytes);
+        out.kind = IK_ALU;
+        snprintf(buf, sizeof buf, "fmov %s, #%s", r_v((int)rd, bytes).c_str(), val.c_str());
+        out.text = buf;
+        return true;
+    }
+
+    // ---------------------------------------------------------------- zero word / padding
+    if (w == 0u)
+    {
+        out.kind = IK_SYS;
+        out.text = "udf #0";
+        return true;
+    }
+
     // ---------------------------------------------------------------- FP <-> integer conversion
     if ((w & 0x7F200000u) == 0x1E200000u)
     {
@@ -1081,6 +1288,9 @@ bool disasm_function(const Image &img, uint64_t start, size_t max_insns, Func &o
         }
         if (in.kind == IK_RET)
             seen_ret = true;
+        if (in.kind == IK_BRANCH && !in.cond && !in.indirect && in.target &&
+            (in.target < start || in.target > start + 0x2000))
+            break;
         const bool terminal = (in.kind == IK_RET) ||
                               (in.kind == IK_BRANCH && !in.cond && !in.indirect);
         if (terminal && va >= furthest)
@@ -1137,8 +1347,16 @@ void disasm_listing(const Func &f, uint64_t base, const NameTable &names, std::s
         if ((in.kind == IK_CALL || in.kind == IK_BRANCH) && in.target)
         {
             const std::string *nm = names.lookup(in.target - base);
-            out += "  ; ";
-            out += nm ? *nm : ("sub_" + hex64(in.target - base).substr(2));
+            if (nm)
+            {
+                out += "  ; ";
+                out += *nm;
+            }
+            else if (in.kind == IK_CALL)
+            {
+                out += "  ; sub_";
+                out += hex64(in.target - base).substr(2);
+            }
         }
         if (in.kind == IK_ADR && in.target)
         {
