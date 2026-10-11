@@ -154,7 +154,7 @@ uint64_t code_str_lookup(const Image &img, uint64_t cstr_va, uint64_t cstr_size,
     {
         if (buf[i] != needle[0])
             continue;
-        if (memcmp(buf.data() + i, needle, len) && 1)
+        if (memcmp(buf.data() + i, needle, len) != 0)
             continue;
         if (buf[i + len] != 0)
             continue;
