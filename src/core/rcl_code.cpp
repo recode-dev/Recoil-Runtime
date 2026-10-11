@@ -236,11 +236,82 @@ void code_singletons(const Image &img, std::vector<uint64_t> &out)
     }
 }
 
+static bool cstr_range(const Image &img, uint64_t &va, uint64_t &size)
+{
+    uint8_t hdr[32];
+    uint32_t ncmds = 0;
+    uint32_t sizeofcmds = 0;
+    std::vector<uint8_t> lc;
+    if (!img.read(img.ctx, img.base, hdr, sizeof hdr) || rd32(hdr) != kMagic64)
+        return false;
+    ncmds = rd32(hdr + 16);
+    sizeofcmds = rd32(hdr + 20);
+    if (!ncmds || ncmds > 4096 || sizeofcmds < 8 || sizeofcmds > 0x400000)
+        return false;
+    lc.resize(sizeofcmds);
+    if (!img.read(img.ctx, img.base + sizeof hdr, lc.data(), sizeofcmds))
+        return false;
+    for (uint32_t p = 0, c = 0; c < ncmds && p + 8 <= sizeofcmds; c++)
+    {
+        const uint32_t cmd = rd32(lc.data() + p);
+        const uint32_t sz = rd32(lc.data() + p + 4);
+        if (sz < 8 || p + sz > sizeofcmds)
+            break;
+        if (cmd == kSeg64 && sz >= 72 && !memcmp(lc.data() + p + 8, "__TEXT", 6))
+        {
+            const uint64_t vmaddr = rd64(lc.data() + p + 24);
+            const uint32_t nsects = rd32(lc.data() + p + 64);
+            for (uint32_t s = 0; s < nsects && 72 + (s + 1) * 80 <= sz; s++)
+            {
+                const uint8_t *sec = lc.data() + p + 72 + (size_t)s * 80;
+                if (memcmp(sec, "__cstring", 10))
+                    continue;
+                const uint64_t addr = rd64(sec + 32);
+                const uint64_t ssize = rd64(sec + 40);
+                if (!ssize)
+                    break;
+                va = img.base + (addr - vmaddr);
+                size = ssize;
+                return true;
+            }
+        }
+        p += sz;
+    }
+    return false;
+}
+
 void code_resolve(const Image &img, const Seeds &s, Found &f, size_t &by_str, size_t &by_sing)
 {
     static bool str_done = false;
     static std::map<uint64_t, std::vector<uint64_t>> refs;
     static std::vector<uint64_t> sings;
+    static uint64_t cva = 0;
+    static uint64_t csz = 0;
+    uint64_t sva = s.cstr_va;
+    uint64_t ssz = s.cstr_size;
+    if (!cva && !str_done)
+    {
+        if (!sva || !ssz)
+        {
+            if (cstr_range(img, cva, csz))
+            {
+                sva = cva;
+                ssz = csz;
+                RCL_LOGLN("[code] cstring fallback 0x%llx size %llu", (unsigned long long)cva,
+                          (unsigned long long)csz);
+            }
+        }
+        else
+        {
+            cva = sva;
+            csz = ssz;
+        }
+    }
+    else if (cva)
+    {
+        sva = cva;
+        ssz = csz;
+    }
     char name[64];
     const char *p = f.key;
     const char *last = f.key;
@@ -256,13 +327,13 @@ void code_resolve(const Image &img, const Seeds &s, Found &f, size_t &by_str, si
     len = strlen(last);
     if (len >= 3 && len < sizeof name)
     {
-        const uint64_t sv = code_str_lookup(img, s.cstr_va, s.cstr_size, last);
+        const uint64_t sv = code_str_lookup(img, sva, ssz, last);
         if (sv)
         {
             if (!str_done)
             {
                 str_done = true;
-                code_str_refs(img, s.cstr_va, s.cstr_size, refs);
+                code_str_refs(img, sva, ssz, refs);
                 RCL_LOGLN("[code] string refs %zu", refs.size());
             }
             std::map<uint64_t, std::vector<uint64_t>>::iterator it = refs.find(sv);

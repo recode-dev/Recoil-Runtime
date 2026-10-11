@@ -45,7 +45,8 @@ void dump_targets(const Image &img, const Seeds &s)
     FindResult fr = find_all(img, s);
     std::string t = out_fmt("# targets\n\n- total: %zu\n- by symbol: %zu\n- by field hint: %zu\n"
                             "- by hint rva (prologue check): %zu\n- unresolved: %zu\n\n",
-                            kTargetCount, fr.by_sym, fr.by_field, fr.by_hint, fr.missing);
+                            kTargetCount, fr.by_sym, fr.by_field, fr.by_hint, fr.by_str, fr.by_sing,
+                            fr.missing);
     size_t i = 0;
     t += "## offsets\n\n```js\nexport const offsets = Object.freeze(\n{\n";
     for (i = 0; i < fr.items.size(); i++)
