@@ -251,78 +251,127 @@ static bool rdany(const Image &img, uint64_t va, void *dst, size_t n)
     return img.read(img.ctx, va, dst, n);
 }
 
+static bool win_ok(uint64_t va)
+{
+    return va >= 0x100000000ULL && va < 0x400000000ULL;
+}
+
+static std::string rstr(const Image &img, uint64_t va, size_t maxn)
+{
+    char buf[64];
+    size_t n = maxn < sizeof buf - 1 ? maxn : sizeof buf - 1;
+    if (!win_ok(va) || n < 2)
+        return std::string();
+    if (!rdany(img, va, buf, n))
+        return std::string();
+    buf[n] = 0;
+    for (size_t i = 0; i < n; i++)
+    {
+        if (buf[i] == 0)
+        {
+            if (i < 2)
+                return std::string();
+            return std::string(buf, i);
+        }
+        if ((unsigned char)buf[i] < 32 || (unsigned char)buf[i] > 127)
+            return std::string();
+    }
+    return std::string();
+}
+
+static std::string scstring(const Image &img, uint64_t sc)
+{
+    uint32_t len = 0;
+    uint64_t data = 0;
+    if (!rdany(img, sc + 4, &len, 4) || len == 0 || len > 64)
+        return std::string();
+    if (len <= 7)
+        return rstr(img, sc + 8, len);
+    if (!rdany(img, sc + 8, &data, 8) || !data)
+        return std::string();
+    return rstr(img, data, len);
+}
+
 void dump_colmap(const Image &img, const Seeds &s)
 {
     const uint64_t arr = img.base + 0x1154f08ULL;
-    std::string root = out_fmt("# table array probe\n\n- arr: `0x%llx`\n\n## raw slots\n\n",
-                               (unsigned long long)arr);
-    std::string idx = "# column map\n\n";
-    for (int i = 0; i < 24; i++)
-    {
-        uint64_t w = 0;
-        if (rdany(img, arr + (uint64_t)i * 8, &w, 8))
-            root += out_fmt("- slot[%d] = `0x%llx`\n", i, (unsigned long long)w);
-    }
-    for (int i = 0; i < 24; i++)
+    std::string root = out_fmt("# column map\n\n- arr: `0x%llx`\n\n", (unsigned long long)arr);
+    std::string idx = "# tables\n\n";
+    for (int i = 0; i < 157; i++)
     {
         uint64_t t = 0;
         uint64_t vt = 0;
+        uint64_t ti = 0;
+        uint64_t csv = 0;
+        uint64_t buckets = 0;
         uint64_t cnt = 0;
+        uint64_t rows = 0;
         uint64_t a = 0;
         uint64_t b = 0;
         uint64_t c = 0;
         std::string nm;
+        std::string body;
         if (!rdany(img, arr + (uint64_t)i * 8, &t, 8) || !t)
             continue;
-        root += out_fmt("\n## slot %d  table `0x%llx`\n\n", i, (unsigned long long)t);
-        if (rdany(img, t, &vt, 8))
-            root += out_fmt("- *(table) = `0x%llx`\n", (unsigned long long)vt);
-        if (rdany(img, t + 0x50, &cnt, 8))
-            root += out_fmt("- *(table+0x50) = `0x%llx`\n", (unsigned long long)cnt);
-        if (!rdany(img, t + 0x58, &a, 8) || !a)
-        {
-            root += "- *(table+0x58) = null\n";
+        rdany(img, t, &vt, 8);
+        rdany(img, t + 0x50, &ti, 8);
+        if (!rdany(img, t + 0x58, &csv, 8) || !csv)
             continue;
-        }
-        root += out_fmt("- *(table+0x58) = `0x%llx`\n", (unsigned long long)a);
-        if (rdany(img, a, &b, 8))
-            root += out_fmt("- *(csv+0x00) = `0x%llx`\n", (unsigned long long)b);
-        if (rdany(img, a + 8, &b, 8))
-            root += out_fmt("- *(csv+0x08) = `0x%llx`\n", (unsigned long long)b);
-        if (rdany(img, a + 0x18, &b, 8))
-            root += out_fmt("- *(csv+0x18) = `0x%llx`\n", (unsigned long long)b);
-        if (rdany(img, a + 0x58, &b, 8) && b && rdany(img, b + 0x18, &c, 8) && c)
+        rdany(img, csv, &buckets, 8);
+        rdany(img, csv + 8, &cnt, 8);
+        rdany(img, csv + 0x18, &rows, 8);
+        if (rdany(img, csv + 0x58, &a, 8) && a && rdany(img, a + 0x18, &b, 8) && b)
         {
-            uint64_t sc = c + 0x30;
-            uint32_t len = 0;
-            uint64_t data = 0;
-            root += out_fmt("- name-scstring `0x%llx`\n", (unsigned long long)sc);
-            if (img.u32(sc + 4, len) && len > 0 && len < 64)
+            if (rdany(img, b + 0x30, &c, 8))
+                nm = scstring(img, b + 0x30);
+        }
+        body = out_fmt("# tbl %d\n\n- table `0x%llx` vtable `0x%llx` idx %llu\n- csv `0x%llx`\n"
+                       "- buckets `0x%llx` n=%llu\n- rows `0x%llx`\n- name \"%s\"\n\n",
+                       i, (unsigned long long)t, (unsigned long long)vt, (unsigned long long)ti,
+                       (unsigned long long)csv, (unsigned long long)buckets, (unsigned long long)cnt,
+                       (unsigned long long)rows, nm.c_str());
+        if (win_ok(buckets) && cnt > 0 && cnt <= 4096)
+        {
+            size_t shown = 0;
+            for (uint64_t k = 0; k < cnt && shown < 48; k++)
             {
-                if (len <= 7)
+                uint64_t e = 0;
+                if (!rdany(img, buckets + k * 8, &e, 8) || !e)
+                    continue;
+                for (int chain = 0; chain < 8 && shown < 48; chain++)
                 {
-                    char buf[72];
-                    if (rdany(img, sc + 8, buf, len))
+                    if (!win_ok(e))
+                        break;
+                    body += out_fmt("\n## bucket %llu entry `0x%llx`\n\n", (unsigned long long)k,
+                                    (unsigned long long)e);
+                    for (int q = 0; q < 6; q++)
                     {
-                        buf[len] = 0;
-                        nm = std::string(buf);
+                        uint64_t w = 0;
+                        std::string st;
+                        if (!rdany(img, e + (uint64_t)q * 8, &w, 8))
+                            break;
+                        st = rstr(img, w, 40);
+                        body += out_fmt("- `+0x%02x` = `0x%llx`%s%s%s\n", q * 8,
+                                        (unsigned long long)w, st.empty() ? "" : "  \"",
+                                        st.empty() ? "" : st.c_str(), st.empty() ? "" : "\"");
+                    }
+                    shown++;
+                    {
+                        uint64_t nxt = 0;
+                        if (!rdany(img, e, &nxt, 8) || !nxt || nxt == e)
+                            break;
+                        e = nxt;
                     }
                 }
-                else if (rdany(img, sc + 8, &data, 8) && data)
-                {
-                    std::string tmp;
-                    if (img.cstr(data, tmp))
-                        nm = tmp;
-                }
-                root += out_fmt("- name = \"%s\"\n", nm.c_str());
             }
         }
-        idx += out_fmt("- [%d] table `0x%llx` csv `0x%llx` name \"%s\"\n", i,
-                       (unsigned long long)t, (unsigned long long)a, nm.c_str());
+        out_write("columns", out_fmt("map-%d", i).c_str(), body);
+        idx += out_fmt("- [%d] `0x%llx` n=%llu name \"%s\"\n", i, (unsigned long long)csv,
+                       (unsigned long long)cnt, nm.c_str());
     }
-    out_write("columns", "map-root", root);
     out_write("columns", "map-index", idx);
-    RCL_LOGLN("[dump] column map probe");
+    out_write("columns", "map-root", root);
+    RCL_LOGLN("[dump] column map");
 }
 
 void dump_all(const Image &img, const Seeds &s)
