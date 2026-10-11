@@ -41,7 +41,7 @@ static bool live_read(void *ctx, uint64_t va, void *dst, size_t n)
     return true;
 }
 
-static bool raw_read_2(void *, uint64_t va, void *dst, size_t n)
+static bool raw_read_3(void *, uint64_t va, void *dst, size_t n)
 {
     vm_size_t got = 0;
     if (n == 0 || n > 0x10000 || va < 0x100000000ULL || va >= 0x400000000ULL)
@@ -119,7 +119,7 @@ static int gather_images(std::vector<Loaded> &out, bool verbose)
         l.img.vmsize = ts;
         l.img.image_vmsize = macho_image_size(h);
         l.img.read = live_read;
-        l.img.read_raw = raw_read_2;
+        l.img.read_raw = raw_read_3;
         l.img.ctx = nullptr;
         l.name = name;
         l.text = ts;
