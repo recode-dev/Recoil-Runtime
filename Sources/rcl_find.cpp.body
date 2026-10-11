@@ -1,0 +1,120 @@
+static bool leaf_get(const Image &img, uint64_t va, uint32_t &off, uint8_t &width)
+{
+    uint32_t a = 0;
+    uint32_t b = 0;
+    if (!img.u32(va, a) || !img.u32(va + 4, b) || b != 0xD65F03C0u)
+    {
+        return false;
+    }
+    if ((a & 0xFFC00000u) == 0xB9400000u)
+    {
+        off = ((a >> 10) & 0xFFFu) * 4u;
+        width = 4;
+        return true;
+    }
+    if ((a & 0xFFC00000u) == 0xF9400000u)
+    {
+        off = ((a >> 10) & 0xFFFu) * 8u;
+        width = 8;
+        return true;
+    }
+    return false;
+}
+
+static bool singleton_get(const Image &img, uint64_t va, uint64_t &slot)
+{
+    uint32_t a = 0;
+    uint32_t b = 0;
+    uint32_t c = 0;
+    int64_t hi = 0;
+    uint64_t page = 0;
+    if (!img.u32(va, a) || !img.u32(va + 4, b) || !img.u32(va + 8, c))
+    {
+        return false;
+    }
+    if (c != 0xD65F03C0u || (a & 0x9F00001Fu) != 0x90000000u)
+    {
+        return false;
+    }
+    if ((a & 0x1Fu) != 0 || ((b >> 5) & 0x1Fu) != 0 || (b & 0xFFC00000u) != 0xF9400000u)
+    {
+        return false;
+    }
+    hi = ((int64_t)((a >> 5) & 0x7FFFFu) << 2) | (int64_t)((a >> 29) & 3u);
+    if (hi & (1 << 20))
+    {
+        hi -= 1 << 21;
+    }
+    page = (va & ~0xFFFULL) + ((uint64_t)hi << 12);
+    slot = page + (uint64_t)(((b >> 10) & 0xFFFu) * 8u);
+    return true;
+}
+
+FindResult find_all(const Image &img, const Seeds &s)
+{
+    FindResult r;
+    std::map<uint64_t, std::string> seen;
+    std::map<std::string, const ClassBoundary *> bounds;
+    std::vector<ClassBoundary> all = discover_class_boundaries(img);
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    size_t i = 0;
+    if (!macho_text_range(img, lo, hi))
+    {
+        lo = img.base;
+        hi = img.base + img.vmsize;
+    }
+    (void)s;
+    for (i = 0; i < all.size(); i++)
+    {
+        if (all[i].name && all[i].name[0])
+        {
+            bounds.emplace(all[i].name, &all[i]);
+        }
+    }
+    for (i = 0; i < kTargetCount; i++)
+    {
+        const Target &t = kTargets[i];
+        Found f{};
+        std::map<uint64_t, std::string>::iterator it;
+        f.key = t.key;
+        f.kind = t.kind;
+        if (t.seed != 0)
+        {
+            f.value = t.seed;
+            f.src = "seed";
+            it = seen.find(t.seed);
+            if (it == seen.end())
+            {
+                seen.emplace(t.seed, t.key);
+                r.resolved++;
+            }
+            else
+            {
+                f.alias_of = it->second.c_str();
+                r.duplicated++;
+            }
+            r.items.push_back(f);
+            continue;
+        }
+        if (t.cls && t.cls[0] && bounds.count(t.cls))
+        {
+            const ClassBoundary *b = bounds[t.cls];
+            RCL_LOGLN("[class] %-34s slots=%u rows=%u", t.cls, (unsigned)b->slots, (unsigned)b->start);
+            r.ambiguous++;
+            continue;
+        }
+        r.missing++;
+        RCL_LOGLN("[missing] %-34s cls=%s kind=%u", t.key, t.cls ? t.cls : "", (unsigned)t.kind);
+    }
+    RCL_LOGLN("[globals] singleton candidates:");
+    for (uint64_t va = lo; va + 12 <= hi; va += 4)
+    {
+        uint64_t slot = 0;
+        if (singleton_get(img, va, slot))
+        {
+            RCL_LOGLN("   0x%llx -> [0x%llx]", (unsigned long long)va, (unsigned long long)slot);
+        }
+    }
+    return r;
+}

@@ -158,29 +158,6 @@ static inline int64_t sign_extend(uint64_t v, int bits)
     return (int64_t)((v ^ m) - m);
 }
 
-bool branch_target(const Image &img, uint64_t va, uint64_t &target)
-{
-    uint32_t w = 0;
-    if (!img.u32(va, w))
-        return false;
-    if ((w & 0xFC000000) == 0x14000000)
-    {
-        target = va + ((uint64_t)(sign_extend(w & 0x03FFFFFF, 26)) << 2);
-        return true;
-    }
-    if ((w & 0xFF000010) == 0x54000000)
-    {
-        target = va + ((uint64_t)(sign_extend((w >> 5) & 0x7FFFF, 19)) << 2);
-        return true;
-    }
-    if ((w & 0x7E000000) == 0x34000000)
-    {
-        target = va + ((uint64_t)(sign_extend((w >> 5) & 0x7FFFF, 19)) << 2);
-        return true;
-    }
-    return false;
-}
-
 static bool is_bl_to(const Image &img, uint64_t va, uint64_t target)
 {
     uint32_t w = 0;
@@ -579,107 +556,6 @@ std::vector<ColumnSite> scan_column_sites(const Image &img, const Seeds &s)
             out.push_back({name, imm, va, slot_va});
             break;
         }
-    }
-    return out;
-}
-
-std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s,
-                                             const std::vector<ClassBoundary> &boundaries)
-{
-    std::vector<ClassColumns> out;
-    if (!s.colname_off)
-        return out;
-    const uint64_t target = img.base + s.colname_off;
-    for (uint64_t va = img.base + s.text_off; va + 4 <= img.base + s.text_end_off; va += 4)
-    {
-        if (!is_bl_to(img, va, target))
-            continue;
-        std::string name;
-        for (int k = 1; k <= 4; k++)
-        {
-            uint64_t page = 0;
-            uint32_t rd = 0;
-            if (!adrp_at(img, va - 4 * k, page, rd))
-                continue;
-            uint64_t full = 0;
-            if (!add_imm(img, va - 4 * k + 4, rd, full))
-                continue;
-            if (img.cstr(full, name))
-                break;
-            name.clear();
-        }
-        if (name.empty())
-            continue;
-
-        uint64_t slot = 0;
-        for (int k = 1; k <= 8; k++)
-        {
-            uint32_t w = 0;
-            if (!img.u32(va + 4 * k, w))
-                break;
-            uint32_t imm = 0, scale = 0;
-            const uint32_t op = w & 0xFFC00000;
-            if (op == 0xB9000000 && (w & 0x1F) == 0)
-            {
-                imm = (w >> 10) & 0xFFF;
-                scale = 4;
-            }
-            else if (op == 0xF9000000 && (w & 0x1F) == 0)
-            {
-                imm = (w >> 10) & 0xFFF;
-                scale = 8;
-            }
-            else if ((w & 0xFFE00C00) == 0xB8000000 && (w & 0x1F) == 0)
-            {
-                imm = (uint32_t)sign_extend((w >> 12) & 0x1FF, 9);
-                scale = 4;
-            }
-            else
-            {
-                continue;
-            }
-            const uint32_t base = (w >> 5) & 0x1F;
-            for (int b = 1; b <= 8; b++)
-            {
-                uint64_t page = 0;
-                uint32_t rd = 0;
-                if (!adrp_at(img, va + 4 * k - 4 * b, page, rd))
-                    continue;
-                if (rd == base)
-                {
-                    slot = page + (uint64_t)imm * scale;
-                    break;
-                }
-            }
-            break;
-        }
-
-        const uint32_t site = (uint32_t)(va - img.base);
-        int idx = -1;
-        for (size_t c = 0; c < boundaries.size(); c++)
-        {
-            if (boundaries[c].start > site)
-                continue;
-            if (idx < 0 || boundaries[c].start > boundaries[idx].start)
-                idx = (int)c;
-        }
-        if (idx < 0)
-            continue;
-        if (out.empty() || out.back().start != boundaries[idx].start)
-        {
-            ClassColumns cc;
-            cc.start = boundaries[idx].start;
-            cc.cols = boundaries[idx].slots;
-            cc.name = boundaries[idx].name;
-            out.push_back(cc);
-        }
-        ClassColumn item;
-        item.name = name;
-        item.slot_va = slot;
-        item.id = 0;
-        if (slot)
-            img.u32(slot, item.id);
-        out.back().items.push_back(item);
     }
     return out;
 }

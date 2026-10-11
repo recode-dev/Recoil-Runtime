@@ -1,4 +1,5 @@
 #include "rcl_scan.h"
+#include "rcl_find.h"
 #include "rcl_report.h"
 #include "rcl_log.h"
 #include "rcl_ident.h"
@@ -235,6 +236,39 @@ static void run_pass(const Image &img, const std::string &why, int pass)
                   _dyld_image_count());
     }
     report_run(img, s);
+    find_once(img, s);
+}
+
+static void find_once(const Image &img, const Seeds &s)
+{
+    static bool done = false;
+    FindResult fr;
+    std::string line;
+    if (done)
+    {
+        return;
+    }
+    done = true;
+    alert_show("Recoil-Runtime", "dump started");
+    RCL_LOGLN("[find] start: %zu targets", kTargetCount);
+    fr = find_all(img, s);
+    line = "dump finished: " + std::to_string(fr.resolved) + "/" + std::to_string(kTargetCount) +
+           " (alias " + std::to_string(fr.duplicated) + ", class-ambiguous " + std::to_string(fr.ambiguous) +
+           ", missing " + std::to_string(fr.missing) + ")";
+    RCL_LOGLN("[find] %s", line.c_str());
+    for (size_t i = 0; i < fr.items.size(); i++)
+    {
+        const Found &f = fr.items[i];
+        if (f.alias_of != nullptr)
+        {
+            RCL_LOGLN("[find] %-46s 0x%llx  alias-of %s", f.key, (unsigned long long)f.value, f.alias_of);
+        }
+        else
+        {
+            RCL_LOGLN("[find] %-46s 0x%llx  %s", f.key, (unsigned long long)f.value, f.src);
+        }
+    }
+    alert_show("Recoil-Runtime", line.c_str());
 }
 
 static void *waiter(void *)

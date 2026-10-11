@@ -81,20 +81,7 @@ struct ColumnSite
     uint64_t slot_va = 0;
 };
 
-struct ClassColumn
-{
-    std::string name;
-    uint64_t slot_va = 0;
-    uint32_t id = 0;
-};
 
-struct ClassColumns
-{
-    uint32_t start = 0;
-    uint32_t cols = 0;
-    const char *name = "";
-    std::vector<ClassColumn> items;
-};
 
 struct ClassBoundary
 {
@@ -123,11 +110,8 @@ std::vector<ClassBoundary> discover_class_boundaries(const Image &img);
 
 std::vector<PropSite> scan_property_sites(const Image &img, const Seeds &s);
 std::vector<ColumnSite> scan_column_sites(const Image &img, const Seeds &s);
-std::vector<ClassColumns> scan_class_columns(const Image &img, const Seeds &s,
-                                             const std::vector<ClassBoundary> &boundaries);
 std::vector<OwnFlag> scan_own_char_flags(const Image &img, const Seeds &s);
 
-bool branch_target(const Image &img, uint64_t va, uint64_t &target);
 
 } // namespace rcl
 
