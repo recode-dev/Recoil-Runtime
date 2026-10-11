@@ -2,8 +2,7 @@
 #include "rcl_report.h"
 #include "rcl_log.h"
 #include "rcl_ident.h"
-#include "rcl_live.h"
-#include "rcl_classdump.h"
+#include "rcl_alert.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -119,22 +118,6 @@ static bool pick_image(Image &out, std::string &why, std::vector<Loaded> &all)
     RCL_LOGLN("[images] %u loaded, __TEXT threshold 0x%llx", _dyld_image_count(),
               (unsigned long long)mintext);
     gather_images(all, true);
-    {
-        int bcBest = -1;
-        for (size_t i = 0; i < all.size(); i++)
-        {
-            const bool bcApp = all[i].name.find(".app/") != std::string::npos &&
-                               all[i].name.find(".framework/") == std::string::npos;
-            if (!bcApp)
-                continue;
-            if (bcBest < 0 || all[i].text > all[bcBest].text)
-                bcBest = (int)i;
-        }
-        if (bcBest < 0 && !all.empty())
-            bcBest = 0;
-        if (bcBest >= 0)
-            battle_capture_autostart(all[bcBest].img);
-    }
     if (all.empty())
     {
         why = "no image passed the structural filter";
@@ -216,7 +199,6 @@ static void open_log_anywhere()
     int n = 0;
     if (env && *env)
         cands[n++] = env;
-    cands[n++] = dumps_root();
     if (home_docs[0])
         cands[n++] = home_docs;
     if (home[0])
@@ -227,28 +209,12 @@ static void open_log_anywhere()
     for (int i = 0; i < n; i++)
     {
         log_open(cands[i]);
-        battle_capture_open();
         if (log_is_open())
         {
             RCL_LOGLN("[log] %s", cands[i]);
             return;
         }
     }
-}
-
-static Image g_live_img;
-static Seeds g_live_seeds;
-static bool g_live_started = false;
-
-static void *live_worker(void *)
-{
-    g_live_started = true;
-    for (;;)
-    {
-        live_session(g_live_img, g_live_seeds);
-        sleep(5);
-    }
-    return nullptr;
 }
 
 static void run_pass(const Image &img, const std::string &why, int pass)
@@ -268,31 +234,14 @@ static void run_pass(const Image &img, const std::string &why, int pass)
         RCL_LOGLN("[pass %d] base 0x%llx images %u", pass, (unsigned long long)img.base,
                   _dyld_image_count());
     }
-    set_skip_bundle(pass > 0);
     report_run(img, s);
-    set_skip_bundle(false);
-    if (pass > 0)
-        return;
-    if (g_live_started)
-        return;
-    if ((int)env_u64("RCL_RESCAN_SEC", 20) <= 0)
-    {
-        live_session(img, s);
-        return;
-    }
-    g_live_img = img;
-    g_live_seeds = s;
-    pthread_t lt;
-    if (pthread_create(&lt, nullptr, live_worker, nullptr) == 0)
-        pthread_detach(lt);
-    else
-        live_session(img, s);
 }
 
 static void *waiter(void *)
 {
     open_log_anywhere();
     RCL_LOGLN("[boot] pid %d images %u", (int)getpid(), _dyld_image_count());
+    alert_show("Recoil-Runtime", "loaded, waiting for the target image");
 
     const int wait_ms = (int)env_u64("RCL_WAIT_SEC", 60) * 1000;
     const int step_ms = 500;
@@ -317,7 +266,6 @@ static void *waiter(void *)
                     RCL_LOGLN("[scan %zu/%zu] %s", k + 1, all.size(), all[k].name.c_str());
                     report_run(all[k].img, Seeds::discover(all[k].img));
                 }
-                live_session(all[0].img, Seeds::discover(all[0].img));
                 log_close();
                 return nullptr;
             }
@@ -345,6 +293,7 @@ static void *waiter(void *)
     }
     RCL_LOGLN("Recoil-Runtime: no target image after %ds, images %u", wait_ms / 1000,
               _dyld_image_count());
+    alert_show("Recoil-Runtime", "no target image");
     log_close();
     return nullptr;
 }
