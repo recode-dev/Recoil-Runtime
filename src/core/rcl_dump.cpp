@@ -244,12 +244,70 @@ void dump_missing(const Image &img)
     RCL_LOGLN("[dump] missing %zu", sizeof kMiss / sizeof kMiss[0]);
 }
 
+void dump_colmap(const Image &img, const Seeds &s)
+{
+    const uint64_t arr = img.base + 0x1154f08ULL;
+    std::string idx = "# column map (pure reads, nothing is called)\n\n"
+                      "for each LogicDataTable slot: table -> csv -> bucket map\n\n";
+    for (int i = 0; i < 157; i++)
+    {
+        uint64_t t = 0;
+        uint64_t a = 0;
+        uint64_t buckets = 0;
+        uint64_t cnt = 0;
+        uint64_t arena = 0;
+        std::string head;
+        if (!img.read(img.ctx, arr + (uint64_t)i * 8, &t, 8) || !t)
+            continue;
+        if (!img.read(img.ctx, t + 0x58, &a, 8) || !a)
+            continue;
+        img.read(img.ctx, a, &buckets, 8);
+        img.read(img.ctx, a + 8, &cnt, 8);
+        img.read(img.ctx, a + 0x18, &arena, 8);
+        head = out_fmt("# table slot %d\n\n- table: `0x%llx`\n- csv: `0x%llx`\n"
+                       "- buckets: `0x%llx`\n- count: %llu\n- arena: `0x%llx`\n\n",
+                       i, (unsigned long long)t, (unsigned long long)a, (unsigned long long)buckets,
+                       (unsigned long long)cnt, (unsigned long long)arena);
+        if (buckets > img.base && buckets < img.base + img.vmsize && cnt > 0 && cnt <= 4096)
+        {
+            for (uint64_t b = 0; b < cnt && b < 8; b++)
+            {
+                uint64_t e = 0;
+                if (!img.read(img.ctx, buckets + b * 8, &e, 8) || !e)
+                    continue;
+                if (e < img.base || e >= img.base + img.vmsize)
+                    continue;
+                head += out_fmt("\n## bucket %llu entry `0x%llx`\n\n", (unsigned long long)b,
+                                (unsigned long long)e);
+                for (int k = 0; k < 8; k++)
+                {
+                    uint64_t w = 0;
+                    std::string st;
+                    if (!img.read(img.ctx, e + (uint64_t)k * 8, &w, 8))
+                        break;
+                    head += out_fmt("- `+0x%02x` = `0x%llx`", k * 8, (unsigned long long)w);
+                    if (w > 0x1000 && img.cstr(w, st) && !st.empty() && st.size() <= 48)
+                        head += "  \"" + st + "\"";
+                    head += "\n";
+                }
+            }
+        }
+        out_write("columns", out_fmt("map-%d", i).c_str(), head);
+        idx += out_fmt("- [%d] table `0x%llx` csv `0x%llx` buckets `0x%llx` count %llu\n", i,
+                       (unsigned long long)t, (unsigned long long)a, (unsigned long long)buckets,
+                       (unsigned long long)cnt);
+    }
+    out_write("columns", "map-index", idx);
+    RCL_LOGLN("[dump] column map");
+}
+
 void dump_all(const Image &img, const Seeds &s)
 {
     dump_index(img);
     dump_anchors(img, s);
     dump_properties(img, s);
     dump_columns(img, s);
+    dump_colmap(img, s);
     dump_vtables(img);
     dump_ctors(img);
     dump_targets(img, s);
