@@ -38,6 +38,8 @@ struct FindResult
     size_t by_sym = 0;
     size_t by_field = 0;
     size_t by_hint = 0;
+    size_t by_str = 0;
+    size_t by_sing = 0;
     std::vector<Found> items;
 };
 

@@ -426,7 +426,11 @@ FindResult find_all(const Image &img, const Seeds &s)
         }
         f.src = "todo";
         f.info = "0x0";
-        r.missing++;
+        code_resolve(img, s, f, r.by_str, r.by_sing);
+        if (f.value)
+            r.resolved++;
+        else
+            r.missing++;
         r.items.push_back(f);
     }
     RCL_LOGLN("[find] sym=%zu field=%zu hint=%zu unresolved=%zu symtab=%zu", r.by_sym, r.by_field, r.by_hint, r.missing,
