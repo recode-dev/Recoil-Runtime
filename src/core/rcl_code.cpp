@@ -317,12 +317,6 @@ void code_profile(const Image &img, uint64_t rva, std::string &out)
             out += buf;
             return;
         }
-        if (n && is_prologue(w))
-        {
-            snprintf(buf, sizeof buf, "- next fn 0x%llx\n", (unsigned long long)(va - img.base));
-            out += buf;
-            return;
-        }
         if (is_adrp(w))
         {
             page = adrp_page(va, w);
