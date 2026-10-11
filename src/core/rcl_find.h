@@ -26,6 +26,7 @@ struct Found
     uint64_t value;
     uint8_t kind;
     const char *src;
+    std::string info;
 };
 
 struct FindResult
@@ -34,6 +35,8 @@ struct FindResult
     size_t duplicated = 0;
     size_t ambiguous = 0;
     size_t missing = 0;
+    size_t by_sym = 0;
+    size_t by_field = 0;
     std::vector<Found> items;
 };
 
