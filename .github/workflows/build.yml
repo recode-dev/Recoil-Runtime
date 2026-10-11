@@ -14,9 +14,9 @@ jobs:
       - name: Compile every translation unit
         run: |
           set -e
-          for f in Sources/*.cpp; do
+          for f in $(find src -name '*.cpp' | sort); do
             g++ -fsyntax-only -std=c++17 -Wall -Wextra -Werror -Wno-unused-parameter \
-                -DRCL_HOST_TEST -ISources "$f"
+                -DRCL_HOST_TEST -Isrc -Isrc/core -Isrc/scan -Isrc/utils "$f"
           done
 
   dylib:
