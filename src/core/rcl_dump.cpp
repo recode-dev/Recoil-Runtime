@@ -5,6 +5,7 @@
 #include "rcl_disasm.h"
 #include "rcl_pseudo.h"
 #include "rcl_objc.h"
+#include "rcl_infer.h"
 #include "rcl_log.h"
 #include "../utils/rcl_out.h"
 
@@ -160,16 +161,45 @@ void dump_objc(const Image &img)
         out_write_root("objc", t);
         return;
     }
-    const uint64_t cap = cfg_u64("RCL_OBJC_MAX", 20000);
+    const uint64_t cap = cfg_u64("RCL_OBJC_MAX", 0);
     t += "| rva | method |\n|---|---|\n";
     size_t i = 0;
-    for (i = 0; i < syms.size() && (uint64_t)i < cap; i++)
+    for (i = 0; i < syms.size() && (cap == 0 || (uint64_t)i < cap); i++)
         t += out_fmt("| `0x%llx` | `%s[%s %s]` |\n", (unsigned long long)syms[i].rva,
                      syms[i].meta ? "+" : "-", syms[i].cls.c_str(), syms[i].sel.c_str());
-    if ((uint64_t)i < syms.size())
+    if (cap && (uint64_t)i < syms.size())
         t += out_fmt("\n(cut: RCL_OBJC_MAX=%llu of %zu)\n", (unsigned long long)cap, syms.size());
     out_write_root("objc", t);
     RCL_LOGLN("[dump] objc: %zu methods", got);
+}
+
+void dump_inferred(const Image &img, const Seeds &s)
+{
+    const std::vector<InferredName> &in = infer_cached(img, s);
+    std::string t = "# inferred symbols\n\n";
+    t += out_fmt("- dictionary: `%s`\n", getenv("RCL_SYM_DICT") && *getenv("RCL_SYM_DICT")
+                                              ? getenv("RCL_SYM_DICT")
+                                              : "<none>");
+    t += out_fmt("- functions named from strings found in their own body: %zu\n\n", in.size());
+    if (in.empty())
+    {
+        t += "no dictionary or nothing matched\n";
+        out_write_root("inferred", t);
+        return;
+    }
+    t += "These are inferred, not real symbols: the name is a class/method identifier that the\n";
+    t += "function itself references as a string literal. Confidence is per row - verify with the\n";
+    t += "disassembly of that address.\n\n";
+    t += "| rva | inferred name | evidence strings |\n|---|---|---|\n";
+    const uint64_t cap = cfg_u64("RCL_INFER_MAX", 0);
+    size_t i = 0;
+    for (i = 0; i < in.size() && (cap == 0 || (uint64_t)i < cap); i++)
+        t += out_fmt("| `0x%llx` | `%s` | `%s` |\n", (unsigned long long)in[i].rva,
+                     in[i].name.c_str(), in[i].evidence.c_str());
+    if (cap && (uint64_t)i < in.size())
+        t += out_fmt("\n(cut: RCL_INFER_MAX=%llu of %zu)\n", (unsigned long long)cap, in.size());
+    out_write_root("inferred", t);
+    RCL_LOGLN("[dump] inferred: %zu", in.size());
 }
 
 void dump_code(const Image &img, const Seeds &s)
@@ -202,6 +232,7 @@ void dump_code(const Image &img, const Seeds &s)
         objc_collect(img, syms);
         objc_names(syms, fns);
     }
+    infer_names(infer_cached(img, s), fns);
     parse_rvas(getenv("RCL_DISASM_RVAS"), rvas);
     for (size_t k = 0; k < rvas.size(); k++)
     {
@@ -276,6 +307,7 @@ void dump_all(const Image &img, const Seeds &s)
     dump_anchors(img, s);
     dump_targets(img, s);
     dump_objc(img);
+    dump_inferred(img, s);
     dump_code(img, s);
 }
 

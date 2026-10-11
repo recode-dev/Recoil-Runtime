@@ -25,6 +25,7 @@ int64_t sym_match(const std::vector<Sym> &syms, const std::vector<std::string> &
 
 bool code_text_range(const Image &img, uint64_t &lo, uint64_t &hi);
 uint64_t code_fn_start(const Image &img, uint64_t va, uint64_t lo);
+bool code_cstr_range(const Image &img, uint64_t &va, uint64_t &size);
 uint64_t code_str_lookup(const Image &img, uint64_t cstr_va, uint64_t cstr_size, const char *needle, uint32_t *hits);
 void code_str_refs(const Image &img, uint64_t cstr_va, uint64_t cstr_size,
                    std::map<uint64_t, std::vector<uint64_t>> &out);

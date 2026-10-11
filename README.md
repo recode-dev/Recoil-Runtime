@@ -24,6 +24,7 @@ index.md
 anchors/anchors.md
 map-all.md
 objc.md
+inferred.md
 disasm/index.md + disasm/fn-<rva>.md
 pseudo/index.md + pseudo/fn-<rva>.md
 ```
@@ -65,7 +66,9 @@ The dylib lands in `.theos/`; `make` also copies it next to the project root for
 | `RCL_DISASM_RVAS` | extra RVAs to disassemble regardless of the target table (`0x1234 0x5678`) |
 | `RCL_DISASM_INSNS` | instruction cap per function (default 2000) |
 | `RCL_PSEUDO_LINES` | pseudocode statement cap per function (default 400) |
-| `RCL_OBJC_MAX` | rows written to `objc.md` (default 20000) |
+| `RCL_OBJC_MAX` | rows written to `objc.md` (default 0 = no cap) |
+| `RCL_SYM_DICT` | path to a name dictionary (e.g. `Symbols_v36.218.md`); also picked up from `<out dir>/Symbols_v36.218.md` |
+| `RCL_INFER_MAX` | rows written to `inferred.md` (default 0 = no cap) |
 
 ## Decoder notes
 
@@ -86,6 +89,18 @@ ends by a heuristic: a terminating instruction (`ret`, a tail call `b` leaving t
 any terminator past the furthest forward conditional branch) plus a prologue scan for the next
 function boundary. Both are visible in the output as the `insns` / `end` header fields; treat the
 last few instructions of a function as uncertain.
+
+## Inferred names
+
+`inferred.md` lists functions named from a string literal found in their own body: the class or
+method identifier has to be in the image `__cstring` *and* referenced by the function. The name is
+written as `inferred:<token>` and every row carries its evidence string, so a name can be checked
+against the disassembly of that address. These are guesses, not symbols.
+
+Measured on the Nulls client with the v36 dictionary (37149 tokens from `Symbols_v36.218.md`): only
+3 tokens exist as exact `__cstring` strings and 5 functions were attributed. The engine simply
+does not embed its own class names in code-referenced strings, so this path cannot symbolise the
+client in bulk. It is kept because the rows it does produce are evidence-backed.
 
 ## Verification
 

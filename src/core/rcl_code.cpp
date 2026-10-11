@@ -245,7 +245,7 @@ void code_singletons(const Image &img, std::vector<uint64_t> &out)
     }
 }
 
-static bool cstr_range(const Image &img, uint64_t &va, uint64_t &size)
+bool code_cstr_range(const Image &img, uint64_t &va, uint64_t &size)
 {
     uint8_t hdr[32];
     uint32_t ncmds = 0;
@@ -376,7 +376,7 @@ void code_resolve(const Image &img, const Seeds &s, Found &f, size_t &by_str, si
     {
         if (!sva || !ssz)
         {
-            if (cstr_range(img, cva, csz))
+            if (code_cstr_range(img, cva, csz))
             {
                 sva = cva;
                 ssz = csz;

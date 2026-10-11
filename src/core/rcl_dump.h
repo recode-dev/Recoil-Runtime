@@ -11,6 +11,7 @@ void dump_anchors(const Image &img, const Seeds &s);
 void dump_targets(const Image &img, const Seeds &s);
 void dump_code(const Image &img, const Seeds &s);
 void dump_objc(const Image &img);
+void dump_inferred(const Image &img, const Seeds &s);
 
 void dump_all(const Image &img, const Seeds &s);
 
