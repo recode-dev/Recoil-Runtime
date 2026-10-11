@@ -1,0 +1,12 @@
+Package: com.client.recoil.runtime
+Name: Recoil-Runtime
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Runtime offset dumper for the Nulls Brawl client
+Maintainer: recode-dev
+Author: recode-dev
+Section: Development
+Priority: optional
+Depends: firmware (>= 15.0)
+Homepage: https://github.com/recode-dev/Recoil-Runtime
+License: MIT

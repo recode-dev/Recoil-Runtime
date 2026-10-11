@@ -295,29 +295,6 @@ const Target kTargets[] = {
 };
 const size_t kTargetCount = sizeof(kTargets) / sizeof(kTargets[0]);
 
-static bool leaf_get(const Image &img, uint64_t va, uint32_t &off, uint8_t &width)
-{
-    uint32_t a = 0;
-    uint32_t b = 0;
-    if (!img.u32(va, a) || !img.u32(va + 4, b) || b != 0xD65F03C0u)
-    {
-        return false;
-    }
-    if ((a & 0xFFC00000u) == 0xB9400000u)
-    {
-        off = ((a >> 10) & 0xFFFu) * 4u;
-        width = 4;
-        return true;
-    }
-    if ((a & 0xFFC00000u) == 0xF9400000u)
-    {
-        off = ((a >> 10) & 0xFFFu) * 8u;
-        width = 8;
-        return true;
-    }
-    return false;
-}
-
 static bool singleton_get(const Image &img, uint64_t va, uint64_t &slot)
 {
     uint32_t a = 0;

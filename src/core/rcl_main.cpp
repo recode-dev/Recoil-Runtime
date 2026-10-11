@@ -1,5 +1,7 @@
 #include "rcl_scan.h"
+#include "rcl_dump.h"
 #include "rcl_find.h"
+#include "../utils/rcl_out.h"
 #include "rcl_report.h"
 #include "rcl_log.h"
 #include "rcl_ident.h"
@@ -237,6 +239,12 @@ static void run_pass(const Image &img, const std::string &why, int pass)
     }
     report_run(img, s);
     find_once(img, s);
+    if (pass == 0)
+    {
+        out_begin(log_dir());
+        RCL_LOGLN("[out] %s", out_root().c_str());
+        dump_all(img, s);
+    }
 }
 
 static void find_once(const Image &img, const Seeds &s)
