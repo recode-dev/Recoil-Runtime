@@ -6,6 +6,7 @@
 #include "../utils/rcl_out.h"
 
 #include <string>
+#include <string.h>
 #include <vector>
 
 namespace rcl
