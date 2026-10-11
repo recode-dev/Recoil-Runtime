@@ -160,7 +160,7 @@ void dump_objc(const Image &img)
         out_write_root("objc", t);
         return;
     }
-    const uint64_t cap = cfg_u64("RCL_OBJC_MAX", 4000);
+    const uint64_t cap = cfg_u64("RCL_OBJC_MAX", 20000);
     t += "| rva | method |\n|---|---|\n";
     size_t i = 0;
     for (i = 0; i < syms.size() && (uint64_t)i < cap; i++)

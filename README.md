@@ -65,7 +65,7 @@ The dylib lands in `.theos/`; `make` also copies it next to the project root for
 | `RCL_DISASM_RVAS` | extra RVAs to disassemble regardless of the target table (`0x1234 0x5678`) |
 | `RCL_DISASM_INSNS` | instruction cap per function (default 2000) |
 | `RCL_PSEUDO_LINES` | pseudocode statement cap per function (default 400) |
-| `RCL_OBJC_MAX` | rows written to `objc.md` (default 4000) |
+| `RCL_OBJC_MAX` | rows written to `objc.md` (default 20000) |
 
 ## Decoder notes
 
