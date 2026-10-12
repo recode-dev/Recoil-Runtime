@@ -6,6 +6,7 @@
 #include "rcl_log.h"
 #include "rcl_ident.h"
 #include "rcl_alert.h"
+#include "rcl_dodge.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -279,6 +280,7 @@ static void find_once(const Image &img, const Seeds &s)
     alert_show("Recoil-Runtime", "dump started");
     RCL_LOGLN("[find] start: %zu targets", kTargetCount);
     fr = find_all(img, s);
+    dodge_sites(img, s);
     line = "dump finished: " + std::to_string(fr.resolved) + "/" + std::to_string(kTargetCount) +
            " (alias " + std::to_string(fr.duplicated) + ", class-ambiguous " + std::to_string(fr.ambiguous) +
            ", missing " + std::to_string(fr.missing) + ")";
