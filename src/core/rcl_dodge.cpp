@@ -26,9 +26,9 @@ static const DodgeTarget kDodgeTargets[] = {
 
 static int dodge_access(uint32_t w, uint32_t &off, uint32_t &width)
 {
-    uint32_t base = w & 0xFFC00000u;
-    uint32_t scale = 4;
-    switch (base)
+    uint32_t op = w & 0xFFC00000u;
+    uint32_t scale = 0;
+    switch (op)
     {
     case 0xB9400000u:
     case 0xB9000000u:
@@ -57,13 +57,11 @@ static int dodge_access(uint32_t w, uint32_t &off, uint32_t &width)
     default:
         return 0;
     }
-    if ((w & 0x00C00000u) == 0x00400000u && base != 0x3D400000u && base != 0x3D000000u)
-        scale *= 2;
     if (((w >> 5) & 0x1Fu) == 31u)
         return 0;
     off = ((w >> 10) & 0xFFFu) * scale;
     width = scale;
-    return (base & 0x00400000u) ? 2 : 1;
+    return (op & 0x00400000u) ? 1 : 2;
 }
 
 void dodge_sites(const Image &img, const Seeds &s)
